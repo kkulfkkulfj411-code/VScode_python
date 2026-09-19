@@ -1,0 +1,11 @@
+streamlit
+yfinance
+pandas
+ta
+fear-greed
+google-generativeai
+mplfinance
+python-dotenv
+feedparser
+requests
+matplotlib
