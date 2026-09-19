@@ -13,6 +13,7 @@ import urllib.parse
 import requests
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import platform # OS判定用に追加
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -25,6 +26,16 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+
+# --- フォントのパスをOS（Windowsかクラウドか）で自動判定 ---
+if platform.system() == "Windows":
+    SYS_FONT_PATH = 'C:/Windows/Fonts/meiryo.ttc'
+    SYS_FONT_NAME = 'Meiryo'
+else:
+    # Linux (GitHub Codespaces) 用
+    SYS_FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
+    SYS_FONT_NAME = 'NotoSansCJK'
+# -------------------------------------------------------------
 
 # 1. APIキーの読み込みとGeminiの初期設定
 load_dotenv()
@@ -221,8 +232,7 @@ def save_high_res_chart(df_full, filename, title, tail_count, timeframe_type):
         aps.append(mpf.make_addplot(df_plot['RSI_30'], color='gray', linestyle='--', width=0.8, panel=2))
 
     try:
-        font_path = 'C:/Windows/Fonts/meiryo.ttc'
-        meiryo_prop = fm.FontProperties(fname=font_path)
+        meiryo_prop = fm.FontProperties(fname=SYS_FONT_PATH)
         my_style = mpf.make_mpf_style(base_mpf_style='yahoo', rc={'font.family': meiryo_prop.get_name()})
     except:
         my_style = 'yahoo'
@@ -513,15 +523,15 @@ except Exception as e:
 # 6. PDFレポート出力処理
 pdf_filename = "analysis_report.pdf"
 try:
-    pdfmetrics.registerFont(TTFont('Meiryo', 'C:/Windows/Fonts/meiryo.ttc'))
-    font_name = 'Meiryo'
+    pdfmetrics.registerFont(TTFont(SYS_FONT_NAME, SYS_FONT_PATH))
+    font_name = SYS_FONT_NAME
 except:
     font_name = 'Helvetica'
 
 doc = SimpleDocTemplate(pdf_filename, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
 styles = getSampleStyleSheet()
-normal_style = ParagraphStyle('MeiryoNormal', parent=styles['Normal'], fontName=font_name, fontSize=9, leading=14, textColor=colors.HexColor('#333333'))
-title_style = ParagraphStyle('MeiryoTitle', parent=styles['Heading1'], fontName=font_name, fontSize=14, leading=20, textColor=colors.HexColor('#1a365d'), spaceAfter=12)
+normal_style = ParagraphStyle('SystemNormal', parent=styles['Normal'], fontName=font_name, fontSize=9, leading=14, textColor=colors.HexColor('#333333'))
+title_style = ParagraphStyle('SystemTitle', parent=styles['Heading1'], fontName=font_name, fontSize=14, leading=20, textColor=colors.HexColor('#1a365d'), spaceAfter=12)
 
 story = []
 today_str = datetime.date.today().strftime('%Y年%m月%d日')
