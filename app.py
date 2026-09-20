@@ -228,20 +228,57 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     # チャートを描画して、軸データ（axes）を受け取る
     fig, axes = mpf.plot(df_plot, **plot_kwargs)
     
-    # 🌟X軸の年月日を数字2桁（YY/MM または YY/MM/DD）に強制書き換え
+# 🌟X軸の年月日を数字2桁に強制書き換え（1970年問題対策版）
     ax_main = axes[0]
+    tick_indices = []
+    tick_labels = []
+    
     if timeframe_type == 'weekly':
-        ax_main.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%y/%m'))
+        # 2ヶ月ごとにラベルを作成（例：26/01, 26/03...）
+        last_month = None
+        count = 0
+        for i, dt in enumerate(df_plot.index):
+            if dt.month != last_month:
+                if count % 2 == 0:
+                    tick_indices.append(i)
+                    tick_labels.append(dt.strftime('%y/%m'))
+                count += 1
+                last_month = dt.month
+
     elif timeframe_type == 'daily':
-        ax_main.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%y/%m'))
+        # 月初めにラベルを作成（例：26/01, 26/02...）
+        last_month = None
+        for i, dt in enumerate(df_plot.index):
+            if dt.month != last_month:
+                tick_indices.append(i)
+                tick_labels.append(dt.strftime('%y/%m'))
+                last_month = dt.month
+
     elif timeframe_type == 'hourly':
-        # 1時間足の場合は見やすくするため7日ごとに日付を表示
-        ax_main.xaxis.set_major_locator(mdates.DayLocator(interval=7))
-        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%y/%m/%d'))
+        # 約7営業日ごとにラベルを作成
+        # 月が切り替わった最初の表記は「YY/MM/DD」、同じ月内は「DD」のみ
+        last_date = None
+        days_counted = 0
+        last_printed_month = None
         
-    # 日本語化と日付書き換えが完了した画像を保存
+        for i, dt in enumerate(df_plot.index):
+            current_date = dt.date()
+            if current_date != last_date:
+                if days_counted % 7 == 0:
+                    tick_indices.append(i)
+                    if dt.month != last_printed_month:
+                        tick_labels.append(dt.strftime('%y/%m/%d'))
+                        last_printed_month = dt.month
+                    else:
+                        tick_labels.append(dt.strftime('%d'))
+                days_counted += 1
+                last_date = current_date
+
+    # 作成した自作ラベルをX軸に上書き適用する
+    ax_main.set_xticks(tick_indices)
+    ax_main.set_xticklabels(tick_labels, rotation=45)
+        
+    # 画像を保存
     fig.savefig(filename, dpi=150, bbox_inches='tight')
     plt.close(fig)
     return filename
