@@ -169,7 +169,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
 
     aps = []
     
-    # 指標の計算に必要なデータが存在する場合のみ描画（クラッシュ回避処理）
     if 'SMA25' in df_plot.columns and df_plot['SMA25'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA25'], color='blue', width=1.2))
     if 'SMA75' in df_plot.columns and df_plot['SMA75'].notna().any():
@@ -182,18 +181,19 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
         aps.append(mpf.make_addplot(df_plot['BB_MID'], color='purple', width=0.8, alpha=0.6))
         aps.append(mpf.make_addplot(df_plot['BB_LOW'], color='gray', width=0.8, alpha=0.6))
 
-    # パネル分割比率の動的調整
     panel_ratios = [6]
     panels_count = 0
     
-    has_volume = 'Volume' in df_plot.columns and df_plot['Volume'].notna().any()
+    # 🌟修正箇所: bool() で囲んで純粋なPythonのTrue/Falseに変換する
+    has_volume = bool('Volume' in df_plot.columns and df_plot['Volume'].notna().any())
     if has_volume:
         panels_count += 1
         panel_ratios.append(2)
         if 'Vol_SMA20' in df_plot.columns and df_plot['Vol_SMA20'].notna().any():
             aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='Volume'))
 
-    has_rsi = 'RSI' in df_plot.columns and df_plot['RSI'].notna().any()
+    # 🌟修正箇所: こちらも同様に bool() で囲む
+    has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
     if has_rsi:
         panels_count += 1
         panel_ratios.append(2)
@@ -209,24 +209,20 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
     except:
         my_style = 'yahoo'
 
-    # パラメータを辞書形式で安全にまとめる
     plot_kwargs = dict(
         type='candle',
         style=my_style,
-        volume=has_volume,
+        volume=has_volume,  # ここに渡される値が標準のbool型になったためエラーが消えます
         figratio=(12, 8),
         title=title,
         savefig=dict(fname=filename, dpi=150, bbox_inches='tight')
     )
-    # addplot（追加の指標線）が1つでもあれば追加
     if aps:
         plot_kwargs['addplot'] = aps
     
-    # 画面が2つ以上（メイン＋出来高 or RSI）に分割される場合のみ比率を指定
     if len(panel_ratios) > 1:
         plot_kwargs['panel_ratios'] = tuple(panel_ratios)
 
-    # 描画実行
     mpf.plot(df_plot, **plot_kwargs)
     return filename
 
