@@ -209,9 +209,25 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
     except:
         my_style = 'yahoo'
 
-    mpf.plot(df_plot, type='candle', style=my_style, addplot=aps, volume=has_volume, 
-             panel_ratios=tuple(panel_ratios), figratio=(12, 8), title=title, 
-             savefig=dict(fname=filename, dpi=150, bbox_inches='tight'))
+    # パラメータを辞書形式で安全にまとめる
+    plot_kwargs = dict(
+        type='candle',
+        style=my_style,
+        volume=has_volume,
+        figratio=(12, 8),
+        title=title,
+        savefig=dict(fname=filename, dpi=150, bbox_inches='tight')
+    )
+    # addplot（追加の指標線）が1つでもあれば追加
+    if aps:
+        plot_kwargs['addplot'] = aps
+    
+    # 画面が2つ以上（メイン＋出来高 or RSI）に分割される場合のみ比率を指定
+    if len(panel_ratios) > 1:
+        plot_kwargs['panel_ratios'] = tuple(panel_ratios)
+
+    # 描画実行
+    mpf.plot(df_plot, **plot_kwargs)
     return filename
 
 # ==========================================
