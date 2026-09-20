@@ -14,7 +14,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.font_manager as fm
 import os
-
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
 
@@ -159,7 +160,7 @@ def add_indicators(df):
     df['MACD'] = ta.trend.macd_diff(df['Close'])
     return df
 
-def generate_safe_chart_image(df_full, filename, title, tail_count):
+def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_type):
     if df_full.empty: return None
     df_full.index = pd.to_datetime(df_full.index)
     if df_full.index.tz is not None: df_full.index = df_full.index.tz_convert(None)
@@ -184,15 +185,14 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
     panel_ratios = [6]
     panels_count = 0
     
-    # 🌟修正箇所: bool() で囲んで純粋なPythonのTrue/Falseに変換する
     has_volume = bool('Volume' in df_plot.columns and df_plot['Volume'].notna().any())
     if has_volume:
         panels_count += 1
         panel_ratios.append(2)
         if 'Vol_SMA20' in df_plot.columns and df_plot['Vol_SMA20'].notna().any():
-            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='Volume'))
+            # 英語の「Volume」を「出来高」に変更
+            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='出来高'))
 
-    # 🌟修正箇所: こちらも同様に bool() で囲む
     has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
     if has_rsi:
         panels_count += 1
@@ -212,10 +212,12 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
     plot_kwargs = dict(
         type='candle',
         style=my_style,
-        volume=has_volume,  # ここに渡される値が標準のbool型になったためエラーが消えます
+        volume=has_volume,
         figratio=(12, 8),
         title=title,
-        savefig=dict(fname=filename, dpi=150, bbox_inches='tight')
+        ylabel='価格(円)',       # メインY軸の日本語化
+        ylabel_lower='出来高',   # 下部Y軸の日本語化
+        returnfig=True           # 直接保存せず、一度画像データ(fig, axes)として返す
     )
     if aps:
         plot_kwargs['addplot'] = aps
@@ -223,7 +225,25 @@ def generate_safe_chart_image(df_full, filename, title, tail_count):
     if len(panel_ratios) > 1:
         plot_kwargs['panel_ratios'] = tuple(panel_ratios)
 
-    mpf.plot(df_plot, **plot_kwargs)
+    # チャートを描画して、軸データ（axes）を受け取る
+    fig, axes = mpf.plot(df_plot, **plot_kwargs)
+    
+    # 🌟X軸の年月日を数字2桁（YY/MM または YY/MM/DD）に強制書き換え
+    ax_main = axes[0]
+    if timeframe_type == 'weekly':
+        ax_main.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%y/%m'))
+    elif timeframe_type == 'daily':
+        ax_main.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%y/%m'))
+    elif timeframe_type == 'hourly':
+        # 1時間足の場合は見やすくするため7日ごとに日付を表示
+        ax_main.xaxis.set_major_locator(mdates.DayLocator(interval=7))
+        ax_main.xaxis.set_major_formatter(mdates.DateFormatter('%y/%m/%d'))
+        
+    # 日本語化と日付書き換えが完了した画像を保存
+    fig.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.close(fig)
     return filename
 
 # ==========================================
@@ -260,10 +280,10 @@ if analyze_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        # 安全なチャート生成
-        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} 週足", 260)
-        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} 日足", 250)
-        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} 1時間足", 500)
+        # 🌟修正箇所：引数に 'weekly' などを追加
+        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} 週足", 260, 'weekly')
+        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} 日足", 250, 'daily')
+        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} 1時間足", 500, 'hourly')
         
         image_payloads = []
         if img_w: image_payloads.append(Image.open(img_w))
