@@ -92,6 +92,7 @@ def get_edinet_documents(stock_code_4digit, days=60):
         return "EDINET APIキー未設定", []
     try:
         df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
+        df_code['証券コード'] = pd.to_numeric(df_code['証券コード'], errors='coerce')
         target_sec_code = float(stock_code_4digit) * 10
         match_row = df_code[df_code['証券コード'] == target_sec_code]
         if match_row.empty:
@@ -148,7 +149,7 @@ def get_domestic_news(company_name, edinet_reasons=None):
 @st.cache_data(ttl=3600)
 def get_japanese_name(stock_code):
     try:
-        # まずWindows標準の文字コードで読み込みを試す
+        # まずwindows標準の文字コードで読み込みを試す
         try:
             df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
         except UnicodeDecodeError:
@@ -156,13 +157,18 @@ def get_japanese_name(stock_code):
             df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
             
         target_sec_code = float(stock_code) * 10
+        
+        # 🌟修正箇所：CSVの証券コード列を強制的に「数値」に変換する（エラーは無視して空欄にする）
+        df_code['証券コード'] = pd.to_numeric(df_code['証券コード'], errors='coerce')
+        
+        # 数値同士になったので、これで確実にヒットします
         match_row = df_code[df_code['証券コード'] == target_sec_code]
         
         if not match_row.empty:
             raw_name = match_row['提出者名'].values[0]
             # 会社名の不要な部分を削ってスッキリさせる
             for rm in ['株式会社', 'ホールディングス', 'グループ本社', 'グループ']:
-                raw_name = raw_name.replace(rm, '')
+                raw_name = str(raw_name).replace(rm, '')
             return raw_name.strip()
     except Exception:
         pass
