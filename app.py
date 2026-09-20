@@ -301,8 +301,26 @@ if analyze_button and stock_code:
     with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
         macro_text = get_macro_data()
         
+        # --- 日本語の銘柄名を取得する処理 ---
+        jp_name = None
+        try:
+            # すでにEDINET連携で使っているCSVから日本語名（提出者名）を探す
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
+            target_sec_code = float(stock_code) * 10
+            match_row = df_code[df_code['証券コード'] == target_sec_code]
+            if not match_row.empty:
+                raw_name = match_row['提出者名'].values[0]
+                # 見栄えを良くするため「株式会社」などを削除してスッキリさせる
+                jp_name = raw_name.replace('株式会社', '').strip()
+        except:
+            pass
+            
         stock = yf.Ticker(ticker)
-        name = stock.info.get('longName') or stock.info.get('shortName') or stock_code
+        yf_name = stock.info.get('longName') or stock.info.get('shortName') or stock_code
+        
+        # 日本語名が取得できればそれを優先し、なければyfinanceの英語名を使う
+        name = jp_name if jp_name else yf_name
+        # ------------------------------------
         
         # マルチタイムフレームデータの取得
         df_w = stock.history(period="5y", interval="1wk").ffill()
