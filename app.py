@@ -336,7 +336,7 @@ if analyze_button and stock_code:
 {market_data_text}
 """
         # ※安定性重視のため1.5-proを指定しています。プレビュー版をご希望の場合は書き換えてください。
-        model = genai.GenerativeModel('gemini-1.5-pro') 
+        model = genai.GenerativeModel('gemini-3-flash-preview') 
         chat = model.start_chat(history=[])
         st.session_state.chat_session = chat
         
