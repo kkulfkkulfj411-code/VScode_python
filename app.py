@@ -16,6 +16,7 @@ import matplotlib.font_manager as fm
 import os
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
 
@@ -144,6 +145,29 @@ def get_domestic_news(company_name, edinet_reasons=None):
     unique_news = list(dict.fromkeys(news_list))[:9]
     return " / ".join(unique_news) if unique_news else "直近の重要な関連ニュースは見つかりませんでした。"
 
+@st.cache_data(ttl=3600)
+def get_japanese_name(stock_code):
+    try:
+        # まずWindows標準の文字コードで読み込みを試す
+        try:
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
+        except UnicodeDecodeError:
+            # クラウド環境等でUTF-8に変換されている場合はこちらで救済
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
+            
+        target_sec_code = float(stock_code) * 10
+        match_row = df_code[df_code['証券コード'] == target_sec_code]
+        
+        if not match_row.empty:
+            raw_name = match_row['提出者名'].values[0]
+            # 会社名の不要な部分を削ってスッキリさせる
+            for rm in ['株式会社', 'ホールディングス', 'グループ本社', 'グループ']:
+                raw_name = raw_name.replace(rm, '')
+            return raw_name.strip()
+    except Exception:
+        pass
+    return None
+
 def add_indicators(df):
     if df.empty: return df
     df['SMA25'] = ta.trend.sma_indicator(df['Close'], window=25)
@@ -190,7 +214,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         panels_count += 1
         panel_ratios.append(2)
         if 'Vol_SMA20' in df_plot.columns and df_plot['Vol_SMA20'].notna().any():
-            # 英語の「Volume」を「出来高」に変更
             aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='出来高'))
 
     has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
@@ -215,9 +238,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         volume=has_volume,
         figratio=(12, 8),
         title=title,
-        ylabel='価格(円)',       # メインY軸の日本語化
-        ylabel_lower='出来高',   # 下部Y軸の日本語化
-        returnfig=True           # 直接保存せず、一度画像データ(fig, axes)として返す
+        ylabel='価格(円)',
+        ylabel_lower='出来高',
+        returnfig=True
     )
     if aps:
         plot_kwargs['addplot'] = aps
@@ -225,16 +248,14 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if len(panel_ratios) > 1:
         plot_kwargs['panel_ratios'] = tuple(panel_ratios)
 
-    # チャートを描画して、軸データ（axes）を受け取る
     fig, axes = mpf.plot(df_plot, **plot_kwargs)
     
-# 🌟X軸の年月日を数字2桁に強制書き換え（1970年問題対策版）
+    # X軸の年月日を数字2桁に強制書き換え（1970年問題対策版）
     ax_main = axes[0]
     tick_indices = []
     tick_labels = []
     
     if timeframe_type == 'weekly':
-        # 2ヶ月ごとにラベルを作成（例：26/01, 26/03...）
         last_month = None
         count = 0
         for i, dt in enumerate(df_plot.index):
@@ -246,7 +267,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                 last_month = dt.month
 
     elif timeframe_type == 'daily':
-        # 月初めにラベルを作成（例：26/01, 26/02...）
         last_month = None
         for i, dt in enumerate(df_plot.index):
             if dt.month != last_month:
@@ -255,8 +275,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                 last_month = dt.month
 
     elif timeframe_type == 'hourly':
-        # 約7営業日ごとにラベルを作成
-        # 月が切り替わった最初の表記は「YY/MM/DD」、同じ月内は「DD」のみ
         last_date = None
         days_counted = 0
         last_printed_month = None
@@ -274,11 +292,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                 days_counted += 1
                 last_date = current_date
 
-    # 作成した自作ラベルをX軸に上書き適用する
     ax_main.set_xticks(tick_indices)
     ax_main.set_xticklabels(tick_labels, rotation=45)
         
-    # 画像を保存
     fig.savefig(filename, dpi=150, bbox_inches='tight')
     plt.close(fig)
     return filename
@@ -301,26 +317,14 @@ if analyze_button and stock_code:
     with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
         macro_text = get_macro_data()
         
-        # --- 日本語の銘柄名を取得する処理 ---
-        jp_name = None
-        try:
-            # すでにEDINET連携で使っているCSVから日本語名（提出者名）を探す
-            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
-            target_sec_code = float(stock_code) * 10
-            match_row = df_code[df_code['証券コード'] == target_sec_code]
-            if not match_row.empty:
-                raw_name = match_row['提出者名'].values[0]
-                # 見栄えを良くするため「株式会社」などを削除してスッキリさせる
-                jp_name = raw_name.replace('株式会社', '').strip()
-        except:
-            pass
+        # 🌟専用関数で確実に日本語名を取得する
+        jp_name = get_japanese_name(stock_code)
             
         stock = yf.Ticker(ticker)
         yf_name = stock.info.get('longName') or stock.info.get('shortName') or stock_code
         
-        # 日本語名が取得できればそれを優先し、なければyfinanceの英語名を使う
+        # 日本語名があれば採用、なければYahooの英語名
         name = jp_name if jp_name else yf_name
-        # ------------------------------------
         
         # マルチタイムフレームデータの取得
         df_w = stock.history(period="5y", interval="1wk").ffill()
@@ -335,7 +339,6 @@ if analyze_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        # 🌟修正箇所：引数に 'weekly' などを追加
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} 週足", 260, 'weekly')
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} 日足", 250, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} 1時間足", 500, 'hourly')
@@ -345,7 +348,6 @@ if analyze_button and stock_code:
         if img_d: image_payloads.append(Image.open(img_d))
         if img_h: image_payloads.append(Image.open(img_h))
         
-        # ファンダメンタルズとテクニカル値の抽出
         latest_d = df_d.iloc[-1]
         close_price = int(latest_d['Close'])
         vol_avg20 = df_d['Volume'].tail(20).mean()
@@ -375,7 +377,6 @@ if analyze_button and stock_code:
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
         )
         
-        # AI分析用プロンプト（エラー修正済み）
         prompt = f"""
 あなたは投資家（資金500万円、利益は再投資、年間平均インデックス利益超えを目指す、数日〜数週間のスイングトレード主体、最大4週間の注文期限、指値・逆指値・IFDOCO・OCO活用）のポートフォリオを支えるマルチエージェント分析システムです。
 
@@ -410,16 +411,13 @@ if analyze_button and stock_code:
 対象データ：
 {market_data_text}
 """
-        # ※安定性重視のため1.5-proを指定しています。プレビュー版をご希望の場合は書き換えてください。
         model = genai.GenerativeModel('gemini-3-flash-preview') 
         chat = model.start_chat(history=[])
         st.session_state.chat_session = chat
         
-        # エラー修正箇所: [prompt] を渡す
         response = chat.send_message([prompt] + image_payloads)
         st.session_state.report_text = response.text
         
-        # チャートの画面表示
         st.subheader(f"📊 {name} のチャート")
         col1, col2, col3 = st.columns(3)
         if img_w:
