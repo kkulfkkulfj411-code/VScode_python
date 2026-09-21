@@ -42,6 +42,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "report_text" not in st.session_state:
     st.session_state.report_text = ""
+if "chart_images" not in st.session_state:
+    st.session_state.chart_images = None
 
 # ==========================================
 # データ取得関数群
@@ -117,7 +119,6 @@ def get_edinet_documents(stock_code_4digit, days=60):
 @st.cache_data(ttl=3600)
 def get_news(company_name, is_jp, edinet_reasons=None):
     news_list = []
-    # 🌟修正：日米でニュースの検索クエリと取得先言語を切り替える
     if is_jp:
         q1 = urllib.parse.quote(f"{company_name} (アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
         url1 = f"https://news.google.com/rss/search?q={q1}&hl=ja&gl=JP&ceid=JP:ja"
@@ -217,6 +218,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if df_full.index.tz is not None: df_full.index = df_full.index.tz_convert(None)
     
     df_plot = df_full.tail(tail_count).copy()
+    
+    # 🌟修正1：KOPNなど中小型株の欠損データによるクラッシュを完全に防ぐ
+    df_plot = df_plot.dropna(subset=['Open', 'High', 'Low', 'Close'])
     if df_plot.empty: return None
 
     aps = []
@@ -272,58 +276,62 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if aps:
         plot_kwargs['addplot'] = aps
     
-    if len(panel_ratios) > 1:
-        plot_kwargs['panel_ratios'] = tuple(panel_ratios)
-
-    fig, axes = mpf.plot(df_plot, **plot_kwargs)
+    # 🌟修正2：エラー発生時でもアプリ全体が止まらないように保護する
+    try:
+        if len(panel_ratios) > 1:
+            plot_kwargs['panel_ratios'] = tuple(panel_ratios)
     
-    ax_main = axes[0]
-    tick_indices = []
-    tick_labels = []
+        fig, axes = mpf.plot(df_plot, **plot_kwargs)
+        
+        ax_main = axes[0]
+        tick_indices = []
+        tick_labels = []
+        
+        if timeframe_type == 'weekly':
+            last_month = None
+            count = 0
+            for i, dt in enumerate(df_plot.index):
+                if dt.month != last_month:
+                    if count % 2 == 0:
+                        tick_indices.append(i)
+                        tick_labels.append(dt.strftime('%y/%m'))
+                    count += 1
+                    last_month = dt.month
     
-    if timeframe_type == 'weekly':
-        last_month = None
-        count = 0
-        for i, dt in enumerate(df_plot.index):
-            if dt.month != last_month:
-                if count % 2 == 0:
+        elif timeframe_type == 'daily':
+            last_month = None
+            for i, dt in enumerate(df_plot.index):
+                if dt.month != last_month:
                     tick_indices.append(i)
                     tick_labels.append(dt.strftime('%y/%m'))
-                count += 1
-                last_month = dt.month
-
-    elif timeframe_type == 'daily':
-        last_month = None
-        for i, dt in enumerate(df_plot.index):
-            if dt.month != last_month:
-                tick_indices.append(i)
-                tick_labels.append(dt.strftime('%y/%m'))
-                last_month = dt.month
-
-    elif timeframe_type == 'hourly':
-        last_date = None
-        days_counted = 0
-        last_printed_month = None
-        
-        for i, dt in enumerate(df_plot.index):
-            current_date = dt.date()
-            if current_date != last_date:
-                if days_counted % 7 == 0:
-                    tick_indices.append(i)
-                    if dt.month != last_printed_month:
-                        tick_labels.append(dt.strftime('%y/%m/%d'))
-                        last_printed_month = dt.month
-                    else:
-                        tick_labels.append(dt.strftime('%d'))
-                days_counted += 1
-                last_date = current_date
-
-    ax_main.set_xticks(tick_indices)
-    ax_main.set_xticklabels(tick_labels, rotation=45)
-        
-    fig.savefig(filename, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    return filename
+                    last_month = dt.month
+    
+        elif timeframe_type == 'hourly':
+            last_date = None
+            days_counted = 0
+            last_printed_month = None
+            
+            for i, dt in enumerate(df_plot.index):
+                current_date = dt.date()
+                if current_date != last_date:
+                    if days_counted % 7 == 0:
+                        tick_indices.append(i)
+                        if dt.month != last_printed_month:
+                            tick_labels.append(dt.strftime('%y/%m/%d'))
+                            last_printed_month = dt.month
+                        else:
+                            tick_labels.append(dt.strftime('%d'))
+                    days_counted += 1
+                    last_date = current_date
+    
+        ax_main.set_xticks(tick_indices)
+        ax_main.set_xticklabels(tick_labels, rotation=45)
+            
+        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+        return filename
+    except Exception as e:
+        return None
 
 # ==========================================
 # UI構築・メインロジック
@@ -334,13 +342,11 @@ with st.sidebar:
     st.header("分析設定")
     stock_code = st.text_input("銘柄コード（日本株は4桁、米国株はティッカーを入力）", value="NVDA")
     
-    # 🌟追加：入力内容から日本株か米国株かを判定
     is_jp = bool(re.match(r'^\d{4}[A-Za-z]?$', stock_code))
     
     st.markdown("---")
     st.subheader("🔗 調査サイトへ一発アクセス")
     
-    # 🌟追加：日米でショートカットリンクを動的に切り替え。TradingView連携を追加
     if is_jp:
         sbi_search_url = f"https://site0.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultMACON&getFlg=on&burl=search_domestic&cat1=domestic&cat2=none&dir=info&pass=%2Fdomestic%2Fstock%2Fsearch%2F&StockSecId_3={stock_code}"
         kabutan_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
@@ -371,6 +377,7 @@ with st.sidebar:
 if analyze_button and stock_code:
     st.session_state.chat_history = [] 
     st.session_state.report_text = ""
+    st.session_state.chart_images = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
     with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
@@ -383,9 +390,10 @@ if analyze_button and stock_code:
         else:
             name = stock.info.get('longName', stock.info.get('shortName', stock_code))
         
-        df_w = stock.history(period="5y", interval="1wk").ffill()
-        df_d = stock.history(period="1y", interval="1d").ffill()
-        df_h = stock.history(period="3mo", interval="1h").ffill()
+        # 🌟修正3：取得段階での欠損穴埋めを強化
+        df_w = stock.history(period="5y", interval="1wk").ffill().bfill()
+        df_d = stock.history(period="1y", interval="1d").ffill().bfill()
+        df_h = stock.history(period="3mo", interval="1h").ffill().bfill()
         
         if df_d.empty:
             st.error("株価データが取得できませんでした。ティッカーコードを確認してください。")
@@ -398,6 +406,14 @@ if analyze_button and stock_code:
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 250, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
+        
+        # 🌟修正4：生成された画像をSession Stateに保存し、会話しても消えないようにする
+        st.session_state.chart_images = {
+            "name": name,
+            "w": img_w,
+            "d": img_d,
+            "h": img_h
+        }
         
         image_payloads = []
         if img_w: image_payloads.append(Image.open(img_w))
@@ -432,7 +448,6 @@ if analyze_button and stock_code:
         vol_avg20 = df_d['Volume'].tail(20).mean()
         vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if vol_avg20 > 0 else 1.0
 
-# 🌟修正：日米でファンダメンタルズの取得ロジックを切り替え
         try:
             info = stock.info
             if is_jp:
@@ -445,13 +460,11 @@ if analyze_button and stock_code:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
                 pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
                 
-                # 1. 配当利回りのバグ修正（yfinanceの気まぐれな%表記を避け、1株配当額÷株価で自力計算する）
                 if info.get('dividendRate') and close_price > 0:
                     div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2)
                 else:
                     div_yield_pct = 'N/A'
                 
-                # 2. 米国株の時価総額単位を修正（億ドルだと桁が大きすぎるため、グローバル標準の Billion USD とする）
                 if info.get('marketCap'):
                     market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD"
                 else:
@@ -460,7 +473,6 @@ if analyze_button and stock_code:
         except:
             per, pbr, div_yield_pct, market_cap_str = 'N/A', 'N/A', 'N/A', 'N/A'
 
-        # 🌟修正：米国株の場合はEDINETをスキップし、英語ニュースを取得する
         edinet_str = ""
         news_str = ""
         if is_jp:
@@ -539,15 +551,18 @@ ABCDEFGHの順で指定された銘柄を分析し、それぞれ十分な文字
         
         response = chat.send_message([prompt] + image_payloads + doc_payloads)
         st.session_state.report_text = response.text
-        
-        st.subheader(f"📊 {name} のチャート")
-        col1, col2, col3 = st.columns(3)
-        if img_w:
-            with col1: st.image(img_w, use_container_width=True)
-        if img_d:
-            with col2: st.image(img_d, use_container_width=True)
-        if img_h:
-            with col3: st.image(img_h, use_container_width=True)
+
+# 🌟修正5：画面を更新・チャットしてもチャートが消えないようにブロック外に移動
+if st.session_state.chart_images:
+    charts = st.session_state.chart_images
+    st.subheader(f"📊 {charts['name']} のチャート")
+    col1, col2, col3 = st.columns(3)
+    if charts['w']:
+        with col1: st.image(charts['w'], use_container_width=True)
+    if charts['d']:
+        with col2: st.image(charts['d'], use_container_width=True)
+    if charts['h']:
+        with col3: st.image(charts['h'], use_container_width=True)
 
 if st.session_state.report_text:
     st.subheader("📑 AIアナリストチームの分析レポート")
