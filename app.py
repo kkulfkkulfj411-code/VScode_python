@@ -16,16 +16,17 @@ import matplotlib.font_manager as fm
 import os
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import tempfile
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
 
-# --- フォントのパス設定（Streamlit Cloud環境を優先） ---
+# --- フォントのパス設定 ---
 SYS_FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
 if not os.path.exists(SYS_FONT_PATH):
-    SYS_FONT_PATH = 'C:/Windows/Fonts/meiryo.ttc' # ローカルテスト用
+    SYS_FONT_PATH = 'C:/Windows/Fonts/meiryo.ttc'
 
-# --- API初期設定（Streamlit Secretsから取得） ---
+# --- API初期設定 ---
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     edinet_key = st.secrets.get("EDINET_API_KEY", "")
@@ -58,34 +59,6 @@ def get_macro_data():
     except:
         return f"Fear & Greed Index: 取得エラー, VIX: {current_vix}"
 
-def fetch_edinet_for_date(target_date, edinet_code, api_key):
-    url = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
-    params = {"date": target_date, "type": 2, "Subscription-Key": api_key}
-    found_docs, reasons = [], []
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if "results" in data:
-                for doc in data["results"]:
-                    if doc.get("edinetCode") == edinet_code:
-                        title = doc.get("title", "タイトル不明")
-                        desc = doc.get("docDescription")
-                        reason = doc.get("currentReportReason")
-                        
-                        content_details = []
-                        if desc: content_details.append(f"概要: {desc}")
-                        if reason: 
-                            content_details.append(f"事由: {reason}")
-                            if "臨時報告書" in title or "修正" in title or "配当" in title:
-                                reasons.append(reason)
-                        
-                        content_str = " | ".join(content_details) if content_details else "詳細記載なし"
-                        found_docs.append(f"[{target_date}] {title} ({content_str})")
-    except:
-        pass
-    return found_docs, reasons
-
 @st.cache_data(ttl=3600)
 def get_edinet_documents(stock_code_4digit, days=60):
     if not edinet_key:
@@ -104,6 +77,32 @@ def get_edinet_documents(stock_code_4digit, days=60):
     date_list = [(datetime.date.today() - datetime.timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days)]
     all_found, all_reasons = [], []
     
+    def fetch_edinet_for_date(target_date, edinet_code, api_key):
+        url = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
+        params = {"date": target_date, "type": 2, "Subscription-Key": api_key}
+        found_docs, reasons = [], []
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if "results" in data:
+                    for doc in data["results"]:
+                        if doc.get("edinetCode") == edinet_code:
+                            title = doc.get("title", "タイトル不明")
+                            desc = doc.get("docDescription")
+                            reason = doc.get("currentReportReason")
+                            content_details = []
+                            if desc: content_details.append(f"概要: {desc}")
+                            if reason: 
+                                content_details.append(f"事由: {reason}")
+                                if "臨時報告書" in title or "修正" in title or "配当" in title:
+                                    reasons.append(reason)
+                            content_str = " | ".join(content_details) if content_details else "詳細記載なし"
+                            found_docs.append(f"[{target_date}] {title} ({content_str})")
+        except:
+            pass
+        return found_docs, reasons
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_edinet_for_date, d, edinet_code, edinet_key): d for d in date_list}
         for future in as_completed(futures):
@@ -116,20 +115,29 @@ def get_edinet_documents(stock_code_4digit, days=60):
     return res_str, list(set(all_reasons))
 
 @st.cache_data(ttl=3600)
-def get_domestic_news(company_name, edinet_reasons=None):
+def get_news(company_name, is_jp, edinet_reasons=None):
     news_list = []
-    q1 = urllib.parse.quote(f"{company_name} (アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
-    url1 = f"https://news.google.com/rss/search?q={q1}&hl=ja&gl=JP&ceid=JP:ja"
+    # 🌟修正：日米でニュースの検索クエリと取得先言語を切り替える
+    if is_jp:
+        q1 = urllib.parse.quote(f"{company_name} (アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
+        url1 = f"https://news.google.com/rss/search?q={q1}&hl=ja&gl=JP&ceid=JP:ja"
+    else:
+        q1 = urllib.parse.quote(f"{company_name} stock (earnings OR upgrade OR target OR guidance)")
+        url1 = f"https://news.google.com/rss/search?q={q1}&hl=en-US&gl=US&ceid=US:en"
+        
     try:
         feed = feedparser.parse(url1)
         for entry in feed.entries[:8]:
             title = entry.title.split(' - ')[0]
-            if company_name in title or any(kw in title for kw in ['決算', '配当', '株', '業績', 'アナリスト', 'レーティング', '目標']):
+            if is_jp:
+                if company_name in title or any(kw in title for kw in ['決算', '配当', '株', '業績', 'アナリスト', 'レーティング', '目標']):
+                    news_list.append(title)
+            else:
                 news_list.append(title)
     except:
         pass
 
-    if edinet_reasons:
+    if is_jp and edinet_reasons:
         for reason in edinet_reasons:
             match = re.search(r'（(.*?)）', reason)
             keyword = match.group(1) if match else reason[:15]
@@ -149,30 +157,43 @@ def get_domestic_news(company_name, edinet_reasons=None):
 @st.cache_data(ttl=3600)
 def get_japanese_name(stock_code):
     try:
-        # まずwindows標準の文字コードで読み込みを試す
         try:
             df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
         except UnicodeDecodeError:
-            # クラウド環境等でUTF-8に変換されている場合はこちらで救済
             df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
             
         target_sec_code = float(stock_code) * 10
-        
-        # 🌟修正箇所：CSVの証券コード列を強制的に「数値」に変換する（エラーは無視して空欄にする）
         df_code['証券コード'] = pd.to_numeric(df_code['証券コード'], errors='coerce')
-        
-        # 数値同士になったので、これで確実にヒットします
         match_row = df_code[df_code['証券コード'] == target_sec_code]
         
         if not match_row.empty:
             raw_name = match_row['提出者名'].values[0]
-            # 会社名の不要な部分を削ってスッキリさせる
             for rm in ['株式会社', 'ホールディングス', 'グループ本社', 'グループ']:
                 raw_name = str(raw_name).replace(rm, '')
             return raw_name.strip()
     except Exception:
         pass
     return None
+
+@st.cache_data(ttl=3600)
+def get_japanese_fundamentals(stock_code):
+    try:
+        url = f"https://kabutan.jp/stock/?code={stock_code}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=5)
+        html = res.text
+        
+        per = re.search(r'PER[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
+        pbr = re.search(r'PBR[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
+        div = re.search(r'利回り[^0-9]*?([0-9\.]+)[^0-9]*?％', html)
+        
+        return {
+            'per': per.group(1) if per else 'N/A',
+            'pbr': pbr.group(1) if pbr else 'N/A',
+            'div': div.group(1) if div else 'N/A'
+        }
+    except Exception:
+        return {'per': 'N/A', 'pbr': 'N/A', 'div': 'N/A'}
 
 def add_indicators(df):
     if df.empty: return df
@@ -220,7 +241,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         panels_count += 1
         panel_ratios.append(2)
         if 'Vol_SMA20' in df_plot.columns and df_plot['Vol_SMA20'].notna().any():
-            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='出来高'))
+            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='Volume' if timeframe_type != 'daily' else '出来高'))
 
     has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
     if has_rsi:
@@ -244,8 +265,8 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         volume=has_volume,
         figratio=(12, 8),
         title=title,
-        ylabel='価格(円)',
-        ylabel_lower='出来高',
+        ylabel='Price',
+        ylabel_lower='Volume',
         returnfig=True
     )
     if aps:
@@ -256,7 +277,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
     fig, axes = mpf.plot(df_plot, **plot_kwargs)
     
-    # X軸の年月日を数字2桁に強制書き換え（1970年問題対策版）
     ax_main = axes[0]
     tick_indices = []
     tick_labels = []
@@ -312,78 +332,147 @@ st.title("📈 AI株式分析ダッシュボード")
 
 with st.sidebar:
     st.header("分析設定")
-    stock_code = st.text_input("銘柄コード（4桁）を入力", value="6191")
+    stock_code = st.text_input("銘柄コード（日本株は4桁、米国株はティッカーを入力）", value="NVDA")
+    
+    # 🌟追加：入力内容から日本株か米国株かを判定
+    is_jp = bool(re.match(r'^\d{4}[A-Za-z]?$', stock_code))
+    
+    st.markdown("---")
+    st.subheader("🔗 調査サイトへ一発アクセス")
+    
+    # 🌟追加：日米でショートカットリンクを動的に切り替え。TradingView連携を追加
+    if is_jp:
+        sbi_search_url = f"https://site0.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultMACON&getFlg=on&burl=search_domestic&cat1=domestic&cat2=none&dir=info&pass=%2Fdomestic%2Fstock%2Fsearch%2F&StockSecId_3={stock_code}"
+        kabutan_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
+        tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
+        st.markdown(f"""
+        * [SBI証券（個別銘柄トップ）]({sbi_search_url})
+        * [株探（業績・四季報タブ）]({kabutan_url})
+        * [TradingView（チャート分析）]({tv_url})
+        """)
+        st.caption("※SBIのリンクを開いたら、画面中央の「分析」タブを1回クリックしてください。")
+    else:
+        tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
+        yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
+        st.markdown(f"""
+        * [TradingView（チャート分析）]({tv_url})
+        * [Yahoo! Finance (US)]({yh_url})
+        """)
+        st.caption("※米国株はyfinanceでデータを完全取得できるため、手動の資料追加は必須ではありません。")
+
+    st.markdown("---")
+    st.subheader("📁 追加資料（ドラッグ＆ドロップ）")
+    st.caption("PDFレポートや、画面切り取り（Win+Shift+S → ここをクリックしてCtrl+V）で画像を直接AIに渡せます。")
+    uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
+    
+    st.markdown("---")
     analyze_button = st.button("AI分析スタート", type="primary")
 
 if analyze_button and stock_code:
     st.session_state.chat_history = [] 
     st.session_state.report_text = ""
-    ticker = f"{stock_code}.T"
+    ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
     with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
         macro_text = get_macro_data()
         
-        # 🌟専用関数で確実に日本語名を取得する
-        jp_name = get_japanese_name(stock_code)
-            
         stock = yf.Ticker(ticker)
-        yf_name = stock.info.get('longName') or stock.info.get('shortName') or stock_code
+        if is_jp:
+            jp_name = get_japanese_name(stock_code)
+            name = jp_name if jp_name else stock.info.get('longName', stock_code)
+        else:
+            name = stock.info.get('longName', stock.info.get('shortName', stock_code))
         
-        # 日本語名があれば採用、なければYahooの英語名
-        name = jp_name if jp_name else yf_name
-        
-        # マルチタイムフレームデータの取得
         df_w = stock.history(period="5y", interval="1wk").ffill()
         df_d = stock.history(period="1y", interval="1d").ffill()
         df_h = stock.history(period="3mo", interval="1h").ffill()
         
         if df_d.empty:
-            st.error("株価データが取得できませんでした。コードを確認してください。")
+            st.error("株価データが取得できませんでした。ティッカーコードを確認してください。")
             st.stop()
             
         df_w = add_indicators(df_w)
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} 週足", 260, 'weekly')
-        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} 日足", 250, 'daily')
-        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} 1時間足", 500, 'hourly')
+        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
+        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 250, 'daily')
+        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
         
         image_payloads = []
         if img_w: image_payloads.append(Image.open(img_w))
         if img_d: image_payloads.append(Image.open(img_d))
         if img_h: image_payloads.append(Image.open(img_h))
         
+        doc_payloads = []
+        if uploaded_files:
+            for f in uploaded_files:
+                if f.name.lower().endswith('.pdf'):
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(f.getvalue())
+                        tmp_path = tmp.name
+                    uploaded_pdf = genai.upload_file(tmp_path)
+                    doc_payloads.append(uploaded_pdf)
+                else:
+                    doc_payloads.append(Image.open(f))
+
+        try:
+            local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
+            for file_name in local_files:
+                if file_name.lower().endswith('.pdf'):
+                    uploaded_pdf = genai.upload_file(file_name)
+                    doc_payloads.append(uploaded_pdf)
+                else:
+                    doc_payloads.append(Image.open(file_name))
+        except:
+            pass
+
         latest_d = df_d.iloc[-1]
-        close_price = int(latest_d['Close'])
+        close_price = round(latest_d['Close'], 2) if not is_jp else int(latest_d['Close'])
         vol_avg20 = df_d['Volume'].tail(20).mean()
         vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if vol_avg20 > 0 else 1.0
 
+        # 🌟修正：日米でファンダメンタルズの取得ロジックを切り替え
         try:
             info = stock.info
-            per = info.get('trailingPE', 'N/A')
-            pbr = info.get('priceToBook', 'N/A')
-            div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') else 'N/A'
+            if is_jp:
+                fund_data = get_japanese_fundamentals(stock_code)
+                per = fund_data['per'] if fund_data['per'] != 'N/A' else info.get('trailingPE', 'N/A')
+                pbr = fund_data['pbr'] if fund_data['pbr'] != 'N/A' else info.get('priceToBook', 'N/A')
+                div_yield_pct = fund_data['div'] if fund_data['div'] != 'N/A' else (round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') else 'N/A')
+            else:
+                per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
+                pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
+                div_yield_pct = round(info.get('dividendYield', 0) * 100, 2) if info.get('dividendYield') else 'N/A'
+                
             market_cap_oku = round(info.get('marketCap', 0) / 100000000, 1) if info.get('marketCap') else 'N/A'
         except:
             per, pbr, div_yield_pct, market_cap_oku = 'N/A', 'N/A', 'N/A', 'N/A'
 
-        edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
-        news_str = get_domestic_news(name, edinet_reasons)
-        
+        # 🌟修正：米国株の場合はEDINETをスキップし、英語ニュースを取得する
+        edinet_str = ""
+        news_str = ""
+        if is_jp:
+            edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
+            news_str = get_news(name, True, edinet_reasons)
+            edinet_section = f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
+        else:
+            news_str = get_news(name, False)
+            edinet_section = ""
+
         market_data_text = (
             f"【対象銘柄詳細データ】\n"
             f"--- 【銘柄: {name} ({ticker})】 ---\n"
-            f"[ファンダメンタルズ]\n"
-            f"時価総額: 約{market_cap_oku}億円 | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%\n"
+            f"[基本ファンダメンタルズ（※追加資料がある場合は資料内の数値を最優先すること）]\n"
+            f"時価総額: 約{market_cap_oku}億{'円' if is_jp else 'ドル相当'} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%\n"
             f"[直近ニュース・話題・アナリスト動向（重要）]\n{news_str}\n"
-            f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
+            f"{edinet_section}"
             f"[日足（1年相当）最新テクニカル値]\n"
-            f"終値: {close_price} 円 | 出来高20日平均比: {vol_ratio}倍\n"
+            f"終値: {close_price} {'円' if is_jp else 'ドル'} | 出来高20日平均比: {vol_ratio}倍\n"
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
         )
         
-prompt = f"""
+        prompt = f"""
 あなたはプロの投資家チームです。以下の提供データおよびチャート画像を基に、極めて詳細で深掘りした多角的な銘柄分析レポートを作成してください。
 
 【前提とする投資戦略】
@@ -403,6 +492,7 @@ NISAには毎月積み立て投資でオルカンを4万円、S&P500を3万円�
 
 【分析の深さについて】
 今回は個別指定モードのため、添付された高解像度チャート画像を視覚的に分析してください。ボリンジャーバンドの収縮・拡散、サブパネルのRSI推移や出来高移動平均線との乖離、マルチタイムフレームでのトレンド整合性を詳細に読み解いてください。
+さらに、四季報、個別銘柄詳細レポート(PDF)、ニュース等の追加資料が添付されている場合は、その内容（PER/PBR等の指標、業績推移、アナリスト評価など）を最優先で抽出し、各アナリストの分析（特にアナリストAの厳格なバリュー評価）の根拠としてフル活用してください。
 
 【アナリストの役割分担】
 アナリストA、あなたはウォーレンバフェットのような厳格なバリュー投資家です。定性的な夢物語は無視し、キャッシュフローとバランスシートの数字だけを信じてください。また、発表やニュース、目標株価等から適正株価を算出します。
@@ -432,21 +522,20 @@ ABCDEFGHの順で指定された銘柄を分析し、それぞれ十分な文字
 対象データ：
 {market_data_text}
 """
-
-model = genai.GenerativeModel('gemini-3-flash-preview') 
-chat = model.start_chat(history=[])
-st.session_state.chat_session = chat
+        model = genai.GenerativeModel('gemini-3-flash-preview') 
+        chat = model.start_chat(history=[])
+        st.session_state.chat_session = chat
         
-response = chat.send_message([prompt] + image_payloads)
-st.session_state.report_text = response.text
+        response = chat.send_message([prompt] + image_payloads + doc_payloads)
+        st.session_state.report_text = response.text
         
-st.subheader(f"📊 {name} のチャート")
-col1, col2, col3 = st.columns(3)
-if img_w:
+        st.subheader(f"📊 {name} のチャート")
+        col1, col2, col3 = st.columns(3)
+        if img_w:
             with col1: st.image(img_w, use_container_width=True)
-if img_d:
+        if img_d:
             with col2: st.image(img_d, use_container_width=True)
-if img_h:
+        if img_h:
             with col3: st.image(img_h, use_container_width=True)
 
 if st.session_state.report_text:
