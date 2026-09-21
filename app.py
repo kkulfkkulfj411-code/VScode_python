@@ -432,7 +432,7 @@ if analyze_button and stock_code:
         vol_avg20 = df_d['Volume'].tail(20).mean()
         vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if vol_avg20 > 0 else 1.0
 
-        # 🌟修正：日米でファンダメンタルズの取得ロジックを切り替え
+# 🌟修正：日米でファンダメンタルズの取得ロジックを切り替え
         try:
             info = stock.info
             if is_jp:
@@ -440,14 +440,25 @@ if analyze_button and stock_code:
                 per = fund_data['per'] if fund_data['per'] != 'N/A' else info.get('trailingPE', 'N/A')
                 pbr = fund_data['pbr'] if fund_data['pbr'] != 'N/A' else info.get('priceToBook', 'N/A')
                 div_yield_pct = fund_data['div'] if fund_data['div'] != 'N/A' else (round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') else 'N/A')
+                market_cap_str = f"約{round(info.get('marketCap', 0) / 100000000, 1)}億円" if info.get('marketCap') else 'N/A'
             else:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
                 pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
-                div_yield_pct = round(info.get('dividendYield', 0) * 100, 2) if info.get('dividendYield') else 'N/A'
                 
-            market_cap_oku = round(info.get('marketCap', 0) / 100000000, 1) if info.get('marketCap') else 'N/A'
+                # 1. 配当利回りのバグ修正（yfinanceの気まぐれな%表記を避け、1株配当額÷株価で自力計算する）
+                if info.get('dividendRate') and close_price > 0:
+                    div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2)
+                else:
+                    div_yield_pct = 'N/A'
+                
+                # 2. 米国株の時価総額単位を修正（億ドルだと桁が大きすぎるため、グローバル標準の Billion USD とする）
+                if info.get('marketCap'):
+                    market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD"
+                else:
+                    market_cap_str = 'N/A'
+                    
         except:
-            per, pbr, div_yield_pct, market_cap_oku = 'N/A', 'N/A', 'N/A', 'N/A'
+            per, pbr, div_yield_pct, market_cap_str = 'N/A', 'N/A', 'N/A', 'N/A'
 
         # 🌟修正：米国株の場合はEDINETをスキップし、英語ニュースを取得する
         edinet_str = ""
@@ -464,7 +475,7 @@ if analyze_button and stock_code:
             f"【対象銘柄詳細データ】\n"
             f"--- 【銘柄: {name} ({ticker})】 ---\n"
             f"[基本ファンダメンタルズ（※追加資料がある場合は資料内の数値を最優先すること）]\n"
-            f"時価総額: 約{market_cap_oku}億{'円' if is_jp else 'ドル相当'} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%\n"
+            f"時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%\n"
             f"[直近ニュース・話題・アナリスト動向（重要）]\n{news_str}\n"
             f"{edinet_section}"
             f"[日足（1年相当）最新テクニカル値]\n"
