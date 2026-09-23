@@ -310,25 +310,43 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         aps.append(mpf.make_addplot(df_plot['BB_MID'], color='purple', width=0.8, alpha=0.6))
         aps.append(mpf.make_addplot(df_plot['BB_LOW'], color='gray', width=0.8, alpha=0.6))
 
+    # 🌟修正点1: パネルの比率を メイン(6) : サブ(1.5) に変更してサブを縮小
     panel_ratios = [6]
     panels_count = 0
     
     has_volume = bool('Volume' in df_plot.columns and df_plot['Volume'].notna().any())
     if has_volume:
         panels_count += 1
-        panel_ratios.append(2)
+        panel_ratios.append(1.5)
         if 'Vol_SMA20' in df_plot.columns and df_plot['Vol_SMA20'].notna().any():
-            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, ylabel='Volume' if timeframe_type != 'daily' else '出来高'))
+            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count))
 
     has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
     if has_rsi:
         panels_count += 1
-        panel_ratios.append(2)
-        aps.append(mpf.make_addplot(df_plot['RSI'], color='purple', width=1.2, panel=panels_count, ylabel='RSI'))
+        panel_ratios.append(1.5)
+        aps.append(mpf.make_addplot(df_plot['RSI'], color='purple', width=1.2, panel=panels_count))
         df_plot['RSI_70'] = 70
         df_plot['RSI_30'] = 30
         aps.append(mpf.make_addplot(df_plot['RSI_70'], color='gray', linestyle='--', width=0.8, panel=panels_count))
         aps.append(mpf.make_addplot(df_plot['RSI_30'], color='gray', linestyle='--', width=0.8, panel=panels_count))
+
+    # 🌟修正点2: MACDパネルの追加（MACD線、シグナル線、ヒストグラム）
+    # 事前にMACD本体とシグナルを計算しておく（add_indicatorsにも追加が必要ですが、ここで計算してもOKです）
+    df_plot['MACD_Line'] = ta.trend.macd(df_plot['Close'])
+    df_plot['MACD_Signal'] = ta.trend.macd_signal(df_plot['Close'])
+    df_plot['MACD_Hist'] = ta.trend.macd_diff(df_plot['Close'])
+    
+    has_macd = bool('MACD_Line' in df_plot.columns and df_plot['MACD_Line'].notna().any())
+    if has_macd:
+        panels_count += 1
+        panel_ratios.append(1.5)
+        
+        # ヒストグラムは正負で色分け（緑＝プラス、赤＝マイナス）
+        colors = ['green' if val >= 0 else 'red' for val in df_plot['MACD_Hist']]
+        aps.append(mpf.make_addplot(df_plot['MACD_Hist'], type='bar', color=colors, panel=panels_count, alpha=0.5))
+        aps.append(mpf.make_addplot(df_plot['MACD_Line'], color='blue', width=1.0, panel=panels_count))
+        aps.append(mpf.make_addplot(df_plot['MACD_Signal'], color='orange', width=1.0, panel=panels_count))
 
     try:
         meiryo_prop = fm.FontProperties(fname=SYS_FONT_PATH)
@@ -340,10 +358,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         type='candle',
         style=my_style,
         volume=has_volume,
-        figratio=(12, 8),
+        figratio=(12, 10),  # パネルが増えたので縦を少し伸ばす
         title=title,
         ylabel='Price',
-        ylabel_lower='Volume',
         returnfig=True
     )
     if aps:
@@ -384,6 +401,29 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                      backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
                      transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10)
                      
+        # 🌟修正点3: 各サブパネルの左上にラベル（Volume, RSI, MACD）を描画
+        current_panel = 1 # 0はメインチャートなので1から
+        
+        # mpf.plotが返すaxesは [ax_main, ax_volume, ax_volume_twin, ax_addplot1, ax_addplot1_twin...] 
+        # のように複雑なリストになるため、figureから直接パネル領域（Geometry）を判定してラベルを配置します
+        ax_list = [ax for ax in fig.axes if ax.get_geometry()[2] == 1] # メインの枠組みを持つaxのみ抽出
+        
+        if has_volume and current_panel < len(ax_list):
+            ax_vol = ax_list[current_panel]
+            ax_vol.text(0.01, 0.85, 'Volume', transform=ax_vol.transAxes, fontsize=10, fontweight='bold', color='black', alpha=0.7)
+            current_panel += 1
+            
+        if has_rsi and current_panel < len(ax_list):
+            ax_rsi = ax_list[current_panel]
+            ax_rsi.text(0.01, 0.85, 'RSI', transform=ax_rsi.transAxes, fontsize=10, fontweight='bold', color='black', alpha=0.7)
+            current_panel += 1
+            
+        if has_macd and current_panel < len(ax_list):
+            ax_macd = ax_list[current_panel]
+            ax_macd.text(0.01, 0.85, 'MACD', transform=ax_macd.transAxes, fontsize=10, fontweight='bold', color='black', alpha=0.7)
+            current_panel += 1
+
+
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
         highs = []
         lows = []
