@@ -226,7 +226,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
     aps = []
     
-    # 凡例用のフラグ確認とタイトルへの統合
     legend_texts = []
     if 'SMA25' in df_plot.columns and df_plot['SMA25'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA25'], color='blue', width=1.2))
@@ -292,15 +291,13 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
         
-        # 出来高などのY軸にある指数表記（10^6）を完全消去
         from matplotlib.ticker import ScalarFormatter
         for ax in fig.axes:
             formatter = ScalarFormatter(useOffset=False, useMathText=False)
             formatter.set_scientific(False)
             ax.yaxis.set_major_formatter(formatter)
-            ax.yaxis.offsetText.set_visible(False)  # ← 10^6の文字そのものを非表示にする
-    
-        # パネル境界線の明示
+            ax.yaxis.offsetText.set_visible(False)
+            
         for ax in axes:
             ax.spines['top'].set_visible(True)
             ax.spines['bottom'].set_visible(True)
@@ -315,7 +312,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             ax.spines['left'].set_color('black')
             ax.spines['right'].set_color('black')
             
-        # 現在値の右側（Y軸の真上）明示
         last_close = df_plot['Close'].iloc[-1]
         price_str = f"{int(last_close)}" if last_close > 100 else f"{last_close:.2f}"
         
@@ -323,7 +319,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                      backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
                      transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10)
                      
-        # 突出した高値と安値の明示
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
         highs = []
         lows = []
@@ -346,7 +341,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
             ax_main.text(idx, val - (val*0.015), val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
 
-        # 日付軸の最適化
         tick_indices = []
         tick_labels = []
         
@@ -388,15 +382,12 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     tick_labels.append(dt.strftime('%y/%m'))
                     last_month = dt.month
     
-        # 1時間足のX軸（初日と翌日の被りを防止）
         elif timeframe_type == 'hourly':
             last_date_printed = None
             last_month_printed = -1
-            
             for i, dt in enumerate(df_plot.index):
                 current_date = dt.date()
                 if current_date != last_date_printed:
-                    # 初回、または直前のラベルとインデックスが5本以上離れている場合のみ描画
                     if not tick_indices or (i - tick_indices[-1]) >= 4:
                         tick_indices.append(i)
                         if dt.month != last_month_printed:
@@ -436,13 +427,13 @@ with st.sidebar:
         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
         
         st.markdown(f"""
-        * [Yahoo!ファイナンス（四季報要約・信用残）]({yahoo_url})
+        * [Yahoo!ファイナンス（四季報・信用残）]({yahoo_url})
         * [株探（適時開示・IR速報）]({kabutan_disclose_url})
         * [株探（財務・業績推移）]({kabutan_finance_url})
         * [TradingView（詳細チャート）]({tv_url})
         * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
         """)
-        st.caption("※四季報の概況や最新の信用残はYahoo!ファイナンス、会社の公式IRは株探（適時開示）から素早く確認できます。")
+        st.caption("※四季報概況や信用残はYahoo!ファイナンス、公式IR速報は株探（適時開示）から素早く確認できます。")
     else:
         tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
         yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
@@ -488,7 +479,6 @@ if analyze_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        # 🌟修正：1時間足の表示本数を500から130（約1ヶ月分）に削減し、ローソク足を明確にする
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly')
@@ -548,20 +538,17 @@ if analyze_button and stock_code:
             else:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
                 pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
-                
                 if info.get('dividendRate') and close_price > 0:
                     div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2)
                 else:
                     div_yield_pct = 'N/A'
-                
                 if info.get('marketCap'):
                     market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD"
                 else:
                     market_cap_str = 'N/A'
-                    margin_str = ""
-                    
+                margin_str = ""
         except:
-            per, pbr, div_yield_pct, market_cap_str = 'N/A', 'N/A', 'N/A', 'N/A'
+            per, pbr, div_yield_pct, market_cap_str, margin_str = 'N/A', 'N/A', 'N/A', 'N/A', ""
 
         edinet_str = ""
         news_str = ""
