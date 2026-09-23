@@ -346,7 +346,7 @@ with st.sidebar:
     st.subheader("🔗 調査サイトへ一発アクセス")
     
     if is_jp:
-        sbi_search_url = f"https://site0.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultMACON&getFlg=on&burl=search_domestic&cat1=domestic&cat2=none&dir=info&pass=%2Fdomestic%2Fstock%2Fsearch%2F&StockSecId_3={stock_code}"
+        sbisearch_url = f"https://www.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultMACON&getFlg=on&burl=search_domestic&cat1=domestic&cat2=none&dir=info&pass=%2Fdomestic%2Fstock%2Fsearch%2F&StockSecId_3={stock_code}"
         kabutan_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
         st.markdown(f"""
@@ -378,7 +378,7 @@ if analyze_button and stock_code:
     st.session_state.chart_images = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
-    with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
+with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
         macro_text = get_macro_data()
         
         stock = yf.Ticker(ticker)
@@ -388,9 +388,10 @@ if analyze_button and stock_code:
         else:
             name = stock.info.get('longName', stock.info.get('shortName', stock_code))
         
-        df_w = stock.history(period="5y", interval="1wk").ffill().bfill()
-        df_d = stock.history(period="1y", interval="1d").ffill().bfill()
-        df_h = stock.history(period="3mo", interval="1h").ffill().bfill()
+        # 🌟修正1：インジケーター計算用の「助走期間」を長めに取得する（日足を2年、週足を10年に延長）
+        df_w = stock.history(period="10y", interval="1wk").ffill().bfill()
+        df_d = stock.history(period="2y", interval="1d").ffill().bfill()
+        df_h = stock.history(period="1y", interval="1h").ffill().bfill()
         
         if df_d.empty:
             st.error("株価データが取得できませんでした。ティッカーコードを確認してください。")
@@ -400,8 +401,9 @@ if analyze_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
+        # 🌟修正2：日足の表示期間をHYPER SBI 2と同じ「6ヵ月（約130営業日）」に合わせる
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
-        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 250, 'daily')
+        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
         
         st.session_state.chart_images = {
