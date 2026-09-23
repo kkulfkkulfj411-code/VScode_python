@@ -593,15 +593,29 @@ if analyze_button and stock_code:
         
         stock = yf.Ticker(ticker)
         
-        # 🌟修正点：米国株の場合も確実に正式名称（またはショートネーム）を取得し、見出しやチャートタイトルに適用する
+        # 🌟修正点：yfinanceの不安定な info に頼らず、確実に名称を取得する強固なロジックに変更
         if is_jp:
             jp_name = get_japanese_name(stock_code)
-            name = jp_name if jp_name else stock.info.get('longName', stock_code)
+            name = jp_name if jp_name else stock_code
         else:
+            name = stock_code.upper()
             try:
-                # longName（フルネーム）を優先し、無ければshortName、それも無ければティッカーをそのまま使う
-                name = stock.info.get('longName', stock.info.get('shortName', stock_code.upper()))
+                # 検索用に作ったYahoo公式APIに直接ティッカーを投げて、正式名称を確実に抜き出す
+                url = f"https://query2.finance.yahoo.com/v1/finance/search?q={stock_code.upper()}"
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                res = requests.get(url, headers=headers, timeout=5)
+                if res.status_code == 200:
+                    quotes = res.json().get('quotes', [])
+                    for q in quotes:
+                        # 検索結果の中から、ティッカーが完全一致するものを探す
+                        if q.get('symbol', '').upper() == stock_code.upper():
+                            # longname（フルネーム）を優先し、無ければshortnameを採用
+                            found_name = q.get('longname') or q.get('shortname')
+                            if found_name:
+                                name = found_name
+                                break
             except Exception:
+                pass # APIが万が一失敗した場合はティッカー（NVDAなど）のまま進める
                 name = stock_code.upper()
         
         df_w = stock.history(period="10y", interval="1wk").ffill().bfill()
