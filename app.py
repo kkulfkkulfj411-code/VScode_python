@@ -16,6 +16,7 @@ import matplotlib.font_manager as fm
 import os
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import tempfile
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
@@ -119,7 +120,8 @@ def get_edinet_documents(stock_code_4digit, days=60):
 def get_news(company_name, is_jp, edinet_reasons=None):
     news_list = []
     if is_jp:
-        q1 = urllib.parse.quote(f"{company_name} (アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
+        # 🌟修正：TOPIXや再編に関するキーワードを追加
+        q1 = urllib.parse.quote(f"{company_name} (TOPIX OR 再編 OR アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
         url1 = f"https://news.google.com/rss/search?q={q1}&hl=ja&gl=JP&ceid=JP:ja"
     else:
         q1 = urllib.parse.quote(f"{company_name} stock (earnings OR upgrade OR target OR guidance)")
@@ -130,7 +132,7 @@ def get_news(company_name, is_jp, edinet_reasons=None):
         for entry in feed.entries[:8]:
             title = entry.title.split(' - ')[0]
             if is_jp:
-                if company_name in title or any(kw in title for kw in ['決算', '配当', '株', '業績', 'アナリスト', 'レーティング', '目標']):
+                if company_name in title or any(kw in title for kw in ['TOPIX', '再編', '決算', '配当', '株', '業績', 'アナリスト', 'レーティング', '目標']):
                     news_list.append(title)
             else:
                 news_list.append(title)
@@ -414,7 +416,6 @@ if analyze_button and stock_code:
         if img_d: image_payloads.append(Image.open(img_d))
         if img_h: image_payloads.append(Image.open(img_h))
         
-        # 🌟修正：PDFをアップロードせず、直接データとしてパッキングする（インライン送信）
         doc_payloads = []
         if uploaded_files:
             for f in uploaded_files:
@@ -492,6 +493,7 @@ if analyze_button and stock_code:
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
         )
         
+        # 🌟修正：TOPIX再編に関する指示を追加
         prompt = f"""
 あなたはプロの投資家チームです。以下の提供データおよびチャート画像を基に、極めて詳細で深掘りした多角的な銘柄分析レポートを作成してください。
 
@@ -506,6 +508,9 @@ NISAには毎月積み立て投資でオルカンを4万円、S&P500を3万円�
 また、注文可能な期間は最大4週間とし、買いと売りは別の期間で指定が可能。いつまでに買えなければ見送りか、OCOはどこまで追いかけるかも検討してください。保持しておくべきであれば注文そのものを行わないものとします。
 長期的に保有を検討する銘柄の場合に限り、最下限で購入したい価格については株価アラームをセットするものとします。
 メモに使用する注文期間の表示は特定の日付を表示（月日と曜日のみ）し、文の最初に持ってきてください。
+
+【特に注視すべきテーマ】
+現在進行中の「TOPIX再編」に関するニュースや該当する可能性（流通株式時価総額の基準未達による段階的ウエイト低減、除外リスク、または新規組み入れの思惑など）があれば、機関投資家の需給変動（パッシブファンドの売り買い）に直結するカタリストとして最優先で分析に組み込んでください。
 
 【グローバルマクロ参考値】
 {macro_text}
@@ -522,7 +527,7 @@ NISAには毎月積み立て投資でオルカンを4万円、S&P500を3万円�
 アナリストE、あなたは世論の分析者です。ネット上の掲示板やSNSでの「製品やサービスの価値」を重要視します。提供された[直近ニュース・話題・アナリスト動向]を深掘りし、一時的なブームに過ぎないのか、同業の競合と比べて価値があるのかを判断します。
 アナリストF、あなたはZ世代の観測者です。20年前はビデオゲームが否定的に考えられていたのに対し、現在は普遍的なものとして認識されています。同様に今のZ世代の価値観が、社会のメインプレイヤーとなった時に普遍化されると予想される物事を重視します。
 アナリストG、あなたはニュースと株価推移の分析者です。分析対象に関わるこれまでのニュースと世情の移り変わりを調査し、株価の大きな上下との関連を考え、直近の値動きを予想します。また、添付されたチャート画像から、現状の推移がチャートパターンに当てはまれば記述してください。それは直近一週間で見た場合と、3か月程度で見た場合を類推してください。該当がなければ「チャートパターンなし」、あればパターンの名称と共にその後の値動きを推測します。最後に、Fear & Greed Indexの数値とVIXを示し、現在欲望と恐怖のどちらに傾いているかを示します。
-アナリストH、あなたは機関投資家の分析者です。大量保有報告書やForm 13Fから保有している投資家を調査し、記録があればいつ発表されたものかを明記すると共に、どういう動きをしやすい投資家かを示唆します。また添付されたチャートの出来高推移から大口の売買が行われた可能性があるかも判断します。
+アナリストH、あなたは機関投資家の分析者です。大量保有報告書やForm 13Fから保有している投資家を調査し、記録があればいつ発表されたものかを明記すると共に、どういう動きをしやすい投資家かを示唆します。また添付されたチャートの出来高推移から大口の売買が行われた可能性があるかも判断します。特に、前述の「TOPIX再編」に関連するパッシブファンドの機械的な資金流出入のリスクについては厳密に判定してください。
 
 【出力形式】
 ABCDEFGHの順で指定された銘柄を分析し、それぞれ十分な文字数を使って深く自分の意見を述べてください。
