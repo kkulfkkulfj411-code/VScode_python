@@ -346,7 +346,7 @@ with st.sidebar:
     st.subheader("🔗 調査サイトへ一発アクセス")
     
     if is_jp:
-        sbisearch_url = f"https://www.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultMACON&getFlg=on&burl=search_domestic&cat1=domestic&cat2=none&dir=info&pass=%2Fdomestic%2Fstock%2Fsearch%2F&StockSecId_3={stock_code}"
+        sbi_search_url = f"https://www.sbisec.co.jp/ETGate/?_ControlID=WPLETmgR001Control&_PageID=WPLETmgR001Mdtl20&_DataStoreID=DSWPLETmgR001Control&_ActionID=DefaultMACON&getFlg=on&burl=search_domestic&cat1=domestic&cat2=none&dir=info&pass=%2Fdomestic%2Fstock%2Fsearch%2F&StockSecId_3={stock_code}"
         kabutan_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
         st.markdown(f"""
@@ -405,7 +405,7 @@ with st.spinner('市場データとAIによる分析を取得中...（約1〜2�
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
-        
+
         st.session_state.chart_images = {
             "name": name,
             "w": img_w,
