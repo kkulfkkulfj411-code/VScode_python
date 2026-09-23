@@ -412,7 +412,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         ax_main.set_xticks(tick_indices)
         ax_main.set_xticklabels(tick_labels, rotation=45)
             
-        fig.savefig(filename, dpi=150, bbox_inches='tight')
+        fig.savefig(filename, dpi=300, bbox_inches='tight')
         plt.close(fig)
         return filename
     except Exception:
