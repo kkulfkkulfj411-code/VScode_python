@@ -231,7 +231,7 @@ with tab_analyze:
             prompt = generate_system_prompt(macro_text, market_data_text)
             
             # ★修正点3: エラーで落ちていた原因のモデル名を修正
-            model = genai.GenerativeModel('gemini-3.1-pro-preview') 
+            model = genai.GenerativeModel('gemini-2.5-pro') 
             chat = model.start_chat(history=[])
             
             try:
