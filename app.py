@@ -24,6 +24,9 @@ st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wid
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=api_key)
+    for m in genai.list_models():
+        if 'generateContent' in m.supported_generation_methods:
+            st.write(m.name)
 except KeyError:
     st.error("エラー: Streamlit CloudのSecretsに 'GEMINI_API_KEY' が設定されていません。")
     st.stop()
