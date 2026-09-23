@@ -211,9 +211,7 @@ def search_japanese_code_by_name(query):
         except UnicodeDecodeError:
             df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
         
-        # 🌟修正点：この1行（数値化してエラー文字を除外する処理）が抜け落ちていました
         df_code['証券コード'] = pd.to_numeric(df_code['証券コード'], errors='coerce')
-        
         df_code = df_code.dropna(subset=['証券コード'])
         df_code['証券コード'] = (df_code['証券コード'] / 10).astype(int).astype(str)
         
@@ -233,6 +231,10 @@ def search_japanese_code_by_name(query):
             
             mask_fuzzy = df_code['提出者名'].isin(close_names) | df_code['提出者名（ヨミ）'].isin(close_yomis)
             matches = df_code[mask_fuzzy]
+
+        # 🌟修正点：matchesのDataFrameを「証券コード」の数値順（昇順）に並べ替える
+        matches['sort_key'] = pd.to_numeric(matches['証券コード'], errors='coerce')
+        matches = matches.sort_values('sort_key')
 
         return [f"{row['証券コード']} - {row['提出者名']}" for _, row in matches.iterrows()]
     except Exception:
