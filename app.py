@@ -571,17 +571,48 @@ if st.session_state.report_text:
 
 if st.session_state.chat_session:
     st.subheader("💬 ファンドマネージャー（AI）への質問・対話")
+    
+    # 過去のチャット履歴を表示
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
-    if user_query := st.chat_input("レポートへの反論や追加の質問を入力..."):
+    # 🌟修正：画像ペーストに対応した独自のチャット入力フォームを作成
+    with st.form("chat_form", clear_on_submit=True):
+        st.markdown("**追加の質問や、スクショ画像の貼り付け（枠内をクリックしてCtrl+V）はこちら**")
+        user_query = st.text_area("テキストを入力", height=100)
+        chat_images = st.file_uploader("追加画像をドロップまたはペースト", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+        submit_button = st.form_submit_button("送信")
+
+    if submit_button and (user_query or chat_images):
+        # ユーザーの入力を履歴に追加
         with st.chat_message("user"):
             st.markdown(user_query)
-        st.session_state.chat_history.append({"role": "user", "content": user_query})
+            if chat_images:
+                for img in chat_images:
+                    st.image(img, width=300)
+        
+        # 履歴保存用のコンテンツ作成
+        content_for_history = user_query
+        if chat_images:
+            content_for_history += f"\n（※画像 {len(chat_images)}枚を送信しました）"
+            
+        st.session_state.chat_history.append({"role": "user", "content": content_for_history})
+        
+        # Geminiへ送信するペイロード（テキスト＋画像）の作成
+        payload = []
+        if user_query:
+            payload.append(user_query)
+        if chat_images:
+            for img_file in chat_images:
+                payload.append(Image.open(img_file))
         
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
-                res = st.session_state.chat_session.send_message(user_query)
+                # 画像がある場合はリストで送信、テキストのみの場合は文字列で送信
+                res = st.session_state.chat_session.send_message(payload if len(payload) > 1 else payload[0])
                 st.markdown(res.text)
         st.session_state.chat_history.append({"role": "assistant", "content": res.text})
+        
+        # 送信後に画面をリロードしてフォームを綺麗にする
+        st.rerun()
