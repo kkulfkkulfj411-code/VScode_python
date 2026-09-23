@@ -223,18 +223,20 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
     aps = []
     
-    # 凡例用のフラグ
-    has_sma25 = has_sma75 = has_sma200 = False
-    
+    # 凡例用のフラグ確認とタイトルへの統合
+    legend_texts = []
     if 'SMA25' in df_plot.columns and df_plot['SMA25'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA25'], color='blue', width=1.2))
-        has_sma25 = True
+        legend_texts.append("SMA25(青)")
     if 'SMA75' in df_plot.columns and df_plot['SMA75'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA75'], color='orange', width=1.2))
-        has_sma75 = True
+        legend_texts.append("SMA75(橙)")
     if 'SMA200' in df_plot.columns and df_plot['SMA200'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA200'], color='red', width=1.2))
-        has_sma200 = True
+        legend_texts.append("SMA200(赤)")
+        
+    if legend_texts:
+        title = f"{title}   [{' / '.join(legend_texts)}]"
     
     if 'BB_UP' in df_plot.columns and df_plot['BB_UP'].notna().any():
         aps.append(mpf.make_addplot(df_plot['BB_UP'], color='gray', width=0.8, alpha=0.6))
@@ -287,23 +289,12 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
         
-        # 1. 凡例の追加
-        from matplotlib.lines import Line2D
-        custom_lines = []
-        custom_labels = []
-        if has_sma25:
-            custom_lines.append(Line2D([0], [0], color='blue', lw=1.2))
-            custom_labels.append('SMA25')
-        if has_sma75:
-            custom_lines.append(Line2D([0], [0], color='orange', lw=1.2))
-            custom_labels.append('SMA75')
-        if has_sma200:
-            custom_lines.append(Line2D([0], [0], color='red', lw=1.2))
-            custom_labels.append('SMA200')
-        if custom_lines:
-            ax_main.legend(custom_lines, custom_labels, loc='upper left', framealpha=0.7)
-
-        # 2. パネル境界線の明示
+        # 出来高などのY軸にある指数表記（1e6など）を解除し、生数字にする
+        from matplotlib.ticker import PlainFormatter
+        for ax in axes:
+            ax.yaxis.set_major_formatter(PlainFormatter())
+            
+        # パネル境界線の明示
         for ax in axes:
             ax.spines['top'].set_visible(True)
             ax.spines['bottom'].set_visible(True)
@@ -318,16 +309,16 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             ax.spines['left'].set_color('black')
             ax.spines['right'].set_color('black')
             
-        # 3. 現在値の右側明示
-        last_idx = len(df_plot) - 1
+        # 現在値の右側（Y軸の真上）明示
         last_close = df_plot['Close'].iloc[-1]
         price_str = f"{int(last_close)}" if last_close > 100 else f"{last_close:.2f}"
-        # チャートの右端に重ねる形でラベルを描画
-        ax_main.text(last_idx, last_close, f' {price_str} ', color='white', 
-                     backgroundcolor='black', verticalalignment='center', fontsize=9, fontweight='bold')
+        
+        # 座標系をY軸ベース（X=1.0でチャート右端）に変換し、ローソク足ではなく価格軸の上にテキストを乗せる
+        ax_main.text(1.0, last_close, f' {price_str} ', color='white', 
+                     backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
+                     transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10)
                      
-        # 6. 突出した高値と安値の明示
-        # 時間足ごとに極値を探すスパン(window)を調整
+        # 突出した高値と安値の明示
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
         highs = []
         lows = []
@@ -350,7 +341,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
             ax_main.text(idx, val - (val*0.015), val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
 
-        # 日付軸の最適化 (4, 5)
+        # 日付軸の最適化
         tick_indices = []
         tick_labels = []
         
@@ -364,7 +355,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     temp_labels.append(dt)
                     last_month = dt.month
             
-            # 約260週分のデータを3ヶ月ごとに間引く
+            # データを間引く
             filtered_indices = []
             filtered_labels = []
             for j in range(len(temp_indices)):
@@ -372,11 +363,16 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     filtered_indices.append(temp_indices[j])
                     filtered_labels.append(temp_labels[j])
                     
+            seen_years = set()
             for k in range(len(filtered_labels)):
                 dt = filtered_labels[k]
-                # 最後のラベルのみ「年/月」、それ以外は「月」のみ
-                if k == len(filtered_labels) - 1:
+                is_last = (k == len(filtered_labels) - 1)
+                is_first_of_year = dt.year not in seen_years
+                
+                # 最初に出現する年、または一番最後のプロットにだけ年を表記
+                if is_last or is_first_of_year:
                     tick_labels.append(dt.strftime('%y/%m'))
+                    seen_years.add(dt.year)
                 else:
                     tick_labels.append(dt.strftime('%m'))
             tick_indices = filtered_indices
@@ -393,15 +389,12 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             last_stage = -1
             last_month_printed = -1
             for i, dt in enumerate(df_plot.index):
-                # 旬（1〜9日, 10〜19日, 20日〜）を判定
                 if dt.day < 10: stage = 1
                 elif dt.day < 20: stage = 10
                 else: stage = 20
                 
-                # 旬が切り替わった最初の営業日をラベル化
                 if last_stage == -1 or stage != last_stage:
                     tick_indices.append(i)
-                    # 月が変わった時は月日を表示、それ以外は日のみを表示
                     if dt.month != last_month_printed:
                         tick_labels.append(dt.strftime('%m/%d'))
                         last_month_printed = dt.month
