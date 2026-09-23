@@ -211,10 +211,12 @@ def search_japanese_code_by_name(query):
         except UnicodeDecodeError:
             df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
         
+        # 🌟修正点：この1行（数値化してエラー文字を除外する処理）が抜け落ちていました
+        df_code['証券コード'] = pd.to_numeric(df_code['証券コード'], errors='coerce')
+        
         df_code = df_code.dropna(subset=['証券コード'])
         df_code['証券コード'] = (df_code['証券コード'] / 10).astype(int).astype(str)
         
-        # 🌟修正点：欠損値を明示的に空文字で埋め、全て文字列型にキャストしてから検索する
         df_code['提出者名'] = df_code['提出者名'].fillna('').astype(str)
         df_code['提出者名（ヨミ）'] = df_code['提出者名（ヨミ）'].fillna('').astype(str)
         
@@ -234,7 +236,6 @@ def search_japanese_code_by_name(query):
 
         return [f"{row['証券コード']} - {row['提出者名']}" for _, row in matches.iterrows()]
     except Exception:
-        # エラー発生時は一旦空リストを返すが、上記の修正により通常はここには落ちない
         return []
     
 def add_indicators(df):
