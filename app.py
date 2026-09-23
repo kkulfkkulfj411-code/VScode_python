@@ -120,7 +120,6 @@ def get_edinet_documents(stock_code_4digit, days=60):
 def get_news(company_name, is_jp, edinet_reasons=None):
     news_list = []
     if is_jp:
-        # 🌟修正：TOPIXや再編に関するキーワードを追加
         q1 = urllib.parse.quote(f"{company_name} (TOPIX OR 再編 OR アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
         url1 = f"https://news.google.com/rss/search?q={q1}&hl=ja&gl=JP&ceid=JP:ja"
     else:
@@ -378,7 +377,7 @@ if analyze_button and stock_code:
     st.session_state.chart_images = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
-with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
+    with st.spinner('市場データとAIによる分析を取得中...（約1〜2分）'):
         macro_text = get_macro_data()
         
         stock = yf.Ticker(ticker)
@@ -388,7 +387,6 @@ with st.spinner('市場データとAIによる分析を取得中...（約1〜2�
         else:
             name = stock.info.get('longName', stock.info.get('shortName', stock_code))
         
-        # 🌟修正1：インジケーター計算用の「助走期間」を長めに取得する（日足を2年、週足を10年に延長）
         df_w = stock.history(period="10y", interval="1wk").ffill().bfill()
         df_d = stock.history(period="2y", interval="1d").ffill().bfill()
         df_h = stock.history(period="1y", interval="1h").ffill().bfill()
@@ -401,11 +399,10 @@ with st.spinner('市場データとAIによる分析を取得中...（約1〜2�
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        # 🌟修正2：日足の表示期間をHYPER SBI 2と同じ「6ヵ月（約130営業日）」に合わせる
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
-
+        
         st.session_state.chart_images = {
             "name": name,
             "w": img_w,
@@ -495,7 +492,6 @@ with st.spinner('市場データとAIによる分析を取得中...（約1〜2�
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
         )
         
-        # 🌟修正：TOPIX再編に関する指示を追加
         prompt = f"""
 あなたはプロの投資家チームです。以下の提供データおよびチャート画像を基に、極めて詳細で深掘りした多角的な銘柄分析レポートを作成してください。
 
