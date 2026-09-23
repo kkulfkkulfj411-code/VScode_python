@@ -240,6 +240,30 @@ def search_japanese_code_by_name(query):
     except Exception:
         return []
     
+@st.cache_data(ttl=3600)
+def search_us_ticker_by_name(query):
+    if not query: return []
+    try:
+        # Yahoo!ファイナンスのサジェストAPIを利用して企業名からティッカーを検索
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(query)}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            quotes = data.get('quotes', [])
+            matches = []
+            for q in quotes:
+                # 株式(EQUITY)やETFのみを抽出し、ティッカーと企業名を結合
+                if q.get('quoteType') in ['EQUITY', 'ETF']:
+                    symbol = q.get('symbol', '')
+                    name = q.get('shortname', '')
+                    if symbol:
+                        matches.append(f"{symbol} - {name}")
+            return matches[:10]  # 最大10件まで表示
+    except Exception:
+        pass
+    return []
+
 def add_indicators(df):
     if df.empty: return df
     df['SMA25'] = ta.trend.sma_indicator(df['Close'], window=25)
@@ -454,28 +478,42 @@ st.title("📈 AI株式分析ダッシュボード")
 
 with st.sidebar:
     st.header("分析設定")
-    raw_input = st.text_input("銘柄コード または 企業名（一部でも可）", value="6844")
+    # プレースホルダーの文字を少し変更
+    raw_input = st.text_input("銘柄コード または 企業名（日米対応・一部でも可）", value="6844")
     
     stock_code = raw_input
     is_jp = False
     
-    # 入力内容の自動判別（4桁数字ならコード、アルファベットのみなら米国株、それ以外は日本企業名検索）
+    # 入力内容の自動判別ロジック
     if re.match(r'^\d{4}[A-Za-z]?$', raw_input):
+        # 4桁数字（日本株コード）なら直接確定
         stock_code = raw_input
         is_jp = True
-    elif re.match(r'^[A-Za-z]+$', raw_input) and len(raw_input) <= 5:
-        stock_code = raw_input.upper()
-        is_jp = False
     else:
-        # 企業名での曖昧検索を実行
-        matches = search_japanese_code_by_name(raw_input)
-        if matches:
-            selected = st.selectbox("複数の候補が見つかりました。対象を選択してください:", matches)
+        # 日本株と米国株の企業名検索を同時に走らせる
+        jp_matches = search_japanese_code_by_name(raw_input)
+        
+        us_matches = []
+        # 入力にアルファベットが含まれている場合のみ、米国株（Yahoo API）検索も実行
+        if re.search(r'[A-Za-z]', raw_input):
+            us_matches = search_us_ticker_by_name(raw_input)
+            
+        all_matches = jp_matches + us_matches
+        
+        if all_matches:
+            # 検索で候補が見つかった場合はプルダウンを表示
+            selected = st.selectbox("複数の候補が見つかりました。対象を選択してください:", all_matches)
             stock_code = selected.split(" - ")[0]
-            is_jp = True
+            # 選ばれたコードが数字で始まれば日本株、アルファベットなら米国株と判定
+            is_jp = bool(re.match(r'^\d{4}', stock_code))
         else:
-            st.warning("該当する日本企業が見つかりませんでした。")
-            stock_code = ""
+            # 検索にヒットしないが、アルファベットのみの場合は直接ティッカーとして扱う（最後の砦）
+            if re.match(r'^[A-Za-z]+$', raw_input):
+                stock_code = raw_input.upper()
+                is_jp = False
+            else:
+                st.warning("該当する銘柄が見つかりませんでした。")
+                stock_code = ""
     
     st.markdown("---")
     st.subheader("🔗 調査サイトへ一発アクセス")
