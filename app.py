@@ -290,9 +290,11 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         ax_main = axes[0]
         
         # 出来高などのY軸にある指数表記（1e6など）を解除し、生数字にする
-        from matplotlib.ticker import PlainFormatter
+        from matplotlib.ticker import ScalarFormatter
         for ax in axes:
-            ax.yaxis.set_major_formatter(PlainFormatter())
+            formatter = ScalarFormatter(useOffset=False)
+            formatter.set_scientific(False)
+            ax.yaxis.set_major_formatter(formatter)
             
         # パネル境界線の明示
         for ax in axes:
