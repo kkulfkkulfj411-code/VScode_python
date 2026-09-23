@@ -290,10 +290,10 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
         
-        # 出来高などのY軸にある指数表記（1e6など）を解除し、図内の「すべての軸」に対して生数字を適用する
+        # 🌟修正1：出来高などのY軸にある指数表記（1e6など）を完全に強制解除する
         from matplotlib.ticker import ScalarFormatter
         for ax in fig.axes:
-            formatter = ScalarFormatter(useOffset=False)
+            formatter = ScalarFormatter(useOffset=False, useMathText=False)
             formatter.set_scientific(False)
             ax.yaxis.set_major_formatter(formatter)
             
@@ -386,26 +386,20 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     last_month = dt.month
     
         elif timeframe_type == 'hourly':
+            # 🌟修正2：1時間足のX軸を「1日刻み」に変更し、毎日最初のローソク足に日付を打つ
+            last_date_printed = None
             last_month_printed = -1
-            df_temp = df_plot.copy()
-            df_temp['idx'] = range(len(df_temp))
             
-            # 年月ごとにグループ化し、各月の1, 10, 20日以上の「最初のデータ」をピンポイントで取得する
-            for (y, m), group in df_temp.groupby([df_temp.index.year, df_temp.index.month]):
-                for target_day in [1, 10, 20]:
-                    matches = group[group.index.day >= target_day]
-                    if not matches.empty:
-                        idx = matches['idx'].iloc[0]
-                        # 重複を防ぐ＆近すぎるラベル（5本以内）は間引いて文字の重なりを防ぐ
-                        if idx not in tick_indices:
-                            if not tick_indices or (idx - tick_indices[-1]) > 5:
-                                tick_indices.append(idx)
-                                dt = matches.index[0]
-                                if dt.month != last_month_printed:
-                                    tick_labels.append(dt.strftime('%m/%d'))
-                                    last_month_printed = dt.month
-                                else:
-                                    tick_labels.append(dt.strftime('%d'))
+            for i, dt in enumerate(df_plot.index):
+                current_date = dt.date()
+                if current_date != last_date_printed:
+                    tick_indices.append(i)
+                    if dt.month != last_month_printed:
+                        tick_labels.append(dt.strftime('%m/%d'))
+                        last_month_printed = dt.month
+                    else:
+                        tick_labels.append(dt.strftime('%d'))
+                    last_date_printed = current_date
     
         ax_main.set_xticks(tick_indices)
         ax_main.set_xticklabels(tick_labels, rotation=45)
