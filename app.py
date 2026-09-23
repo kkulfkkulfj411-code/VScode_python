@@ -592,11 +592,17 @@ if analyze_button and stock_code:
         macro_text = get_macro_data()
         
         stock = yf.Ticker(ticker)
+        
+        # 🌟修正点：米国株の場合も確実に正式名称（またはショートネーム）を取得し、見出しやチャートタイトルに適用する
         if is_jp:
             jp_name = get_japanese_name(stock_code)
             name = jp_name if jp_name else stock.info.get('longName', stock_code)
         else:
-            name = stock.info.get('longName', stock.info.get('shortName', stock_code))
+            try:
+                # longName（フルネーム）を優先し、無ければshortName、それも無ければティッカーをそのまま使う
+                name = stock.info.get('longName', stock.info.get('shortName', stock_code.upper()))
+            except Exception:
+                name = stock_code.upper()
         
         df_w = stock.history(period="10y", interval="1wk").ffill().bfill()
         df_d = stock.history(period="2y", interval="1d").ffill().bfill()
