@@ -18,6 +18,9 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import tempfile
+import matplotlib.dates as mdates
+import tempfile
+import difflib
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
@@ -198,7 +201,42 @@ def get_japanese_fundamentals(stock_code):
         }
     except Exception:
         return {'per': 'N/A', 'pbr': 'N/A', 'div': 'N/A', 'margin': 'N/A'}
+    
+@st.cache_data(ttl=3600)
+def search_japanese_code_by_name(query):
+    if not query: return []
+    try:
+        try:
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
+        except UnicodeDecodeError:
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
+        
+        df_code = df_code.dropna(subset=['証券コード'])
+        df_code['証券コード'] = (df_code['証券コード'] / 10).astype(int).astype(str)
+        df_code['提出者名'] = df_code['提出者名'].fillna('')
+        df_code['提出者名（ヨミ）'] = df_code['提出者名（ヨミ）'].fillna('')
+        
+        # 1. まずは確実な「部分一致検索」
+        mask = df_code['提出者名'].str.contains(query, case=False) | \
+               df_code['提出者名（ヨミ）'].str.contains(query, case=False)
+        matches = df_code[mask]
+        
+        # 2. 1件もヒットしなかった場合、difflibによる「曖昧検索（もしかして検索）」を実行
+        if matches.empty:
+            names = df_code['提出者名'].tolist()
+            yomis = df_code['提出者名（ヨミ）'].tolist()
+            
+            # 文字の並びや一致率が40%以上似ている候補を最大10件抽出
+            close_names = difflib.get_close_matches(query, names, n=10, cutoff=0.4)
+            close_yomis = difflib.get_close_matches(query, yomis, n=10, cutoff=0.4)
+            
+            mask_fuzzy = df_code['提出者名'].isin(close_names) | df_code['提出者名（ヨミ）'].isin(close_yomis)
+            matches = df_code[mask_fuzzy]
 
+        return [f"{row['証券コード']} - {row['提出者名']}" for _, row in matches.iterrows()]
+    except Exception:
+        return []
+    
 def add_indicators(df):
     if df.empty: return df
     df['SMA25'] = ta.trend.sma_indicator(df['Close'], window=25)
@@ -413,14 +451,33 @@ st.title("📈 AI株式分析ダッシュボード")
 
 with st.sidebar:
     st.header("分析設定")
-    stock_code = st.text_input("銘柄コード（日本株は4桁、米国株はティッカーを入力）", value="6844")
+    raw_input = st.text_input("銘柄コード または 企業名（一部でも可）", value="6844")
     
-    is_jp = bool(re.match(r'^\d{4}[A-Za-z]?$', stock_code))
+    stock_code = raw_input
+    is_jp = False
+    
+    # 入力内容の自動判別（4桁数字ならコード、アルファベットのみなら米国株、それ以外は日本企業名検索）
+    if re.match(r'^\d{4}[A-Za-z]?$', raw_input):
+        stock_code = raw_input
+        is_jp = True
+    elif re.match(r'^[A-Za-z]+$', raw_input) and len(raw_input) <= 5:
+        stock_code = raw_input.upper()
+        is_jp = False
+    else:
+        # 企業名での曖昧検索を実行
+        matches = search_japanese_code_by_name(raw_input)
+        if matches:
+            selected = st.selectbox("複数の候補が見つかりました。対象を選択してください:", matches)
+            stock_code = selected.split(" - ")[0]
+            is_jp = True
+        else:
+            st.warning("該当する日本企業が見つかりませんでした。")
+            stock_code = ""
     
     st.markdown("---")
     st.subheader("🔗 調査サイトへ一発アクセス")
     
-    if is_jp:
+    if is_jp and stock_code:
         yahoo_url = f"https://finance.yahoo.co.jp/quote/{stock_code}.T"
         kabutan_disclose_url = f"https://kabutan.jp/stock/news?code={stock_code}&b=k"
         kabutan_finance_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
@@ -434,7 +491,7 @@ with st.sidebar:
         * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
         """)
         st.caption("※四季報概況や信用残はYahoo!ファイナンス、公式IR速報は株探（適時開示）から素早く確認できます。")
-    else:
+    elif not is_jp and stock_code:
         tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
         yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
         st.markdown(f"""
@@ -449,7 +506,8 @@ with st.sidebar:
     uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
     
     st.markdown("---")
-    analyze_button = st.button("AI分析スタート", type="primary")
+    # stock_codeが空（検索失敗時）はボタンを無効化する安全処理
+    analyze_button = st.button("AI分析スタート", type="primary", disabled=not bool(stock_code))
 
 if analyze_button and stock_code:
     st.session_state.chat_history = [] 
