@@ -235,7 +235,10 @@ with tab_analyze:
             chat = model.start_chat(history=[])
             
             try:
-                response = chat.send_message([prompt] + image_payloads + doc_payloads)
+                response = chat.send_message(
+                [prompt] + image_payloads + doc_payloads,
+                request_options={"timeout": 600}
+)
                 st.session_state.report_text = response.text
                 st.session_state.chat_session = chat
                 
