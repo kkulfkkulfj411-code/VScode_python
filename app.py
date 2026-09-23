@@ -16,7 +16,6 @@ import matplotlib.font_manager as fm
 import os
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import tempfile
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
@@ -218,8 +217,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if df_full.index.tz is not None: df_full.index = df_full.index.tz_convert(None)
     
     df_plot = df_full.tail(tail_count).copy()
-    
-    # 🌟修正1：KOPNなど中小型株の欠損データによるクラッシュを完全に防ぐ
     df_plot = df_plot.dropna(subset=['Open', 'High', 'Low', 'Close'])
     if df_plot.empty: return None
 
@@ -276,7 +273,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if aps:
         plot_kwargs['addplot'] = aps
     
-    # 🌟修正2：エラー発生時でもアプリ全体が止まらないように保護する
     try:
         if len(panel_ratios) > 1:
             plot_kwargs['panel_ratios'] = tuple(panel_ratios)
@@ -330,7 +326,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig.savefig(filename, dpi=150, bbox_inches='tight')
         plt.close(fig)
         return filename
-    except Exception as e:
+    except Exception:
         return None
 
 # ==========================================
@@ -340,7 +336,7 @@ st.title("📈 AI株式分析ダッシュボード")
 
 with st.sidebar:
     st.header("分析設定")
-    stock_code = st.text_input("銘柄コード（日本株は4桁、米国株はティッカーを入力）", value="NVDA")
+    stock_code = st.text_input("銘柄コード（日本株は4桁、米国株はティッカーを入力）", value="6844")
     
     is_jp = bool(re.match(r'^\d{4}[A-Za-z]?$', stock_code))
     
@@ -390,7 +386,6 @@ if analyze_button and stock_code:
         else:
             name = stock.info.get('longName', stock.info.get('shortName', stock_code))
         
-        # 🌟修正3：取得段階での欠損穴埋めを強化
         df_w = stock.history(period="5y", interval="1wk").ffill().bfill()
         df_d = stock.history(period="1y", interval="1d").ffill().bfill()
         df_h = stock.history(period="3mo", interval="1h").ffill().bfill()
@@ -407,7 +402,6 @@ if analyze_button and stock_code:
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 250, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
         
-        # 🌟修正4：生成された画像をSession Stateに保存し、会話しても消えないようにする
         st.session_state.chart_images = {
             "name": name,
             "w": img_w,
@@ -420,15 +414,15 @@ if analyze_button and stock_code:
         if img_d: image_payloads.append(Image.open(img_d))
         if img_h: image_payloads.append(Image.open(img_h))
         
+        # 🌟修正：PDFをアップロードせず、直接データとしてパッキングする（インライン送信）
         doc_payloads = []
         if uploaded_files:
             for f in uploaded_files:
                 if f.name.lower().endswith('.pdf'):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                        tmp.write(f.getvalue())
-                        tmp_path = tmp.name
-                    uploaded_pdf = genai.upload_file(tmp_path)
-                    doc_payloads.append(uploaded_pdf)
+                    doc_payloads.append({
+                        "mime_type": "application/pdf",
+                        "data": f.getvalue()
+                    })
                 else:
                     doc_payloads.append(Image.open(f))
 
@@ -436,8 +430,11 @@ if analyze_button and stock_code:
             local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
             for file_name in local_files:
                 if file_name.lower().endswith('.pdf'):
-                    uploaded_pdf = genai.upload_file(file_name)
-                    doc_payloads.append(uploaded_pdf)
+                    with open(file_name, "rb") as pdf_file:
+                        doc_payloads.append({
+                            "mime_type": "application/pdf",
+                            "data": pdf_file.read()
+                        })
                 else:
                     doc_payloads.append(Image.open(file_name))
         except:
@@ -547,12 +544,10 @@ ABCDEFGHの順で指定された銘柄を分析し、それぞれ十分な文字
 """
         model = genai.GenerativeModel('gemini-3-flash-preview') 
         chat = model.start_chat(history=[])
-        st.session_state.chat_session = chat
         
         response = chat.send_message([prompt] + image_payloads + doc_payloads)
         st.session_state.report_text = response.text
 
-# 🌟修正5：画面を更新・チャットしてもチャートが消えないようにブロック外に移動
 if st.session_state.chart_images:
     charts = st.session_state.chart_images
     st.subheader(f"📊 {charts['name']} のチャート")
