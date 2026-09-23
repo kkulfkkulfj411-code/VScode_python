@@ -188,14 +188,16 @@ def get_japanese_fundamentals(stock_code):
         per = re.search(r'PER[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
         pbr = re.search(r'PBR[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
         div = re.search(r'利回り[^0-9]*?([0-9\.]+)[^0-9]*?％', html)
+        margin = re.search(r'信用倍率[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
         
         return {
             'per': per.group(1) if per else 'N/A',
             'pbr': pbr.group(1) if pbr else 'N/A',
-            'div': div.group(1) if div else 'N/A'
+            'div': div.group(1) if div else 'N/A',
+            'margin': margin.group(1) if margin else 'N/A'
         }
     except Exception:
-        return {'per': 'N/A', 'pbr': 'N/A', 'div': 'N/A'}
+        return {'per': 'N/A', 'pbr': 'N/A', 'div': 'N/A', 'margin': 'N/A'}
 
 def add_indicators(df):
     if df.empty: return df
@@ -290,13 +292,14 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
         
-        # 🌟修正1：出来高などのY軸にある指数表記（1e6など）を完全に強制解除する
+        # 出来高などのY軸にある指数表記（10^6）を完全消去
         from matplotlib.ticker import ScalarFormatter
         for ax in fig.axes:
             formatter = ScalarFormatter(useOffset=False, useMathText=False)
             formatter.set_scientific(False)
             ax.yaxis.set_major_formatter(formatter)
-            
+            ax.yaxis.offsetText.set_visible(False)  # ← 10^6の文字そのものを非表示にする
+    
         # パネル境界線の明示
         for ax in axes:
             ax.spines['top'].set_visible(True)
@@ -385,21 +388,23 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     tick_labels.append(dt.strftime('%y/%m'))
                     last_month = dt.month
     
+        # 1時間足のX軸（初日と翌日の被りを防止）
         elif timeframe_type == 'hourly':
-            # 🌟修正2：1時間足のX軸を「1日刻み」に変更し、毎日最初のローソク足に日付を打つ
             last_date_printed = None
             last_month_printed = -1
             
             for i, dt in enumerate(df_plot.index):
                 current_date = dt.date()
                 if current_date != last_date_printed:
-                    tick_indices.append(i)
-                    if dt.month != last_month_printed:
-                        tick_labels.append(dt.strftime('%m/%d'))
-                        last_month_printed = dt.month
-                    else:
-                        tick_labels.append(dt.strftime('%d'))
-                    last_date_printed = current_date
+                    # 初回、または直前のラベルとインデックスが5本以上離れている場合のみ描画
+                    if not tick_indices or (i - tick_indices[-1]) >= 4:
+                        tick_indices.append(i)
+                        if dt.month != last_month_printed:
+                            tick_labels.append(dt.strftime('%m/%d'))
+                            last_month_printed = dt.month
+                        else:
+                            tick_labels.append(dt.strftime('%d'))
+                        last_date_printed = current_date
     
         ax_main.set_xticks(tick_indices)
         ax_main.set_xticklabels(tick_labels, rotation=45)
@@ -425,15 +430,19 @@ with st.sidebar:
     st.subheader("🔗 調査サイトへ一発アクセス")
     
     if is_jp:
-        sbi_search_url = "https://www.sbisec.co.jp/"
-        kabutan_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
+        yahoo_url = f"https://finance.yahoo.co.jp/quote/{stock_code}.T"
+        kabutan_disclose_url = f"https://kabutan.jp/stock/news?code={stock_code}&b=k"
+        kabutan_finance_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
+        
         st.markdown(f"""
-        * [SBI証券（トップページ）]({sbi_search_url})
-        * [株探（業績・四季報タブ）]({kabutan_url})
-        * [TradingView（チャート分析）]({tv_url})
+        * [Yahoo!ファイナンス（四季報要約・信用残）]({yahoo_url})
+        * [株探（適時開示・IR速報）]({kabutan_disclose_url})
+        * [株探（財務・業績推移）]({kabutan_finance_url})
+        * [TradingView（詳細チャート）]({tv_url})
+        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
         """)
-        st.caption(f"※SBI証券は外部からの直接アクセスを弾くため、開いたページの検索窓に **{stock_code}** を入力して検索してください。")
+        st.caption("※四季報の概況や最新の信用残はYahoo!ファイナンス、会社の公式IRは株探（適時開示）から素早く確認できます。")
     else:
         tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
         yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
@@ -533,7 +542,9 @@ if analyze_button and stock_code:
                 per = fund_data['per'] if fund_data['per'] != 'N/A' else info.get('trailingPE', 'N/A')
                 pbr = fund_data['pbr'] if fund_data['pbr'] != 'N/A' else info.get('priceToBook', 'N/A')
                 div_yield_pct = fund_data['div'] if fund_data['div'] != 'N/A' else (round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') else 'N/A')
+                margin_ratio = fund_data['margin']
                 market_cap_str = f"約{round(info.get('marketCap', 0) / 100000000, 1)}億円" if info.get('marketCap') else 'N/A'
+                margin_str = f" | 信用倍率: {margin_ratio}倍" if margin_ratio != 'N/A' else ""
             else:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
                 pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
@@ -547,6 +558,7 @@ if analyze_button and stock_code:
                     market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD"
                 else:
                     market_cap_str = 'N/A'
+                    margin_str = ""
                     
         except:
             per, pbr, div_yield_pct, market_cap_str = 'N/A', 'N/A', 'N/A', 'N/A'
@@ -565,7 +577,7 @@ if analyze_button and stock_code:
             f"【対象銘柄詳細データ】\n"
             f"--- 【銘柄: {name} ({ticker})】 ---\n"
             f"[基本ファンダメンタルズ（※追加資料がある場合は資料内の数値を最優先すること）]\n"
-            f"時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%\n"
+            f"時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
             f"[直近ニュース・話題・アナリスト動向（重要）]\n{news_str}\n"
             f"{edinet_section}"
             f"[日足（1年相当）最新テクニカル値]\n"
