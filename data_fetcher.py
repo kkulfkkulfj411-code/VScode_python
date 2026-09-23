@@ -235,3 +235,49 @@ def search_us_ticker_by_name(query):
     except Exception:
         pass
     return []
+
+# ==========================================
+# Googleスプレッドシート連携（GAS Web版）
+# ==========================================
+
+def save_analysis_to_sheet(date_str, stock_code, name, judgement, target_price, time_limit, report_text):
+    webapp_url = st.secrets.get("GAS_WEBAPP_URL", "")
+    if not webapp_url:
+        st.error("GAS_WEBAPP_URLが設定されていません。")
+        return False
+        
+    payload = {
+        "date": date_str,
+        "stock_code": stock_code,
+        "name": name,
+        "judgement": judgement,
+        "target_price": target_price,
+        "time_limit": time_limit,
+        "report_text": report_text
+    }
+    
+    try:
+        response = requests.post(webapp_url, json=payload)
+        if response.status_code == 200 and response.json().get("status") == "success":
+            return True
+        else:
+            st.error("スプレッドシートへの保存に失敗しました。")
+            return False
+    except Exception as e:
+        st.error(f"通信エラー: {e}")
+        return False
+
+def load_history_from_sheet():
+    webapp_url = st.secrets.get("GAS_WEBAPP_URL", "")
+    if not webapp_url:
+        return pd.DataFrame()
+        
+    try:
+        response = requests.get(webapp_url)
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0:
+                return pd.DataFrame(data)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()

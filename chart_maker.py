@@ -59,7 +59,8 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         aps.append(mpf.make_addplot(df_plot['BB_MID'], color='purple', width=0.8, alpha=0.6))
         aps.append(mpf.make_addplot(df_plot['BB_LOW'], color='gray', width=0.8, alpha=0.6))
 
-    panel_ratios = [6]
+# 🌟修正点：メインチャートの比率を8に広げ、RSIとMACDを0.75（従来の半分）に縮小
+    panel_ratios = [8]
     panels_count = 0
     
     has_volume = bool('Volume' in df_plot.columns and df_plot['Volume'].notna().any())
@@ -72,7 +73,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
     if has_rsi:
         panels_count += 1
-        panel_ratios.append(1.5)
+        panel_ratios.append(0.75)
         aps.append(mpf.make_addplot(df_plot['RSI'], color='purple', width=1.2, panel=panels_count))
         df_plot['RSI_70'] = 70
         df_plot['RSI_30'] = 30
@@ -82,7 +83,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     has_macd = bool('MACD_Line' in df_plot.columns and df_plot['MACD_Line'].notna().any())
     if has_macd:
         panels_count += 1
-        panel_ratios.append(1.5)
+        panel_ratios.append(0.75)
         colors = ['green' if val >= 0 else 'red' for val in df_plot['MACD_Hist']]
         aps.append(mpf.make_addplot(df_plot['MACD_Hist'], type='bar', color=colors, panel=panels_count, alpha=0.5))
         aps.append(mpf.make_addplot(df_plot['MACD_Line'], color='blue', width=1.0, panel=panels_count))
