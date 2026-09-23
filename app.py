@@ -223,12 +223,18 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
     aps = []
     
+    # 凡例用のフラグ
+    has_sma25 = has_sma75 = has_sma200 = False
+    
     if 'SMA25' in df_plot.columns and df_plot['SMA25'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA25'], color='blue', width=1.2))
+        has_sma25 = True
     if 'SMA75' in df_plot.columns and df_plot['SMA75'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA75'], color='orange', width=1.2))
+        has_sma75 = True
     if 'SMA200' in df_plot.columns and df_plot['SMA200'].notna().any():
         aps.append(mpf.make_addplot(df_plot['SMA200'], color='red', width=1.2))
+        has_sma200 = True
     
     if 'BB_UP' in df_plot.columns and df_plot['BB_UP'].notna().any():
         aps.append(mpf.make_addplot(df_plot['BB_UP'], color='gray', width=0.8, alpha=0.6))
@@ -279,21 +285,101 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             plot_kwargs['panel_ratios'] = tuple(panel_ratios)
     
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
-        
         ax_main = axes[0]
+        
+        # 1. 凡例の追加
+        from matplotlib.lines import Line2D
+        custom_lines = []
+        custom_labels = []
+        if has_sma25:
+            custom_lines.append(Line2D([0], [0], color='blue', lw=1.2))
+            custom_labels.append('SMA25')
+        if has_sma75:
+            custom_lines.append(Line2D([0], [0], color='orange', lw=1.2))
+            custom_labels.append('SMA75')
+        if has_sma200:
+            custom_lines.append(Line2D([0], [0], color='red', lw=1.2))
+            custom_labels.append('SMA200')
+        if custom_lines:
+            ax_main.legend(custom_lines, custom_labels, loc='upper left', framealpha=0.7)
+
+        # 2. パネル境界線の明示
+        for ax in axes:
+            ax.spines['top'].set_visible(True)
+            ax.spines['bottom'].set_visible(True)
+            ax.spines['left'].set_visible(True)
+            ax.spines['right'].set_visible(True)
+            ax.spines['top'].set_linewidth(1.5)
+            ax.spines['bottom'].set_linewidth(1.5)
+            ax.spines['left'].set_linewidth(1.0)
+            ax.spines['right'].set_linewidth(1.0)
+            ax.spines['top'].set_color('black')
+            ax.spines['bottom'].set_color('black')
+            ax.spines['left'].set_color('black')
+            ax.spines['right'].set_color('black')
+            
+        # 3. 現在値の右側明示
+        last_idx = len(df_plot) - 1
+        last_close = df_plot['Close'].iloc[-1]
+        price_str = f"{int(last_close)}" if last_close > 100 else f"{last_close:.2f}"
+        # チャートの右端に重ねる形でラベルを描画
+        ax_main.text(last_idx, last_close, f' {price_str} ', color='white', 
+                     backgroundcolor='black', verticalalignment='center', fontsize=9, fontweight='bold')
+                     
+        # 6. 突出した高値と安値の明示
+        # 時間足ごとに極値を探すスパン(window)を調整
+        window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
+        highs = []
+        lows = []
+        for i in range(window_size, len(df_plot) - window_size):
+            is_high = True
+            is_low = True
+            for j in range(i - window_size, i + window_size + 1):
+                if i != j:
+                    if df_plot['High'].iloc[i] <= df_plot['High'].iloc[j]:
+                        is_high = False
+                    if df_plot['Low'].iloc[i] >= df_plot['Low'].iloc[j]:
+                        is_low = False
+            if is_high: highs.append((i, df_plot['High'].iloc[i]))
+            if is_low: lows.append((i, df_plot['Low'].iloc[i]))
+            
+        for idx, val in highs:
+            val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
+            ax_main.text(idx, val + (val*0.015), val_str, ha='center', va='bottom', color='green', fontsize=8, fontweight='bold')
+        for idx, val in lows:
+            val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
+            ax_main.text(idx, val - (val*0.015), val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
+
+        # 日付軸の最適化 (4, 5)
         tick_indices = []
         tick_labels = []
         
         if timeframe_type == 'weekly':
             last_month = None
-            count = 0
+            temp_indices = []
+            temp_labels = []
             for i, dt in enumerate(df_plot.index):
                 if dt.month != last_month:
-                    if count % 2 == 0:
-                        tick_indices.append(i)
-                        tick_labels.append(dt.strftime('%y/%m'))
-                    count += 1
+                    temp_indices.append(i)
+                    temp_labels.append(dt)
                     last_month = dt.month
+            
+            # 約260週分のデータを3ヶ月ごとに間引く
+            filtered_indices = []
+            filtered_labels = []
+            for j in range(len(temp_indices)):
+                if j % 3 == 0:
+                    filtered_indices.append(temp_indices[j])
+                    filtered_labels.append(temp_labels[j])
+                    
+            for k in range(len(filtered_labels)):
+                dt = filtered_labels[k]
+                # 最後のラベルのみ「年/月」、それ以外は「月」のみ
+                if k == len(filtered_labels) - 1:
+                    tick_labels.append(dt.strftime('%y/%m'))
+                else:
+                    tick_labels.append(dt.strftime('%m'))
+            tick_indices = filtered_indices
     
         elif timeframe_type == 'daily':
             last_month = None
@@ -304,22 +390,24 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     last_month = dt.month
     
         elif timeframe_type == 'hourly':
-            last_date = None
-            days_counted = 0
-            last_printed_month = None
-            
+            last_stage = -1
+            last_month_printed = -1
             for i, dt in enumerate(df_plot.index):
-                current_date = dt.date()
-                if current_date != last_date:
-                    if days_counted % 7 == 0:
-                        tick_indices.append(i)
-                        if dt.month != last_printed_month:
-                            tick_labels.append(dt.strftime('%y/%m/%d'))
-                            last_printed_month = dt.month
-                        else:
-                            tick_labels.append(dt.strftime('%d'))
-                    days_counted += 1
-                    last_date = current_date
+                # 旬（1〜9日, 10〜19日, 20日〜）を判定
+                if dt.day < 10: stage = 1
+                elif dt.day < 20: stage = 10
+                else: stage = 20
+                
+                # 旬が切り替わった最初の営業日をラベル化
+                if last_stage == -1 or stage != last_stage:
+                    tick_indices.append(i)
+                    # 月が変わった時は月日を表示、それ以外は日のみを表示
+                    if dt.month != last_month_printed:
+                        tick_labels.append(dt.strftime('%m/%d'))
+                        last_month_printed = dt.month
+                    else:
+                        tick_labels.append(dt.strftime('%d'))
+                    last_stage = stage
     
         ax_main.set_xticks(tick_indices)
         ax_main.set_xticklabels(tick_labels, rotation=45)
