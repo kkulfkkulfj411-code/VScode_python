@@ -1,6 +1,7 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import ta
 import datetime
 import fear_greed
@@ -289,9 +290,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
         
-        # 出来高などのY軸にある指数表記（1e6など）を解除し、生数字にする
+        # 出来高などのY軸にある指数表記（1e6など）を解除し、図内の「すべての軸」に対して生数字を適用する
         from matplotlib.ticker import ScalarFormatter
-        for ax in axes:
+        for ax in fig.axes:
             formatter = ScalarFormatter(useOffset=False)
             formatter.set_scientific(False)
             ax.yaxis.set_major_formatter(formatter)
@@ -315,7 +316,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         last_close = df_plot['Close'].iloc[-1]
         price_str = f"{int(last_close)}" if last_close > 100 else f"{last_close:.2f}"
         
-        # 座標系をY軸ベース（X=1.0でチャート右端）に変換し、ローソク足ではなく価格軸の上にテキストを乗せる
         ax_main.text(1.0, last_close, f' {price_str} ', color='white', 
                      backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
                      transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10)
@@ -357,7 +357,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     temp_labels.append(dt)
                     last_month = dt.month
             
-            # データを間引く
             filtered_indices = []
             filtered_labels = []
             for j in range(len(temp_indices)):
@@ -371,7 +370,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                 is_last = (k == len(filtered_labels) - 1)
                 is_first_of_year = dt.year not in seen_years
                 
-                # 最初に出現する年、または一番最後のプロットにだけ年を表記
                 if is_last or is_first_of_year:
                     tick_labels.append(dt.strftime('%y/%m'))
                     seen_years.add(dt.year)
@@ -388,21 +386,26 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     last_month = dt.month
     
         elif timeframe_type == 'hourly':
-            last_stage = -1
             last_month_printed = -1
-            for i, dt in enumerate(df_plot.index):
-                if dt.day < 10: stage = 1
-                elif dt.day < 20: stage = 10
-                else: stage = 20
-                
-                if last_stage == -1 or stage != last_stage:
-                    tick_indices.append(i)
-                    if dt.month != last_month_printed:
-                        tick_labels.append(dt.strftime('%m/%d'))
-                        last_month_printed = dt.month
-                    else:
-                        tick_labels.append(dt.strftime('%d'))
-                    last_stage = stage
+            df_temp = df_plot.copy()
+            df_temp['idx'] = range(len(df_temp))
+            
+            # 年月ごとにグループ化し、各月の1, 10, 20日以上の「最初のデータ」をピンポイントで取得する
+            for (y, m), group in df_temp.groupby([df_temp.index.year, df_temp.index.month]):
+                for target_day in [1, 10, 20]:
+                    matches = group[group.index.day >= target_day]
+                    if not matches.empty:
+                        idx = matches['idx'].iloc[0]
+                        # 重複を防ぐ＆近すぎるラベル（5本以内）は間引いて文字の重なりを防ぐ
+                        if idx not in tick_indices:
+                            if not tick_indices or (idx - tick_indices[-1]) > 5:
+                                tick_indices.append(idx)
+                                dt = matches.index[0]
+                                if dt.month != last_month_printed:
+                                    tick_labels.append(dt.strftime('%m/%d'))
+                                    last_month_printed = dt.month
+                                else:
+                                    tick_labels.append(dt.strftime('%d'))
     
         ax_main.set_xticks(tick_indices)
         ax_main.set_xticklabels(tick_labels, rotation=45)
@@ -482,9 +485,10 @@ if analyze_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
+        # 🌟修正：1時間足の表示本数を500から130（約1ヶ月分）に削減し、ローソク足を明確にする
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
-        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 500, 'hourly')
+        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly')
         
         st.session_state.chart_images = {
             "name": name,
@@ -661,12 +665,10 @@ if st.session_state.report_text:
 if st.session_state.chat_session:
     st.subheader("💬 ファンドマネージャー（AI）への質問・対話")
     
-    # 過去のチャット履歴を表示
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
-    # 🌟修正：画像ペーストに対応した独自のチャット入力フォームを作成
     with st.form("chat_form", clear_on_submit=True):
         st.markdown("**追加の質問や、スクショ画像の貼り付け（枠内をクリックしてCtrl+V）はこちら**")
         user_query = st.text_area("テキストを入力", height=100)
@@ -674,21 +676,18 @@ if st.session_state.chat_session:
         submit_button = st.form_submit_button("送信")
 
     if submit_button and (user_query or chat_images):
-        # ユーザーの入力を履歴に追加
         with st.chat_message("user"):
             st.markdown(user_query)
             if chat_images:
                 for img in chat_images:
                     st.image(img, width=300)
         
-        # 履歴保存用のコンテンツ作成
         content_for_history = user_query
         if chat_images:
             content_for_history += f"\n（※画像 {len(chat_images)}枚を送信しました）"
             
         st.session_state.chat_history.append({"role": "user", "content": content_for_history})
         
-        # Geminiへ送信するペイロード（テキスト＋画像）の作成
         payload = []
         if user_query:
             payload.append(user_query)
@@ -698,10 +697,8 @@ if st.session_state.chat_session:
         
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
-                # 画像がある場合はリストで送信、テキストのみの場合は文字列で送信
                 res = st.session_state.chat_session.send_message(payload if len(payload) > 1 else payload[0])
                 st.markdown(res.text)
         st.session_state.chat_history.append({"role": "assistant", "content": res.text})
         
-        # 送信後に画面をリロードしてフォームを綺麗にする
         st.rerun()
