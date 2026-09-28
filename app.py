@@ -5,6 +5,7 @@ import google.generativeai as genai
 from PIL import Image
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 # 保存用関数は一旦除外
 from data_fetcher import (
@@ -13,7 +14,10 @@ from data_fetcher import (
     search_japanese_code_by_name, search_us_ticker_by_name
 )
 from chart_maker import add_indicators, generate_safe_chart_image
-from ai_agent import generate_system_prompt
+from ai_agent import (
+    generate_research_prompt, generate_bull_prompt, 
+    generate_bear_prompt, generate_manager_prompt
+)
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
@@ -31,10 +35,18 @@ if "chat_session" not in st.session_state:
     st.session_state.chat_session = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "report_text" not in st.session_state:
-    st.session_state.report_text = ""
 if "chart_images" not in st.session_state:
     st.session_state.chart_images = None
+
+# 各エージェントのレポート保存用
+if "research_report" not in st.session_state:
+    st.session_state.research_report = ""
+if "bull_report" not in st.session_state:
+    st.session_state.bull_report = ""
+if "bear_report" not in st.session_state:
+    st.session_state.bear_report = ""
+if "manager_report" not in st.session_state:
+    st.session_state.manager_report = ""
 
 st.title("📈 AI株式分析ダッシュボード")
 
@@ -97,15 +109,20 @@ with st.sidebar:
     uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
     
     st.markdown("---")
-    analyze_button = st.button("AI分析スタート", type="primary", disabled=not bool(stock_code))
+    analyze_button = st.button("マルチエージェント分析スタート", type="primary", disabled=not bool(stock_code))
 
 if analyze_button and stock_code:
+    # 状態の初期化
     st.session_state.chat_history = [] 
-    st.session_state.report_text = ""
     st.session_state.chart_images = None
+    st.session_state.research_report = ""
+    st.session_state.bull_report = ""
+    st.session_state.bear_report = ""
+    st.session_state.manager_report = ""
+    
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
-    with st.spinner('市場データとAIによる分析を取得中...（PDFなどが多い場合は数分かかります）'):
+    with st.spinner('1/4: 市場データの取得とチャート生成中...'):
         macro_text = get_macro_data()
         stock = yf.Ticker(ticker)
         
@@ -131,37 +148,8 @@ if analyze_button and stock_code:
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly')
         
-        st.session_state.chart_images = {
-            "name": name,
-            "w": img_w,
-            "d": img_d,
-            "h": img_h
-        }
+        st.session_state.chart_images = {"name": name, "w": img_w, "d": img_d, "h": img_h}
         
-        image_payloads = []
-        if img_w: image_payloads.append(Image.open(img_w))
-        if img_d: image_payloads.append(Image.open(img_d))
-        if img_h: image_payloads.append(Image.open(img_h))
-        
-        doc_payloads = []
-        if uploaded_files:
-            for f in uploaded_files:
-                if f.name.lower().endswith('.pdf'):
-                    doc_payloads.append({"mime_type": "application/pdf", "data": f.getvalue()})
-                else:
-                    doc_payloads.append(Image.open(f))
-
-        try:
-            local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
-            for file_name in local_files:
-                if file_name.lower().endswith('.pdf'):
-                    with open(file_name, "rb") as pdf_file:
-                        doc_payloads.append({"mime_type": "application/pdf", "data": pdf_file.read()})
-                else:
-                    doc_payloads.append(Image.open(file_name))
-        except:
-            pass
-
         latest_d = df_d.iloc[-1]
         close_price = round(latest_d['Close'], 2) if not is_jp else int(latest_d['Close'])
         vol_avg20 = df_d['Volume'].tail(20).mean()
@@ -180,14 +168,8 @@ if analyze_button and stock_code:
             else:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
                 pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
-                if info.get('dividendRate') and close_price > 0:
-                    div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2)
-                else:
-                    div_yield_pct = 'N/A'
-                if info.get('marketCap'):
-                    market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD"
-                else:
-                    market_cap_str = 'N/A'
+                div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') and close_price > 0 else 'N/A'
+                market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD" if info.get('marketCap') else 'N/A'
                 margin_str = ""
         except:
             per, pbr, div_yield_pct, market_cap_str, margin_str = 'N/A', 'N/A', 'N/A', 'N/A', ""
@@ -203,34 +185,110 @@ if analyze_button and stock_code:
             edinet_section = ""
 
         market_data_text = (
-            f"【対象銘柄詳細データ】\n"
-            f"--- 【銘柄: {name} ({ticker})】 ---\n"
-            f"[基本ファンダメンタルズ]\n"
-            f"時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
-            f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n"
-            f"{edinet_section}"
-            f"[テクニカル値]\n"
-            f"終値: {close_price} {'円' if is_jp else 'ドル'} | 出来高20日平均比: {vol_ratio}倍\n"
-            f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
+            f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker})】 ---\n"
+            f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
+            f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
+            f"[テクニカル値]\n終値: {close_price} {'円' if is_jp else 'ドル'} | 出来高20日平均比: {vol_ratio}倍\n"
+            f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"
         )
+
+    # ---------------------------------------------------------
+    # Files API を使った画像のアップロード処理（1回だけ）
+    # ---------------------------------------------------------
+    with st.spinner('2/4: Google Files APIへ画像を一時アップロード中...'):
+        uploaded_uris = []
         
-        prompt = generate_system_prompt(macro_text, market_data_text)
-        
-        model = genai.GenerativeModel('gemini-3-flash-preview') 
-        chat = model.start_chat(history=[])
-        
+        # 1. チャート画像をアップロード
+        for img_path in [img_w, img_d, img_h]:
+            if img_path and os.path.exists(img_path):
+                uploaded_file = genai.upload_file(img_path)
+                uploaded_uris.append(uploaded_file)
+                
+        # 2. ドラッグ＆ドロップされたファイルのアップロード
+        if uploaded_files:
+            for f in uploaded_files:
+                temp_file_path = f"temp_{f.name}"
+                with open(temp_file_path, "wb") as temp_f:
+                    temp_f.write(f.getvalue())
+                uploaded_file = genai.upload_file(temp_file_path)
+                uploaded_uris.append(uploaded_file)
+                os.remove(temp_file_path)
+
+        # 3. ★修正追加箇所★: フォルダ内のローカルファイル（PDF/画像）を自動アップロード
         try:
-            # タイムアウトを600秒（10分）に延長し、途中で途切れるのを防ぎます
-            response = chat.send_message(
-                [prompt] + image_payloads + doc_payloads,
+            local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
+            for file_name in local_files:
+                uploaded_file = genai.upload_file(file_name)
+                uploaded_uris.append(uploaded_file)
+        except Exception as e:
+            st.warning(f"ローカルファイルの読み込みに失敗しました: {e}")
+
+        # モデルの設定（無料枠で最高精度の1.5 Proを使用）
+        model_name = 'gemini-1.5-pro'
+        text_model = genai.GenerativeModel(model_name)
+        vision_model = genai.GenerativeModel(model_name)
+
+    # ---------------------------------------------------------
+    # エージェント1: リサーチエージェント（テキストのみ）
+    # ---------------------------------------------------------
+    with st.spinner('3/4: リサーチエージェントが情報整理中...'):
+        research_prompt = generate_research_prompt(macro_text, market_data_text)
+        try:
+            res_research = text_model.generate_content(
+                research_prompt, 
                 request_options={"timeout": 600}
             )
-            st.session_state.report_text = response.text
-            st.session_state.chat_session = chat
-            
+            st.session_state.research_report = res_research.text
         except Exception as e:
-            st.error(f"AI通信エラー（分析処理中）: {e}")
+            st.error(f"リサーチ処理エラー: {e}")
+            st.stop()
 
+    # ---------------------------------------------------------
+    # エージェント2 & 3: 強気派・弱気派（並列処理）
+    # ---------------------------------------------------------
+    with st.spinner('4/4: 強気派と弱気派が白熱した議論を展開中...'):
+        bull_prompt = generate_bull_prompt(st.session_state.research_report)
+        bear_prompt = generate_bear_prompt(st.session_state.research_report)
+        
+        # Files APIのURIリストとテキストプロンプトを結合して渡す
+        bull_payload = uploaded_uris + [bull_prompt]
+        bear_payload = uploaded_uris + [bear_prompt]
+
+        # 並列処理で2つのAPIを同時に叩く
+        def call_bull():
+            return vision_model.generate_content(bull_payload, request_options={"timeout": 600}).text
+            
+        def call_bear():
+            return vision_model.generate_content(bear_payload, request_options={"timeout": 600}).text
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_bull = executor.submit(call_bull)
+                future_bear = executor.submit(call_bear)
+                st.session_state.bull_report = future_bull.result()
+                st.session_state.bear_report = future_bear.result()
+        except Exception as e:
+            st.error(f"強気/弱気分析エラー: {e}")
+            st.stop()
+
+    # ---------------------------------------------------------
+    # エージェント4: ファンドマネージャー（テキストのみ）
+    # ---------------------------------------------------------
+    with st.spinner('最終ステップ: ファンドマネージャーが裁定を下しています...'):
+        manager_prompt = generate_manager_prompt(st.session_state.bull_report, st.session_state.bear_report)
+        try:
+            # 対話用（質問用）にチャットセッションとして開始する
+            chat = text_model.start_chat(history=[])
+            res_manager = chat.send_message(manager_prompt, request_options={"timeout": 600})
+            st.session_state.manager_report = res_manager.text
+            st.session_state.chat_session = chat
+            st.success("✅ マルチエージェントによる会議・分析が完了しました！")
+        except Exception as e:
+            st.error(f"マネージャー裁定エラー: {e}")
+
+# ==========================================
+# 画面描画（分析結果の表示UI）
+# ==========================================
 if st.session_state.chart_images:
     charts = st.session_state.chart_images
     st.subheader(f"📊 {charts['name']} のチャート")
@@ -242,48 +300,49 @@ if st.session_state.chart_images:
     if charts['h']:
         with col3: st.image(charts['h'], use_container_width=True)
 
-if st.session_state.report_text:
-    st.subheader("📑 AIアナリストチームの分析レポート")
-    st.info(st.session_state.report_text)
+if st.session_state.manager_report:
+    # --- エージェントたちの議論プロセス（折りたたみ） ---
+    st.subheader("👥 アナリストチームの議論プロセス")
+    
+    with st.expander("🔍 1. リサーチ結果（ファクト・将来性整理）"):
+        st.write(st.session_state.research_report)
+        
+    with st.expander("🐂 2. 強気派（ブル派）の分析レポート"):
+        st.write(st.session_state.bull_report)
+        
+    with st.expander("🐻 3. 弱気派（ベア派）の分析レポート"):
+        st.write(st.session_state.bear_report)
+        
+    # --- ファンドマネージャーの最終結論（常に表示） ---
+    st.subheader("📑 最終投資判断（ファンドマネージャー）")
+    st.info(st.session_state.manager_report)
 
+# ==========================================
+# チャット機能
+# ==========================================
 if st.session_state.chat_session:
-    st.subheader("💬 ファンドマネージャー（AI）への質問・対話")
+    st.markdown("---")
+    st.subheader("💬 ファンドマネージャーへの追加質問・対話")
     
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
     with st.form("chat_form", clear_on_submit=True):
-        st.markdown("**追加の質問や、スクショ画像の貼り付け（枠内をクリックしてCtrl+V）はこちら**")
-        user_query = st.text_area("テキストを入力", height=100)
-        chat_images = st.file_uploader("追加画像をドロップまたはペースト", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+        user_query = st.text_area("テキストを入力（例：弱気派の意見が気になるので、損切りラインをもっと浅くできない？）", height=100)
         submit_button = st.form_submit_button("送信")
 
-    if submit_button and (user_query or chat_images):
+    if submit_button and user_query:
         with st.chat_message("user"):
             st.markdown(user_query)
-            if chat_images:
-                for img in chat_images:
-                    st.image(img, width=300)
-        
-        content_for_history = user_query
-        if chat_images:
-            content_for_history += f"\n（※画像 {len(chat_images)}枚を送信しました）"
             
-        st.session_state.chat_history.append({"role": "user", "content": content_for_history})
-        
-        payload = []
-        if user_query:
-            payload.append(user_query)
-        if chat_images:
-            for img_file in chat_images:
-                payload.append(Image.open(img_file))
+        st.session_state.chat_history.append({"role": "user", "content": user_query})
         
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
                 try:
                     res = st.session_state.chat_session.send_message(
-                        payload if len(payload) > 1 else payload[0],
+                        user_query,
                         request_options={"timeout": 600}
                     )
                     st.markdown(res.text)
