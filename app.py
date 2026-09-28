@@ -193,37 +193,37 @@ if analyze_button and stock_code:
         )
 
     # ---------------------------------------------------------
-    # Files API を使った画像のアップロード処理（1回だけ）
+    # 2/4: チャートおよび資料データの準備（直接ペイロード化）
     # ---------------------------------------------------------
-    with st.spinner('2/4: Google Files APIへ画像を一時アップロード中...'):
-        uploaded_uris = []
+    with st.spinner('2/4: チャート画像と資料データを準備中...'):
+        image_payloads = []
         
-        # 1. チャート画像をアップロード
+        # 1. 生成したチャート画像を読み込み
         for img_path in [img_w, img_d, img_h]:
             if img_path and os.path.exists(img_path):
-                uploaded_file = genai.upload_file(img_path)
-                uploaded_uris.append(uploaded_file)
+                image_payloads.append(Image.open(img_path))
                 
-        # 2. ドラッグ＆ドロップされたファイルのアップロード
+        # 2. ドラッグ＆ドロップされたファイルの展開
         if uploaded_files:
             for f in uploaded_files:
-                temp_file_path = f"temp_{f.name}"
-                with open(temp_file_path, "wb") as temp_f:
-                    temp_f.write(f.getvalue())
-                uploaded_file = genai.upload_file(temp_file_path)
-                uploaded_uris.append(uploaded_file)
-                os.remove(temp_file_path)
+                if f.name.lower().endswith('.pdf'):
+                    image_payloads.append({"mime_type": "application/pdf", "data": f.getvalue()})
+                else:
+                    image_payloads.append(Image.open(f))
 
-        # 3. ★修正追加箇所★: フォルダ内のローカルファイル（PDF/画像）を自動アップロード
+        # 3. フォルダ内のローカルファイル（PDF/画像）の展開
         try:
             local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
             for file_name in local_files:
-                uploaded_file = genai.upload_file(file_name)
-                uploaded_uris.append(uploaded_file)
+                if file_name.lower().endswith('.pdf'):
+                    with open(file_name, "rb") as pdf_file:
+                        image_payloads.append({"mime_type": "application/pdf", "data": pdf_file.read()})
+                else:
+                    image_payloads.append(Image.open(file_name))
         except Exception as e:
             st.warning(f"ローカルファイルの読み込みに失敗しました: {e}")
 
-        # モデルの設定（無料枠で最高精度の1.5 Proを使用）
+        # モデルの設定
         model_name = 'gemini-1.5-pro'
         text_model = genai.GenerativeModel(model_name)
         vision_model = genai.GenerativeModel(model_name)
@@ -250,11 +250,9 @@ if analyze_button and stock_code:
         bull_prompt = generate_bull_prompt(st.session_state.research_report)
         bear_prompt = generate_bear_prompt(st.session_state.research_report)
         
-        # Files APIのURIリストとテキストプロンプトを結合して渡す
-        bull_payload = uploaded_uris + [bull_prompt]
-        bear_payload = uploaded_uris + [bear_prompt]
+        bull_payload = image_payloads + [bull_prompt]
+        bear_payload = image_payloads + [bear_prompt]
 
-        # 並列処理で2つのAPIを同時に叩く
         def call_bull():
             return vision_model.generate_content(bull_payload, request_options={"timeout": 600}).text
             
@@ -277,7 +275,6 @@ if analyze_button and stock_code:
     with st.spinner('最終ステップ: ファンドマネージャーが裁定を下しています...'):
         manager_prompt = generate_manager_prompt(st.session_state.bull_report, st.session_state.bear_report)
         try:
-            # 対話用（質問用）にチャットセッションとして開始する
             chat = text_model.start_chat(history=[])
             res_manager = chat.send_message(manager_prompt, request_options={"timeout": 600})
             st.session_state.manager_report = res_manager.text
