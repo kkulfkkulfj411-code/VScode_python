@@ -84,10 +84,35 @@ with st.sidebar:
                 st.warning("該当する銘柄が見つかりませんでした。")
                 stock_code = ""
     
+    # ▼ここから復活▼
     st.markdown("---")
+    st.subheader("🔗 調査サイトへ一発アクセス")
+    
+    if is_jp and stock_code:
+        yahoo_url = f"https://finance.yahoo.co.jp/quote/{stock_code}.T"
+        kabutan_disclose_url = f"https://kabutan.jp/stock/news?code={stock_code}&b=k"
+        kabutan_finance_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
+        tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
+        
+        st.markdown(f"""
+        * [Yahoo!ファイナンス（四季報・信用残）]({yahoo_url})
+        * [株探（適時開示・IR速報）]({kabutan_disclose_url})
+        * [株探（財務・業績推移）]({kabutan_finance_url})
+        * [TradingView（詳細チャート）]({tv_url})
+        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
+        """)
+    elif not is_jp and stock_code:
+        tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
+        yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
+        st.markdown(f"""
+        * [TradingView（チャート分析）]({tv_url})
+        * [Yahoo! Finance (US)]({yh_url})
+        """)
+
     st.markdown("---")
-    st.subheader("📁 追加資料（ドラッグ＆ドロップ）") # ←復活
-    uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf']) # ←復活
+    st.subheader("📁 追加資料（ドラッグ＆ドロップ）")
+    uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
+    # ▲ここまで復活▲
     
     st.markdown("---")
     analyze_button = st.button("マルチエージェント分析スタート", type="primary", disabled=not bool(stock_code))
