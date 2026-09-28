@@ -85,8 +85,13 @@ with st.sidebar:
                 stock_code = ""
     
     st.markdown("---")
+    st.markdown("---")
+    st.subheader("📁 追加資料（ドラッグ＆ドロップ）") # ←復活
+    uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf']) # ←復活
+    
+    st.markdown("---")
     analyze_button = st.button("マルチエージェント分析スタート", type="primary", disabled=not bool(stock_code))
-
+    
 # ==========================================
 # ★追加: API通信を安定させるためのリトライ関数（安全設定版）
 # ==========================================

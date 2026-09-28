@@ -9,3 +9,4 @@ python-dotenv
 feedparser
 requests
 matplotlib
+tenacity
