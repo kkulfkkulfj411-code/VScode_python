@@ -224,7 +224,7 @@ if analyze_button and stock_code:
             st.warning(f"ローカルファイルの読み込みに失敗しました: {e}")
 
         # モデルの設定
-        model_name = 'gemini-1.5-pro-latest'
+        model_name = 'gemini-3-flash-preview'
         text_model = genai.GenerativeModel(model_name)
         vision_model = genai.GenerativeModel(model_name)
 
