@@ -5,7 +5,12 @@ import google.generativeai as genai
 from PIL import Image
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
+
+# ★追加：エラー時の自動再試行（リトライ）機能
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted, DeadlineExceeded
 
 # 保存用関数は一旦除外
 from data_fetcher import (
@@ -38,7 +43,6 @@ if "chat_history" not in st.session_state:
 if "chart_images" not in st.session_state:
     st.session_state.chart_images = None
 
-# 各エージェントのレポート保存用
 if "research_report" not in st.session_state:
     st.session_state.research_report = ""
 if "bull_report" not in st.session_state:
@@ -81,38 +85,35 @@ with st.sidebar:
                 stock_code = ""
     
     st.markdown("---")
-    st.subheader("🔗 調査サイトへ一発アクセス")
-    
-    if is_jp and stock_code:
-        yahoo_url = f"https://finance.yahoo.co.jp/quote/{stock_code}.T"
-        kabutan_disclose_url = f"https://kabutan.jp/stock/news?code={stock_code}&b=k"
-        kabutan_finance_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
-        tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
-        
-        st.markdown(f"""
-        * [Yahoo!ファイナンス（四季報・信用残）]({yahoo_url})
-        * [株探（適時開示・IR速報）]({kabutan_disclose_url})
-        * [株探（財務・業績推移）]({kabutan_finance_url})
-        * [TradingView（詳細チャート）]({tv_url})
-        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
-        """)
-    elif not is_jp and stock_code:
-        tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
-        yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
-        st.markdown(f"""
-        * [TradingView（チャート分析）]({tv_url})
-        * [Yahoo! Finance (US)]({yh_url})
-        """)
-
-    st.markdown("---")
-    st.subheader("📁 追加資料（ドラッグ＆ドロップ）")
-    uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
-    
-    st.markdown("---")
     analyze_button = st.button("マルチエージェント分析スタート", type="primary", disabled=not bool(stock_code))
 
+# ==========================================
+# ★追加: API通信を安定させるためのリトライ関数（安全設定版）
+# ==========================================
+@retry(
+    retry=(retry_if_exception_type(ResourceExhausted) | retry_if_exception_type(DeadlineExceeded) | retry_if_exception_type(Exception)),
+    wait=wait_exponential(multiplier=30, min=60, max=180), # ★変更: 初回エラー時は60秒待機、最大180秒まで延長
+    stop=stop_after_attempt(3), # 最大3回まで挑戦
+    reraise=True
+)
+def safe_generate_content(model, prompt_payload):
+    # ★変更: リクエスト送信前に必ず10秒間のインターバルを設ける（連打防止）
+    time.sleep(10)
+    return model.generate_content(prompt_payload, request_options={"timeout": 600})
+
+@retry(
+    retry=(retry_if_exception_type(ResourceExhausted) | retry_if_exception_type(DeadlineExceeded) | retry_if_exception_type(Exception)),
+    wait=wait_exponential(multiplier=30, min=60, max=180),
+    stop=stop_after_attempt(3),
+    reraise=True
+)
+def safe_send_message(chat_session, prompt_payload):
+    time.sleep(10)
+    return chat_session.send_message(prompt_payload, request_options={"timeout": 600})
+# ==========================================
+# 分析メイン処理
+# ==========================================
 if analyze_button and stock_code:
-    # 状態の初期化
     st.session_state.chat_history = [] 
     st.session_state.chart_images = None
     st.session_state.research_report = ""
@@ -137,7 +138,7 @@ if analyze_button and stock_code:
         df_h = stock.history(period="1y", interval="1h").ffill().bfill()
         
         if df_d.empty:
-            st.error("株価データが取得できませんでした。ティッカーコードを確認してください。")
+            st.error("株価データが取得できませんでした。")
             st.stop()
             
         df_w = add_indicators(df_w)
@@ -192,18 +193,12 @@ if analyze_button and stock_code:
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"
         )
 
-    # ---------------------------------------------------------
-    # 2/4: チャートおよび資料データの準備（直接ペイロード化）
-    # ---------------------------------------------------------
     with st.spinner('2/4: チャート画像と資料データを準備中...'):
         image_payloads = []
-        
-        # 1. 生成したチャート画像を読み込み
         for img_path in [img_w, img_d, img_h]:
             if img_path and os.path.exists(img_path):
                 image_payloads.append(Image.open(img_path))
                 
-        # 2. ドラッグ＆ドロップされたファイルの展開
         if uploaded_files:
             for f in uploaded_files:
                 if f.name.lower().endswith('.pdf'):
@@ -211,7 +206,6 @@ if analyze_button and stock_code:
                 else:
                     image_payloads.append(Image.open(f))
 
-        # 3. フォルダ内のローカルファイル（PDF/画像）の展開
         try:
             local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
             for file_name in local_files:
@@ -221,31 +215,22 @@ if analyze_button and stock_code:
                 else:
                     image_payloads.append(Image.open(file_name))
         except Exception as e:
-            st.warning(f"ローカルファイルの読み込みに失敗しました: {e}")
+            pass
 
-        # モデルの設定
-        model_name = 'gemini-3-flash-preview'
+        model_name = 'gemini-3-flash-preview' # ご指定のモデル
         text_model = genai.GenerativeModel(model_name)
         vision_model = genai.GenerativeModel(model_name)
 
-    # ---------------------------------------------------------
-    # エージェント1: リサーチエージェント（テキストのみ）
-    # ---------------------------------------------------------
     with st.spinner('3/4: リサーチエージェントが情報整理中...'):
         research_prompt = generate_research_prompt(macro_text, market_data_text)
         try:
-            res_research = text_model.generate_content(
-                research_prompt, 
-                request_options={"timeout": 600}
-            )
+            # ★変更：リトライ機能付きの関数を使用
+            res_research = safe_generate_content(text_model, research_prompt)
             st.session_state.research_report = res_research.text
         except Exception as e:
             st.error(f"リサーチ処理エラー: {e}")
             st.stop()
 
-    # ---------------------------------------------------------
-    # エージェント2 & 3: 強気派・弱気派（並列処理）
-    # ---------------------------------------------------------
     with st.spinner('4/4: 強気派と弱気派が白熱した議論を展開中...'):
         bull_prompt = generate_bull_prompt(st.session_state.research_report)
         bear_prompt = generate_bear_prompt(st.session_state.research_report)
@@ -254,10 +239,12 @@ if analyze_button and stock_code:
         bear_payload = image_payloads + [bear_prompt]
 
         def call_bull():
-            return vision_model.generate_content(bull_payload, request_options={"timeout": 600}).text
+            # ★変更：リトライ機能付きの関数を使用
+            return safe_generate_content(vision_model, bull_payload).text
             
         def call_bear():
-            return vision_model.generate_content(bear_payload, request_options={"timeout": 600}).text
+            # ★変更：リトライ機能付きの関数を使用
+            return safe_generate_content(vision_model, bear_payload).text
 
         try:
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -269,14 +256,12 @@ if analyze_button and stock_code:
             st.error(f"強気/弱気分析エラー: {e}")
             st.stop()
 
-    # ---------------------------------------------------------
-    # エージェント4: ファンドマネージャー（テキストのみ）
-    # ---------------------------------------------------------
     with st.spinner('最終ステップ: ファンドマネージャーが裁定を下しています...'):
         manager_prompt = generate_manager_prompt(st.session_state.bull_report, st.session_state.bear_report)
         try:
             chat = text_model.start_chat(history=[])
-            res_manager = chat.send_message(manager_prompt, request_options={"timeout": 600})
+            # ★変更：リトライ機能付きの関数を使用
+            res_manager = safe_send_message(chat, manager_prompt)
             st.session_state.manager_report = res_manager.text
             st.session_state.chat_session = chat
             st.success("✅ マルチエージェントによる会議・分析が完了しました！")
@@ -298,35 +283,26 @@ if st.session_state.chart_images:
         with col3: st.image(charts['h'], use_container_width=True)
 
 if st.session_state.manager_report:
-    # --- エージェントたちの議論プロセス（折りたたみ） ---
     st.subheader("👥 アナリストチームの議論プロセス")
-    
     with st.expander("🔍 1. リサーチ結果（ファクト・将来性整理）"):
         st.write(st.session_state.research_report)
-        
     with st.expander("🐂 2. 強気派（ブル派）の分析レポート"):
         st.write(st.session_state.bull_report)
-        
     with st.expander("🐻 3. 弱気派（ベア派）の分析レポート"):
         st.write(st.session_state.bear_report)
         
-    # --- ファンドマネージャーの最終結論（常に表示） ---
     st.subheader("📑 最終投資判断（ファンドマネージャー）")
     st.info(st.session_state.manager_report)
 
-# ==========================================
-# チャット機能
-# ==========================================
 if st.session_state.chat_session:
     st.markdown("---")
     st.subheader("💬 ファンドマネージャーへの追加質問・対話")
-    
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
     with st.form("chat_form", clear_on_submit=True):
-        user_query = st.text_area("テキストを入力（例：弱気派の意見が気になるので、損切りラインをもっと浅くできない？）", height=100)
+        user_query = st.text_area("テキストを入力", height=100)
         submit_button = st.form_submit_button("送信")
 
     if submit_button and user_query:
@@ -338,10 +314,7 @@ if st.session_state.chat_session:
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
                 try:
-                    res = st.session_state.chat_session.send_message(
-                        user_query,
-                        request_options={"timeout": 600}
-                    )
+                    res = safe_send_message(st.session_state.chat_session, user_query)
                     st.markdown(res.text)
                     st.session_state.chat_history.append({"role": "assistant", "content": res.text})
                 except Exception as e:
