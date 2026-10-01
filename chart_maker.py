@@ -173,12 +173,18 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             if is_high: highs.append((i, df_plot['High'].iloc[i]))
             if is_low: lows.append((i, df_plot['Low'].iloc[i]))
             
+        # ★修正: 画面内の値幅（最高値 - 最安値）を基準にオフセット幅を計算する
+        y_max = df_plot['High'].max()
+        y_min = df_plot['Low'].min()
+        y_range = y_max - y_min
+        offset = y_range * 0.03  # 画面の縦幅の3%の余白
+
         for idx, val in highs:
             val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
-            ax_main.text(idx, val + (val*0.015), val_str, ha='center', va='bottom', color='green', fontsize=8, fontweight='bold')
+            ax_main.text(idx, val + offset, val_str, ha='center', va='bottom', color='green', fontsize=8, fontweight='bold')
         for idx, val in lows:
             val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
-            ax_main.text(idx, val - (val*0.015), val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
+            ax_main.text(idx, val - offset, val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
 
         tick_indices = []
         tick_labels = []
