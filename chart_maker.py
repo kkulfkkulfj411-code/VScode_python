@@ -173,12 +173,15 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             if is_high: highs.append((i, df_plot['High'].iloc[i]))
             if is_low: lows.append((i, df_plot['Low'].iloc[i]))
             
-        # ★修正: 画面内の値幅（最高値 - 最安値）を基準にオフセット幅を計算する
-        y_max = df_plot['High'].max()
-        y_min = df_plot['Low'].min()
-        y_range = y_max - y_min
-        offset = y_range * 0.03  # 画面の縦幅の3%の余白
+        # ★追加・修正: チャート完成後に、Y軸の「天井と床」を強制的に少し広げて余白を作る
+        current_ylim = ax_main.get_ylim() # 現在のY軸の上限・下限を取得
+        y_range = current_ylim[1] - current_ylim[0] # 画面に表示されている値幅
+        offset = y_range * 0.025  # 値幅の2.5%をテキストの浮遊距離とする
+        
+        # 上下に余白（ヘッドルーム）を追加して再設定（これで枠外に飛び出さない）
+        ax_main.set_ylim(current_ylim[0] - offset * 1.5, current_ylim[1] + offset * 1.5)
 
+        # テキストの描画
         for idx, val in highs:
             val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
             ax_main.text(idx, val + offset, val_str, ha='center', va='bottom', color='green', fontsize=8, fontweight='bold')
