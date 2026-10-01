@@ -8,7 +8,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# ★追加：エラー時の自動再試行（リトライ）機能
+# ★エラー時の自動再試行（リトライ）機能
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.api_core.exceptions import ResourceExhausted, DeadlineExceeded
 
@@ -19,10 +19,9 @@ from data_fetcher import (
     search_japanese_code_by_name, search_us_ticker_by_name
 )
 from chart_maker import add_indicators, generate_safe_chart_image
-from ai_agent import (
-    generate_research_prompt, generate_bull_prompt, 
-    generate_bear_prompt, generate_manager_prompt
-)
+
+# ★変更：統合版プロンプトのみをインポート
+from ai_agent import generate_system_prompt
 
 # --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析ダッシュボード", layout="wide")
@@ -43,14 +42,9 @@ if "chat_history" not in st.session_state:
 if "chart_images" not in st.session_state:
     st.session_state.chart_images = None
 
-if "research_report" not in st.session_state:
-    st.session_state.research_report = ""
-if "bull_report" not in st.session_state:
-    st.session_state.bull_report = ""
-if "bear_report" not in st.session_state:
-    st.session_state.bear_report = ""
-if "manager_report" not in st.session_state:
-    st.session_state.manager_report = ""
+# ★変更：レポート保存用変数を1つに統合
+if "report_text" not in st.session_state:
+    st.session_state.report_text = ""
 
 st.title("📈 AI株式分析ダッシュボード")
 
@@ -84,7 +78,6 @@ with st.sidebar:
                 st.warning("該当する銘柄が見つかりませんでした。")
                 stock_code = ""
     
-    # ▼ここから復活▼
     st.markdown("---")
     st.subheader("🔗 調査サイトへ一発アクセス")
     
@@ -112,25 +105,13 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("📁 追加資料（ドラッグ＆ドロップ）")
     uploaded_files = st.file_uploader("ファイルをここにドロップ", accept_multiple_files=True, type=['png', 'jpg', 'jpeg', 'pdf'])
-    # ▲ここまで復活▲
     
     st.markdown("---")
-    analyze_button = st.button("マルチエージェント分析スタート", type="primary", disabled=not bool(stock_code))
+    analyze_button = st.button("AI統合分析スタート", type="primary", disabled=not bool(stock_code))
     
 # ==========================================
-# ★追加: API通信を安定させるためのリトライ関数（安全設定版）
+# ★API通信を安定させるためのリトライ関数（安全設定版）
 # ==========================================
-@retry(
-    retry=(retry_if_exception_type(ResourceExhausted) | retry_if_exception_type(DeadlineExceeded) | retry_if_exception_type(Exception)),
-    wait=wait_exponential(multiplier=30, min=60, max=180), # ★変更: 初回エラー時は60秒待機、最大180秒まで延長
-    stop=stop_after_attempt(3), # 最大3回まで挑戦
-    reraise=True
-)
-def safe_generate_content(model, prompt_payload):
-    # ★変更: リクエスト送信前に必ず10秒間のインターバルを設ける（連打防止）
-    time.sleep(10)
-    return model.generate_content(prompt_payload, request_options={"timeout": 600})
-
 @retry(
     retry=(retry_if_exception_type(ResourceExhausted) | retry_if_exception_type(DeadlineExceeded) | retry_if_exception_type(Exception)),
     wait=wait_exponential(multiplier=30, min=60, max=180),
@@ -138,22 +119,20 @@ def safe_generate_content(model, prompt_payload):
     reraise=True
 )
 def safe_send_message(chat_session, prompt_payload):
-    time.sleep(10)
+    time.sleep(5)
     return chat_session.send_message(prompt_payload, request_options={"timeout": 600})
+
 # ==========================================
 # 分析メイン処理
 # ==========================================
 if analyze_button and stock_code:
     st.session_state.chat_history = [] 
     st.session_state.chart_images = None
-    st.session_state.research_report = ""
-    st.session_state.bull_report = ""
-    st.session_state.bear_report = ""
-    st.session_state.manager_report = ""
+    st.session_state.report_text = ""
     
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
-    with st.spinner('1/4: 市場データの取得とチャート生成中...'):
+    with st.spinner('1/2: 市場データの取得とチャート生成中...'):
         macro_text = get_macro_data()
         stock = yf.Ticker(ticker)
         
@@ -223,80 +202,50 @@ if analyze_button and stock_code:
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"
         )
 
-    with st.spinner('2/4: チャート画像と資料データを準備中...'):
-        image_payloads = []
+    with st.spinner('2/2: 画像と資料を展開し、AIが統合分析を実行中...（数分かかります）'):
+        payloads = []
+        # チャート画像の追加
         for img_path in [img_w, img_d, img_h]:
             if img_path and os.path.exists(img_path):
-                image_payloads.append(Image.open(img_path))
+                payloads.append(Image.open(img_path))
                 
+        # ドラッグ＆ドロップされたファイルの追加
         if uploaded_files:
             for f in uploaded_files:
                 if f.name.lower().endswith('.pdf'):
-                    image_payloads.append({"mime_type": "application/pdf", "data": f.getvalue()})
+                    payloads.append({"mime_type": "application/pdf", "data": f.getvalue()})
                 else:
-                    image_payloads.append(Image.open(f))
+                    payloads.append(Image.open(f))
 
+        # ローカルファイルの追加
         try:
             local_files = [f for f in os.listdir('.') if stock_code.upper() in f.upper() and f.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg'))]
             for file_name in local_files:
                 if file_name.lower().endswith('.pdf'):
                     with open(file_name, "rb") as pdf_file:
-                        image_payloads.append({"mime_type": "application/pdf", "data": pdf_file.read()})
+                        payloads.append({"mime_type": "application/pdf", "data": pdf_file.read()})
                 else:
-                    image_payloads.append(Image.open(file_name))
+                    payloads.append(Image.open(file_name))
         except Exception as e:
             pass
 
-        model_name = 'gemini-3-flash-preview' # ご指定のモデル
-        text_model = genai.GenerativeModel(model_name)
+        # テキストプロンプトの追加
+        system_prompt = generate_system_prompt(macro_text, market_data_text)
+        payloads.append(system_prompt)
+
+        # モデル設定と実行（画像も処理できるVisionモデルで一括処理）
+        model_name = 'gemini-3-flash-preview' # ★必要に応じて変更可能
         vision_model = genai.GenerativeModel(model_name)
-
-    with st.spinner('3/4: リサーチエージェントが情報整理中...'):
-        research_prompt = generate_research_prompt(macro_text, market_data_text)
-        try:
-            # ★変更：リトライ機能付きの関数を使用
-            res_research = safe_generate_content(text_model, research_prompt)
-            st.session_state.research_report = res_research.text
-        except Exception as e:
-            st.error(f"リサーチ処理エラー: {e}")
-            st.stop()
-
-    with st.spinner('4/4: 強気派と弱気派が白熱した議論を展開中...'):
-        bull_prompt = generate_bull_prompt(st.session_state.research_report)
-        bear_prompt = generate_bear_prompt(st.session_state.research_report)
         
-        bull_payload = image_payloads + [bull_prompt]
-        bear_payload = image_payloads + [bear_prompt]
-
-        def call_bull():
-            # ★変更：リトライ機能付きの関数を使用
-            return safe_generate_content(vision_model, bull_payload).text
-            
-        def call_bear():
-            # ★変更：リトライ機能付きの関数を使用
-            return safe_generate_content(vision_model, bear_payload).text
-
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                future_bull = executor.submit(call_bull)
-                future_bear = executor.submit(call_bear)
-                st.session_state.bull_report = future_bull.result()
-                st.session_state.bear_report = future_bear.result()
-        except Exception as e:
-            st.error(f"強気/弱気分析エラー: {e}")
-            st.stop()
-
-    with st.spinner('最終ステップ: ファンドマネージャーが裁定を下しています...'):
-        manager_prompt = generate_manager_prompt(st.session_state.bull_report, st.session_state.bear_report)
-        try:
-            chat = text_model.start_chat(history=[])
-            # ★変更：リトライ機能付きの関数を使用
-            res_manager = safe_send_message(chat, manager_prompt)
-            st.session_state.manager_report = res_manager.text
+            chat = vision_model.start_chat(history=[])
+            # ★リトライ機能付きの統合送信（1回だけ叩く）
+            res_analysis = safe_send_message(chat, payloads)
+            st.session_state.report_text = res_analysis.text
             st.session_state.chat_session = chat
-            st.success("✅ マルチエージェントによる会議・分析が完了しました！")
+            st.success("✅ AIによる統合分析が完了しました！")
         except Exception as e:
-            st.error(f"マネージャー裁定エラー: {e}")
+            st.error(f"分析処理エラー: {e}")
 
 # ==========================================
 # 画面描画（分析結果の表示UI）
@@ -312,39 +261,47 @@ if st.session_state.chart_images:
     if charts['h']:
         with col3: st.image(charts['h'], use_container_width=True)
 
-if st.session_state.manager_report:
-    st.subheader("👥 アナリストチームの議論プロセス")
-    with st.expander("🔍 1. リサーチ結果（ファクト・将来性整理）"):
-        st.write(st.session_state.research_report)
-    with st.expander("🐂 2. 強気派（ブル派）の分析レポート"):
-        st.write(st.session_state.bull_report)
-    with st.expander("🐻 3. 弱気派（ベア派）の分析レポート"):
-        st.write(st.session_state.bear_report)
-        
-    st.subheader("📑 最終投資判断（ファンドマネージャー）")
-    st.info(st.session_state.manager_report)
+if st.session_state.report_text:
+    st.subheader("📑 統合アナリストレポート")
+    st.info(st.session_state.report_text)
 
 if st.session_state.chat_session:
     st.markdown("---")
-    st.subheader("💬 ファンドマネージャーへの追加質問・対話")
+    st.subheader("💬 AIアナリストへの追加質問・対話")
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             
     with st.form("chat_form", clear_on_submit=True):
+        st.markdown("**追加の質問や、スクショ画像の貼り付け（枠内をクリックしてCtrl+V）はこちら**")
         user_query = st.text_area("テキストを入力", height=100)
+        chat_images = st.file_uploader("追加画像をドロップまたはペースト", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
         submit_button = st.form_submit_button("送信")
 
-    if submit_button and user_query:
+    if submit_button and (user_query or chat_images):
         with st.chat_message("user"):
             st.markdown(user_query)
+            if chat_images:
+                for img in chat_images:
+                    st.image(img, width=300)
+        
+        content_for_history = user_query
+        if chat_images:
+            content_for_history += f"\n（※画像 {len(chat_images)}枚を送信しました）"
             
-        st.session_state.chat_history.append({"role": "user", "content": user_query})
+        st.session_state.chat_history.append({"role": "user", "content": content_for_history})
+        
+        chat_payload = []
+        if user_query:
+            chat_payload.append(user_query)
+        if chat_images:
+            for img_file in chat_images:
+                chat_payload.append(Image.open(img_file))
         
         with st.chat_message("assistant"):
             with st.spinner("思考中..."):
                 try:
-                    res = safe_send_message(st.session_state.chat_session, user_query)
+                    res = safe_send_message(st.session_state.chat_session, chat_payload if len(chat_payload) > 1 else chat_payload[0])
                     st.markdown(res.text)
                     st.session_state.chat_history.append({"role": "assistant", "content": res.text})
                 except Exception as e:
