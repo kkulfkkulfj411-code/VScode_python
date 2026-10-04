@@ -6,7 +6,6 @@ import re
 import io
 import zipfile
 
-# 保存用関数は一旦除外
 from data_fetcher import (
     get_macro_data, get_edinet_documents, get_news,
     get_japanese_name, get_us_stock_name, get_japanese_fundamentals,
@@ -82,7 +81,7 @@ with st.sidebar:
     generate_button = st.button("データ収集＆画像生成スタート", type="primary", disabled=not bool(stock_code))
 
 # ==========================================
-# データ収集＆画像生成処理（API通信なしで超高速）
+# データ収集＆画像生成処理
 # ==========================================
 if generate_button and stock_code:
     st.session_state.generated_data = None
@@ -148,7 +147,6 @@ if generate_button and stock_code:
             news_str = get_news(name, False)
             edinet_section = ""
 
-        # テキストデータの結合
         full_text_data = (
             f"【グローバルマクロ参考値】\n{macro_text}\n\n"
             f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker})】 ---\n"
@@ -158,7 +156,6 @@ if generate_button and stock_code:
             f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"
         )
         
-        # ZIPファイルのメモリ上での作成
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             zip_file.writestr(f"{stock_code}_market_data.txt", full_text_data.encode('utf-8'))
@@ -197,10 +194,13 @@ if st.session_state.generated_data:
         
     st.markdown("---")
     
-    st.subheader("📱 個別データ（スマホ・直接確認向け）")
-    st.markdown("右上のコピーボタン（📋）を押すと、全テキストをコピーできます。チャート画像は長押しで保存してGeminiアプリに添付してください。")
-    
-    # st.code を使うと、枠の右上に自動で「コピーボタン」が付きます
+    st.subheader("📱 ① Geminiチャット送信用の命令文")
+    st.markdown("AIに検索を強制するための文章です。コピーしてGeminiのチャット入力欄に貼り付けてください。")
+    chat_prompt = f"@Google 添付したデータとチャートをもとに分析をお願いします。データ内でN/Aとなっている「{data['name']}」のファンダメンタルズ（PER、PBR、時価総額、配当利回り）や、直近のニュース・決算の詳細は、必ずGoogle検索機能を用いて最新情報を調べて補完し、指示書の通りに分析を行ってください。"
+    st.code(chat_prompt, language="text")
+
+    st.subheader("📱 ② 個別データ（添付用テキスト）")
+    st.markdown("以下のテキストをコピーして、上記の命令文と一緒にGeminiへ貼り付けて送信してください。")
     st.code(data["text"], language="text")
     
     charts = data["images"]
