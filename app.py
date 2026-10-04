@@ -127,7 +127,7 @@ if generate_button and stock_code:
                 pbr = fund_data['pbr'] if fund_data['pbr'] != 'N/A' else info.get('priceToBook', 'N/A')
                 div_yield_pct = fund_data['div'] if fund_data['div'] != 'N/A' else (round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') else 'N/A')
                 margin_ratio = fund_data['margin']
-                market_cap_str = f"約{round(info.get('marketCap', 0) / 100000000, 1)}億円" if info.get('marketCap') else 'N/A'
+                market_cap_str = f"{fund_data.get('market_cap')}億円" if fund_data.get('market_cap') and fund_data.get('market_cap') != 'N/A' else (f"約{round(info.get('marketCap', 0) / 100000000, 1)}億円" if info.get('marketCap') else 'N/A')
                 margin_str = f" | 信用倍率: {margin_ratio}倍" if margin_ratio != 'N/A' else ""
             else:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
