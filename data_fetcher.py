@@ -9,6 +9,7 @@ import requests
 import re
 import difflib
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import html
 
 @st.cache_data(ttl=3600)
 def get_macro_data():
@@ -97,12 +98,20 @@ def get_news(company_name, is_jp, edinet_reasons=None):
         feed = feedparser.parse(url1)
         for entry in feed.entries[:8]:
             title = entry.title.split(' - ')[0]
+            pub = entry.get('published', '')
+            
+            desc = html.unescape(re.sub(r'<[^>]+>', '', entry.get('description', '')))
+            desc_clean = re.sub(r'\s+', ' ', desc).strip()
+            if len(desc_clean) > 120: desc_clean = desc_clean[:120] + "..." 
+            
+            news_item = f"■ {title} ({pub[:16]})\n   概要: {desc_clean}"
+            
             if is_jp:
                 if company_name in title or any(kw in title for kw in ['TOPIX', '再編', '決算', '配当', '株', '業績', 'アナリスト', 'レーティング', '目標']):
-                    news_list.append(title)
+                    news_list.append(news_item)
             else:
-                news_list.append(title)
-    except:
+                news_list.append(news_item)
+    except Exception:
         pass
 
     if is_jp and edinet_reasons:
@@ -115,12 +124,26 @@ def get_news(company_name, is_jp, edinet_reasons=None):
             try:
                 feed2 = feedparser.parse(url2)
                 for entry in feed2.entries[:3]:
-                    news_list.append(f"[EDINET連動深掘り] {entry.title.split(' - ')[0]}")
+                    title = entry.title.split(' - ')[0]
+                    pub = entry.get('published', '')
+                    desc = html.unescape(re.sub(r'<[^>]+>', '', entry.get('description', '')))
+                    desc_clean = re.sub(r'\s+', ' ', desc).strip()
+                    if len(desc_clean) > 120: desc_clean = desc_clean[:120] + "..."
+                    
+                    news_list.append(f"■ [EDINET連動深掘り] {title} ({pub[:16]})\n   概要: {desc_clean}")
             except:
                 pass
                 
-    unique_news = list(dict.fromkeys(news_list))[:9]
-    return " / ".join(unique_news) if unique_news else "直近の重要な関連ニュースは見つかりませんでした。"
+    unique_news = []
+    seen_titles = set()
+    for item in news_list:
+        t = item.split('\n')[0]
+        if t not in seen_titles:
+            seen_titles.add(t)
+            unique_news.append(item)
+            
+    unique_news = unique_news[:9]
+    return "\n\n".join(unique_news) if unique_news else "直近の重要な関連ニュースは見つかりませんでした。"
 
 @st.cache_data(ttl=3600)
 def get_japanese_name(stock_code):
@@ -164,33 +187,8 @@ def get_japanese_fundamentals(stock_code):
         url = f"https://kabutan.jp/stock/?code={stock_code}"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         res = requests.get(url, headers=headers, timeout=5)
-        html = res.text
-        
-        per = re.search(r'PER[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
-        pbr = re.search(r'PBR[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
-        div = re.search(r'利回り[^0-9]*?([0-9\.]+)[^0-9]*?％', html)
-        margin = re.search(r'信用倍率[^0-9]*?([0-9\.]+)[^0-9]*?倍', html)
-        
-        return {
-            'per': per.group(1) if per else 'N/A',
-            'pbr': pbr.group(1) if pbr else 'N/A',
-            'div': div.group(1) if div else 'N/A',
-            'margin': margin.group(1) if margin else 'N/A'
-        }
-    except Exception:
-        return {'per': 'N/A', 'pbr': 'N/A', 'div': 'N/A', 'margin': 'N/A'}
-    
-import html # ファイルの先頭付近（importが並んでいる所）に追加してください
-
-@st.cache_data(ttl=3600)
-def get_japanese_fundamentals(stock_code):
-    try:
-        url = f"https://kabutan.jp/stock/?code={stock_code}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        res = requests.get(url, headers=headers, timeout=5)
         html_text = res.text
         
-        # 「－」や「赤字」などの非数値テキストも拾えるように正規表現を強化
         per = re.search(r'PER.*?([0-9\.]+?|－|赤字)\s*倍', html_text, re.DOTALL)
         pbr = re.search(r'PBR.*?([0-9\.]+?|－)\s*倍', html_text, re.DOTALL)
         div = re.search(r'利回り.*?([0-9\.]+?|－)\s*％', html_text, re.DOTALL)
@@ -208,71 +206,60 @@ def get_japanese_fundamentals(stock_code):
         return {'per': 'N/A', 'pbr': 'N/A', 'div': 'N/A', 'margin': 'N/A', 'market_cap': 'N/A'}
 
 @st.cache_data(ttl=3600)
-def get_news(company_name, is_jp, edinet_reasons=None):
-    news_list = []
-    if is_jp:
-        q1 = urllib.parse.quote(f"{company_name} (TOPIX OR 再編 OR アナリスト OR レーティング OR 目標株価 OR 株探 OR 四季報 OR 日経 OR 決算 OR 増配)")
-        url1 = f"https://news.google.com/rss/search?q={q1}&hl=ja&gl=JP&ceid=JP:ja"
-    else:
-        q1 = urllib.parse.quote(f"{company_name} stock (earnings OR upgrade OR target OR guidance)")
-        url1 = f"https://news.google.com/rss/search?q={q1}&hl=en-US&gl=US&ceid=US:en"
-        
+def search_japanese_code_by_name(query):
+    if not query: return []
     try:
-        feed = feedparser.parse(url1)
-        for entry in feed.entries[:8]:
-            title = entry.title.split(' - ')[0]
-            pub = entry.get('published', '')
-            
-            # 本文（概要）を取得してHTMLタグを掃除
-            desc = html.unescape(re.sub(r'<[^>]+>', '', entry.get('description', '')))
-            desc_clean = re.sub(r'\s+', ' ', desc).strip()
-            if len(desc_clean) > 120: desc_clean = desc_clean[:120] + "..." # 長すぎる場合はカット
-            
-            news_item = f"■ {title} ({pub[:16]})\n   概要: {desc_clean}"
-            
-            if is_jp:
-                if company_name in title or any(kw in title for kw in ['TOPIX', '再編', '決算', '配当', '株', '業績', 'アナリスト', 'レーティング', '目標']):
-                    news_list.append(news_item)
-            else:
-                news_list.append(news_item)
+        try:
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='cp932', skiprows=1)
+        except UnicodeDecodeError:
+            df_code = pd.read_csv('EdinetcodeDlInfo.csv', encoding='utf-8', skiprows=1)
+        
+        df_code['証券コード'] = pd.to_numeric(df_code['証券コード'], errors='coerce')
+        df_code = df_code.dropna(subset=['証券コード'])
+        df_code['証券コード'] = (df_code['証券コード'] / 10).astype(int).astype(str)
+        
+        df_code['提出者名'] = df_code['提出者名'].fillna('').astype(str)
+        df_code['提出者名（ヨミ）'] = df_code['提出者名（ヨミ）'].fillna('').astype(str)
+        
+        mask = df_code['提出者名'].str.contains(query, case=False, na=False) | \
+               df_code['提出者名（ヨミ）'].str.contains(query, case=False, na=False)
+        matches = df_code[mask]
+        
+        if matches.empty:
+            names = df_code['提出者名'].tolist()
+            yomis = df_code['提出者名（ヨミ）'].tolist()
+            close_names = difflib.get_close_matches(query, names, n=10, cutoff=0.4)
+            close_yomis = difflib.get_close_matches(query, yomis, n=10, cutoff=0.4)
+            mask_fuzzy = df_code['提出者名'].isin(close_names) | df_code['提出者名（ヨミ）'].isin(close_yomis)
+            matches = df_code[mask_fuzzy]
+
+        matches['sort_key'] = pd.to_numeric(matches['証券コード'], errors='coerce')
+        matches = matches.sort_values('sort_key')
+        return [f"{row['証券コード']} - {row['提出者名']}" for _, row in matches.iterrows()]
+    except Exception:
+        return []
+    
+@st.cache_data(ttl=3600)
+def search_us_ticker_by_name(query):
+    if not query: return []
+    try:
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={urllib.parse.quote(query)}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            quotes = data.get('quotes', [])
+            matches = []
+            for q in quotes:
+                if q.get('quoteType') in ['EQUITY', 'ETF']:
+                    symbol = q.get('symbol', '')
+                    name = q.get('shortname', '')
+                    if symbol:
+                        matches.append(f"{symbol} - {name}")
+            return matches[:10]
     except Exception:
         pass
-
-    if is_jp and edinet_reasons:
-        for reason in edinet_reasons:
-            match = re.search(r'（(.*?)）', reason)
-            keyword = match.group(1) if match else reason[:15]
-            keyword = keyword.replace("の件", "").replace("に関する", "")
-            q2 = urllib.parse.quote(f"{company_name} {keyword}")
-            url2 = f"https://news.google.com/rss/search?q={q2}&hl=ja&gl=JP&ceid=JP:ja"
-            try:
-                feed2 = feedparser.parse(url2)
-                for entry in feed2.entries[:3]:
-                    title = entry.title.split(' - ')[0]
-                    pub = entry.get('published', '')
-                    desc = html.unescape(re.sub(r'<[^>]+>', '', entry.get('description', '')))
-                    desc_clean = re.sub(r'\s+', ' ', desc).strip()
-                    if len(desc_clean) > 120: desc_clean = desc_clean[:120] + "..."
-                    
-                    news_list.append(f"■ [EDINET連動深掘り] {title} ({pub[:16]})\n   概要: {desc_clean}")
-            except:
-                pass
-                
-    # 重複排除（タイトルが同じものは省く）
-    unique_news = []
-    seen_titles = set()
-    for item in news_list:
-        t = item.split('\n')[0]
-        if t not in seen_titles:
-            seen_titles.add(t)
-            unique_news.append(item)
-            
-    unique_news = unique_news[:9]
-    return "\n\n".join(unique_news) if unique_news else "直近の重要な関連ニュースは見つかりませんでした。"
-
-# ==========================================
-# Googleスプレッドシート連携（GAS Web版）
-# ==========================================
+    return []
 
 def save_analysis_to_sheet(date_str, stock_code, name, judgement, target_price, time_limit, report_text):
     webapp_url = st.secrets.get("GAS_WEBAPP_URL", "")
