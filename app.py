@@ -114,10 +114,21 @@ if generate_button and stock_code:
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly')
         
         latest_d = df_d.iloc[-1]
+        
+        # 直近1営業日（最新日）の四本値
+        open_price = round(latest_d['Open'], 2) if not is_jp else int(latest_d['Open'])
+        high_price = round(latest_d['High'], 2) if not is_jp else int(latest_d['High'])
+        low_price = round(latest_d['Low'], 2) if not is_jp else int(latest_d['Low'])
         close_price = round(latest_d['Close'], 2) if not is_jp else int(latest_d['Close'])
-        # 直近5営業日の最高値と最安値（ヒゲの先端）を取得
+        
+        # 直近5営業日（約1週間）の最高値・最安値
         recent_high_5d = round(df_d['High'].tail(5).max(), 2) if not is_jp else int(df_d['High'].tail(5).max())
         recent_low_5d = round(df_d['Low'].tail(5).min(), 2) if not is_jp else int(df_d['Low'].tail(5).min())
+        
+        # 直近20営業日（約1ヶ月）の最高値・最安値
+        recent_high_20d = round(df_d['High'].tail(20).max(), 2) if not is_jp else int(df_d['High'].tail(20).max())
+        recent_low_20d = round(df_d['Low'].tail(20).min(), 2) if not is_jp else int(df_d['Low'].tail(20).min())
+        
         vol_avg20 = df_d['Volume'].tail(20).mean()
         vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if vol_avg20 > 0 else 1.0
 
@@ -155,9 +166,11 @@ if generate_button and stock_code:
             f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker})】 ---\n"
             f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
             f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
-            f"[テクニカル値]\n終値: {close_price} {'円' if is_jp else 'ドル'} | 直近5日最高値(上ヒゲ先端): {recent_high_5d} | 直近5日最安値(下ヒゲ先端): {recent_low_5d} | 出来高20日平均比: {vol_ratio}倍\n"
-            f"RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"        )
-        
+            f"[テクニカル値]\n最新営業日の四本値: 始値 {open_price} | 高値 {high_price} | 安値 {low_price} | 終値 {close_price} {'円' if is_jp else 'ドル'}\n"
+            f"直近1週間(5日) 高値: {recent_high_5d} | 安値: {recent_low_5d}\n"
+            f"直近1ヶ月(20日) 高値: {recent_high_20d} | 安値: {recent_low_20d}\n"
+            f"出来高20日平均比: {vol_ratio}倍 | RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"
+        )
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             zip_file.writestr(f"{stock_code}_market_data.txt", full_text_data.encode('utf-8'))
