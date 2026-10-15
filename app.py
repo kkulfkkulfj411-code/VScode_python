@@ -5,6 +5,7 @@ import os
 import re
 import io
 import zipfile
+import requests
 
 from data_fetcher import (
     get_macro_data, get_edinet_documents, get_news,
@@ -19,6 +20,49 @@ st.set_page_config(page_title="AI株式分析データジェネレーター", la
 # --- セッションステート ---
 if "generated_data" not in st.session_state:
     st.session_state.generated_data = None
+
+
+# --- キャッシュ回避＆異常値補正対応のデータ取得関数 ---
+def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
+    """
+    新規セッションでキャッシュを回避してデータを取得する。
+    yfinanceの仕様変更等でカスタムSessionやrepairがエラーを吐いた場合は安全にフォールバックする。
+    """
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache'
+    })
+
+    # 1. 新規セッションでのTicker生成を試行
+    try:
+        stock = yf.Ticker(ticker_symbol, session=session)
+        # テスト取得（日足）でセッションが有効か確認
+        df_d = stock.history(period="2y", interval="1d", repair=use_repair)
+        if df_d.empty:
+            raise ValueError("Custom session returned empty DataFrame")
+    except Exception:
+        # フォールバック：標準のTicker生成
+        stock = yf.Ticker(ticker_symbol)
+        try:
+            df_d = stock.history(period="2y", interval="1d", repair=use_repair)
+        except Exception:
+            df_d = stock.history(period="2y", interval="1d")
+
+    # 週足・1時間足の取得（repairエラー時は通常取得へフォールバック）
+    try:
+        df_w = stock.history(period="10y", interval="1wk", repair=use_repair)
+    except Exception:
+        df_w = stock.history(period="10y", interval="1wk")
+
+    try:
+        df_h = stock.history(period="1y", interval="1h", repair=use_repair)
+    except Exception:
+        df_h = stock.history(period="1y", interval="1h")
+
+    return stock, df_w, df_d, df_h
+
 
 st.title("📈 AI株式分析データジェネレーター")
 st.markdown("このアプリは、Gemini（Web版）に読み込ませるための**最新データとチャート画像**を瞬時に生成・パッケージ化します。")
@@ -54,6 +98,18 @@ with st.sidebar:
                 stock_code = ""
     
     st.markdown("---")
+    st.subheader("⚙️ データ取得・キャッシュ設定")
+    use_repair = st.checkbox(
+        "株式分割バグ・異常値を自動補正 (repair=True)",
+        value=True,
+        help="株式分割直後のスパイクノイズ（異常なヒゲ）を補正します。取得が重い場合はオフにしてください。"
+    )
+    if st.button("🔄 キャッシュをクリアして初期化", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.generated_data = None
+        st.rerun()
+
+    st.markdown("---")
     st.subheader("🔗 調査サイトへ一発アクセス")
     
     if is_jp and stock_code:
@@ -84,12 +140,15 @@ with st.sidebar:
 # データ収集＆画像生成処理
 # ==========================================
 if generate_button and stock_code:
+    st.cache_data.clear()
     st.session_state.generated_data = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
     with st.spinner('市場データの取得とチャート画像を生成中...'):
         macro_text = get_macro_data()
-        stock = yf.Ticker(ticker)
+        
+        # 新規セッション＆異常値補正付きでデータ取得
+        stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, use_repair=use_repair)
         
         if is_jp:
             jp_name = get_japanese_name(stock_code)
@@ -97,13 +156,13 @@ if generate_button and stock_code:
         else:
             name = get_us_stock_name(stock_code)
         
-        df_w = stock.history(period="10y", interval="1wk").ffill().bfill()
-        df_d = stock.history(period="2y", interval="1d").ffill().bfill()
-        df_h = stock.history(period="1y", interval="1h").ffill().bfill()
-        
         if df_d.empty:
             st.error("株価データが取得できませんでした。")
             st.stop()
+            
+        df_w = df_w.ffill().bfill()
+        df_d = df_d.ffill().bfill()
+        df_h = df_h.ffill().bfill()
             
         df_w = add_indicators(df_w)
         df_d = add_indicators(df_d)
@@ -148,7 +207,7 @@ if generate_button and stock_code:
                 div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') and close_price > 0 else 'N/A'
                 market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD" if info.get('marketCap') else 'N/A'
                 margin_str = ""
-        except:
+        except Exception:
             per, pbr, div_yield_pct, market_cap_str, margin_str = 'N/A', 'N/A', 'N/A', 'N/A', ""
 
         edinet_str, edinet_reasons = ("", [])
