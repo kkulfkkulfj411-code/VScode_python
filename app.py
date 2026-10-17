@@ -38,7 +38,6 @@ def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
     # 1. 新規セッションでのTicker生成を試行
     try:
         stock = yf.Ticker(ticker_symbol, session=session)
-        # テスト取得（日足）でセッションが有効か確認
         df_d = stock.history(period="2y", interval="1d", repair=use_repair)
         if df_d.empty:
             raise ValueError("Custom session returned empty DataFrame")
@@ -62,6 +61,85 @@ def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
         df_h = stock.history(period="1y", interval="1h")
 
     return stock, df_w, df_d, df_h
+
+
+# --- 安全な数値フォーマット＆時系列テキスト生成関数 ---
+def format_price(val, is_jp):
+    if pd.isna(val):
+        return "N/A"
+    return str(int(round(val))) if is_jp else f"{val:.2f}"
+
+
+def build_technical_summary_text(df_d, is_jp):
+    """
+    日足データから移動平均線の状態（現在値・5日前比の傾き・乖離率）と
+    直近10営業日の時系列テーブルをエラーなく安全にテキスト化する。
+    """
+    unit = "円" if is_jp else "ドル"
+    close_series = df_d['Close']
+    vol_avg20_series = df_d['Volume'].rolling(20).mean()
+
+    # 1. 移動平均線（SMA25, 75, 200）の独自算出（外部モジュール非依存）
+    sma_lines = []
+    for window in [25, 75, 200]:
+        if len(close_series) >= window:
+            sma_series = close_series.rolling(window).mean()
+            curr_sma = sma_series.iloc[-1]
+            prev_sma = sma_series.iloc[-6] if len(sma_series) >= window + 5 else pd.NA
+
+            if pd.notna(curr_sma):
+                curr_close = close_series.iloc[-1]
+                dev_pct = round(((curr_close - curr_sma) / curr_sma) * 100, 2)
+                dev_str = f"{'+' if dev_pct > 0 else ''}{dev_pct}%"
+
+                if pd.notna(prev_sma):
+                    diff = curr_sma - prev_sma
+                    diff_fmt = int(round(diff)) if is_jp else round(diff, 2)
+                    if diff > 0:
+                        slope_str = f"上昇中(5日前比 +{diff_fmt}{unit})"
+                    elif diff < 0:
+                        slope_str = f"下降中(5日前比 {diff_fmt}{unit})"
+                    else:
+                        slope_str = "横ばい(5日前比 ±0)"
+                else:
+                    slope_str = "傾き算出不可"
+
+                sma_lines.append(
+                    f"SMA{window}: {format_price(curr_sma, is_jp)}{unit} [現在値乖離: {dev_str} | 傾き: {slope_str}]"
+                )
+            else:
+                sma_lines.append(f"SMA{window}: N/A")
+        else:
+            sma_lines.append(f"SMA{window}: N/A (データ期間不足)")
+
+    sma_text = "\n".join(sma_lines)
+
+    # 2. 直近10営業日の時系列ミニテーブル生成
+    recent_df = df_d.tail(10)
+    recent_vol_avg = vol_avg20_series.tail(10)
+
+    table_rows = [
+        "日付 | 始値 | 高値(上ヒゲ) | 安値(下ヒゲ) | 終値 | 出来高比(20日平均比) | RSI | MACD"
+    ]
+    for idx, row in recent_df.iterrows():
+        date_str = idx.strftime('%m/%d') if hasattr(idx, 'strftime') else str(idx)[:10]
+        o_str = format_price(row.get('Open'), is_jp)
+        h_str = format_price(row.get('High'), is_jp)
+        l_str = format_price(row.get('Low'), is_jp)
+        c_str = format_price(row.get('Close'), is_jp)
+
+        v_avg = recent_vol_avg.loc[idx] if idx in recent_vol_avg.index else pd.NA
+        v_ratio = f"{round(row['Volume'] / v_avg, 2)}倍" if pd.notna(v_avg) and v_avg > 0 else "N/A"
+
+        rsi_val = f"{round(row['RSI'], 1)}" if 'RSI' in row and pd.notna(row['RSI']) else "N/A"
+        macd_val = f"{round(row['MACD'], 1)}" if 'MACD' in row and pd.notna(row['MACD']) else "N/A"
+
+        table_rows.append(
+            f"{date_str} | {o_str} | {h_str} | {l_str} | {c_str} | {v_ratio} | {rsi_val} | {macd_val}"
+        )
+
+    table_text = "\n".join(table_rows)
+    return sma_text, table_text
 
 
 st.title("📈 AI株式分析データジェネレーター")
@@ -173,23 +251,28 @@ if generate_button and stock_code:
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly')
         
         latest_d = df_d.iloc[-1]
+        unit_str = '円' if is_jp else 'ドル'
         
         # 直近1営業日（最新日）の四本値
-        open_price = round(latest_d['Open'], 2) if not is_jp else int(latest_d['Open'])
-        high_price = round(latest_d['High'], 2) if not is_jp else int(latest_d['High'])
-        low_price = round(latest_d['Low'], 2) if not is_jp else int(latest_d['Low'])
-        close_price = round(latest_d['Close'], 2) if not is_jp else int(latest_d['Close'])
+        open_price = format_price(latest_d.get('Open'), is_jp)
+        high_price = format_price(latest_d.get('High'), is_jp)
+        low_price = format_price(latest_d.get('Low'), is_jp)
+        close_price_num = round(latest_d['Close'], 2) if not is_jp else int(round(latest_d['Close']))
+        close_price = format_price(latest_d.get('Close'), is_jp)
         
-        # 直近5営業日（約1週間）の最高値・最安値
-        recent_high_5d = round(df_d['High'].tail(5).max(), 2) if not is_jp else int(df_d['High'].tail(5).max())
-        recent_low_5d = round(df_d['Low'].tail(5).min(), 2) if not is_jp else int(df_d['Low'].tail(5).min())
-        
-        # 直近20営業日（約1ヶ月）の最高値・最安値
-        recent_high_20d = round(df_d['High'].tail(20).max(), 2) if not is_jp else int(df_d['High'].tail(20).max())
-        recent_low_20d = round(df_d['Low'].tail(20).min(), 2) if not is_jp else int(df_d['Low'].tail(20).min())
+        # 直近5営業日（約1週間）・20営業日（約1ヶ月）・60営業日（約3ヶ月）の最高値・最安値
+        recent_high_5d = format_price(df_d['High'].tail(5).max(), is_jp)
+        recent_low_5d = format_price(df_d['Low'].tail(5).min(), is_jp)
+        recent_high_20d = format_price(df_d['High'].tail(20).max(), is_jp)
+        recent_low_20d = format_price(df_d['Low'].tail(20).min(), is_jp)
+        recent_high_60d = format_price(df_d['High'].tail(60).max(), is_jp)
+        recent_low_60d = format_price(df_d['Low'].tail(60).min(), is_jp)
         
         vol_avg20 = df_d['Volume'].tail(20).mean()
-        vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if vol_avg20 > 0 else 1.0
+        vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if pd.notna(vol_avg20) and vol_avg20 > 0 else 1.0
+
+        # 移動平均線サマリーと直近10営業日テーブルの生成
+        sma_summary_text, recent_10d_table_text = build_technical_summary_text(df_d, is_jp)
 
         try:
             info = stock.info
@@ -197,14 +280,14 @@ if generate_button and stock_code:
                 fund_data = get_japanese_fundamentals(stock_code)
                 per = fund_data['per'] if fund_data['per'] != 'N/A' else info.get('trailingPE', 'N/A')
                 pbr = fund_data['pbr'] if fund_data['pbr'] != 'N/A' else info.get('priceToBook', 'N/A')
-                div_yield_pct = fund_data['div'] if fund_data['div'] != 'N/A' else (round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') else 'N/A')
+                div_yield_pct = fund_data['div'] if fund_data['div'] != 'N/A' else (round((info.get('dividendRate', 0) / close_price_num) * 100, 2) if info.get('dividendRate') and close_price_num > 0 else 'N/A')
                 margin_ratio = fund_data['margin']
                 market_cap_str = f"{fund_data.get('market_cap')}億円" if fund_data.get('market_cap') and fund_data.get('market_cap') != 'N/A' else (f"約{round(info.get('marketCap', 0) / 100000000, 1)}億円" if info.get('marketCap') else 'N/A')
                 margin_str = f" | 信用倍率: {margin_ratio}倍" if margin_ratio != 'N/A' else ""
             else:
                 per = round(info.get('trailingPE', 0), 2) if info.get('trailingPE') else 'N/A'
                 pbr = round(info.get('priceToBook', 0), 2) if info.get('priceToBook') else 'N/A'
-                div_yield_pct = round((info.get('dividendRate', 0) / close_price) * 100, 2) if info.get('dividendRate') and close_price > 0 else 'N/A'
+                div_yield_pct = round((info.get('dividendRate', 0) / close_price_num) * 100, 2) if info.get('dividendRate') and close_price_num > 0 else 'N/A'
                 market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD" if info.get('marketCap') else 'N/A'
                 margin_str = ""
         except Exception:
@@ -225,10 +308,11 @@ if generate_button and stock_code:
             f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker})】 ---\n"
             f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
             f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
-            f"[テクニカル値]\n最新営業日の四本値: 始値 {open_price} | 高値 {high_price} | 安値 {low_price} | 終値 {close_price} {'円' if is_jp else 'ドル'}\n"
-            f"直近1週間(5日) 高値: {recent_high_5d} | 安値: {recent_low_5d}\n"
-            f"直近1ヶ月(20日) 高値: {recent_high_20d} | 安値: {recent_low_20d}\n"
-            f"出来高20日平均比: {vol_ratio}倍 | RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n"
+            f"[テクニカル基本値]\n最新営業日の四本値: 始値 {open_price} | 高値 {high_price} | 安値 {low_price} | 終値 {close_price} {unit_str}\n"
+            f"期間別高安値: [直近5日] 高値 {recent_high_5d} / 安値 {recent_low_5d} | [直近20日] 高値 {recent_high_20d} / 安値 {recent_low_20d} | [直近60日] 高値 {recent_high_60d} / 安値 {recent_low_60d}\n"
+            f"出来高20日平均比: {vol_ratio}倍 | 最新RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'} | 最新MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
+            f"[日足 移動平均線（現在値・乖離率・5日前比の傾き）]\n{sma_summary_text}\n\n"
+            f"[直近10営業日の時系列推移（日足ベース）]\n{recent_10d_table_text}\n"
         )
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
@@ -278,7 +362,7 @@ if st.session_state.generated_data:
         f"・直近の業績推移（売上高成長率、営業利益率、ROE）\n"
         f"・財務健全性（自己資本比率）\n"
         f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無）\n"
-        f"・大口の需給動向（機関投資家の空売り残高、大量保有報告書の有無）\n"
+        f"・大口の需給動向（日次公表の信用買い残・売り残の推移、機関投資家の空売り残高、大量保有報告書の有無）\n"
         f"・直近のニュース、適時開示、決算の具体的な詳細内容"
     )
     st.code(chat_prompt, language="text")
