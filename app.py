@@ -6,6 +6,7 @@ import re
 import io
 import zipfile
 import requests
+import unicodedata
 
 from data_fetcher import (
     get_macro_data, get_edinet_documents, get_news,
@@ -35,21 +36,18 @@ def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
         'Pragma': 'no-cache'
     })
 
-    # 1. 新規セッションでのTicker生成を試行
     try:
         stock = yf.Ticker(ticker_symbol, session=session)
         df_d = stock.history(period="2y", interval="1d", repair=use_repair)
         if df_d.empty:
             raise ValueError("Custom session returned empty DataFrame")
     except Exception:
-        # フォールバック：標準のTicker生成
         stock = yf.Ticker(ticker_symbol)
         try:
             df_d = stock.history(period="2y", interval="1d", repair=use_repair)
         except Exception:
             df_d = stock.history(period="2y", interval="1d")
 
-    # 週足・1時間足の取得（repairエラー時は通常取得へフォールバック）
     try:
         df_w = stock.history(period="10y", interval="1wk", repair=use_repair)
     except Exception:
@@ -70,6 +68,55 @@ def format_price(val, is_jp):
     return str(int(round(val))) if is_jp else f"{val:.2f}"
 
 
+def build_us_extra_fundamentals(info, close_price_num):
+    """
+    米国株向けにyfinanceのstock.infoから予想PER、成長性、空売り需給（Short Interest）、
+    機関投資家保有比率、アナリスト目標株価を安全に抽出してテキスト化する。
+    """
+    def fmt_pct(key):
+        val = info.get(key)
+        return f"{round(val * 100, 2)}%" if isinstance(val, (int, float)) and pd.notna(val) else "N/A"
+
+    def fmt_num(key, digits=2):
+        val = info.get(key)
+        return f"{round(val, digits)}" if isinstance(val, (int, float)) and pd.notna(val) else "N/A"
+
+    fwd_pe = fmt_num('forwardPE')
+    peg = fmt_num('pegRatio')
+    roe = fmt_pct('returnOnEquity')
+    rev_growth = fmt_pct('revenueGrowth')
+    op_margin = fmt_pct('operatingMargins')
+    beta = fmt_num('beta')
+
+    short_pct = fmt_pct('shortPercentOfFloat')
+    short_ratio = fmt_num('shortRatio')
+    inst_held = fmt_pct('heldPercentInstitutions')
+    insider_held = fmt_pct('heldPercentInsiders')
+
+    rec_key = info.get('recommendationKey', 'N/A')
+    target_mean = info.get('targetMeanPrice')
+    target_high = info.get('targetHighPrice')
+    target_low = info.get('targetLowPrice')
+
+    if isinstance(target_mean, (int, float)) and pd.notna(target_mean) and close_price_num > 0:
+        upside = round(((target_mean - close_price_num) / close_price_num) * 100, 2)
+        upside_str = f"{'+' if upside > 0 else ''}{upside}%"
+        target_str = f"平均 {target_mean}ドル (現在値比 {upside_str} | 上限 {target_high} / 下限 {target_low})"
+    else:
+        target_str = "N/A"
+
+    return (
+        f"[米国株 詳細指標・成長性]\n"
+        f"予想PER(Forward): {fwd_pe} | PEGレシオ: {peg} | ROE: {roe} | 売上成長率: {rev_growth} | 営業利益率: {op_margin} | Beta(感応度): {beta}\n"
+        f"[米国株 需給・空売り動向・コンセンサス]\n"
+        f"浮動株空売り比率(Short % of Float): {short_pct} | 空売りカバー日数(Days to Cover): {short_ratio}日\n"
+        f"機関投資家保有比率: {inst_held} | インサイダー保有比率: {insider_held}\n"
+        f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
+        f"[米国株 注文仕様上の厳守事項]\n"
+        f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文に非対応（単一注文の指値・成行・逆指値のみ、期間指定は最長90現地営業日）。また値幅制限（ストップ高安）が存在せず1株単位で売買可能である点を前提に戦略を組むこと。\n"
+    )
+
+
 def build_technical_summary_text(df_d, is_jp):
     """
     日足データから移動平均線の状態（現在値・5日前比の傾き・乖離率）と
@@ -79,7 +126,6 @@ def build_technical_summary_text(df_d, is_jp):
     close_series = df_d['Close']
     vol_avg20_series = df_d['Volume'].rolling(20).mean()
 
-    # 1. 移動平均線（SMA25, 75, 200）の独自算出（外部モジュール非依存）
     sma_lines = []
     for window in [25, 75, 200]:
         if len(close_series) >= window:
@@ -114,7 +160,6 @@ def build_technical_summary_text(df_d, is_jp):
 
     sma_text = "\n".join(sma_lines)
 
-    # 2. 直近10営業日の時系列ミニテーブル生成
     recent_df = df_d.tail(10)
     recent_vol_avg = vol_avg20_series.tail(10)
 
@@ -147,32 +192,60 @@ st.markdown("このアプリは、Gemini（Web版）に読み込ませるため�
 
 with st.sidebar:
     st.header("銘柄設定")
-    raw_input = st.text_input("銘柄コード または 企業名（日米対応・一部でも可）", value="6844")
+    market_filter = st.radio(
+        "検索対象市場",
+        ["日本株のみ", "すべて（日米）", "米国株のみ"],
+        index=0,
+        horizontal=True,
+        help="日本株の英字社名（MTGなど）が米国株と混同されるのを防ぎます。"
+    )
+    raw_input = st.text_input("銘柄コード または 企業名（日米対応・一部でも可）", value="6844").strip()
     
-    stock_code = raw_input
+    # 日本株の証券コード判定パターン（数字4桁 または 数字3桁+英字1文字）
+    jp_code_pattern = r'^[0-9]{3}[0-9A-Za-z]$'
+    
+    stock_code = ""
     is_jp = False
     
-    if re.match(r'^\d{4}[A-Za-z]?$', raw_input):
-        stock_code = raw_input
+    if not raw_input:
+        stock_code = ""
+    elif re.match(jp_code_pattern, raw_input):
+        stock_code = raw_input.upper()
         is_jp = True
     else:
-        jp_matches = search_japanese_code_by_name(raw_input)
+        jp_matches = []
         us_matches = []
-        if re.search(r'[A-Za-z]', raw_input):
+        
+        if market_filter in ["日本株のみ", "すべて（日米）"]:
+            half_upper = unicodedata.normalize('NFKC', raw_input).upper()
+            full_upper = half_upper.translate(
+                str.maketrans(
+                    '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                    '０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ'
+                )
+            )
+            for q in dict.fromkeys([raw_input, half_upper, full_upper]):
+                res = search_japanese_code_by_name(q)
+                if res:
+                    for item in res:
+                        if item not in jp_matches:
+                            jp_matches.append(item)
+                            
+        if market_filter in ["すべて（日米）", "米国株のみ"] and re.search(r'[A-Za-z]', raw_input):
             us_matches = search_us_ticker_by_name(raw_input)
             
         all_matches = jp_matches + us_matches
         
         if all_matches:
             selected = st.selectbox("複数の候補が見つかりました。対象を選択してください:", all_matches)
-            stock_code = selected.split(" - ")[0]
-            is_jp = bool(re.match(r'^\d{4}', stock_code))
+            stock_code = selected.split(" - ")[0].strip().upper()
+            is_jp = bool(re.match(jp_code_pattern, stock_code))
         else:
-            if re.match(r'^[A-Za-z]+$', raw_input):
+            if market_filter != "日本株のみ" and re.match(r'^[A-Za-z.\-]+$', raw_input):
                 stock_code = raw_input.upper()
                 is_jp = False
             else:
-                st.warning("該当する銘柄が見つかりませんでした。")
+                st.warning("該当する銘柄が見つかりませんでした。市場切替や証券コード直接入力をお試しください。")
                 stock_code = ""
     
     st.markdown("---")
@@ -206,9 +279,12 @@ with st.sidebar:
     elif not is_jp and stock_code:
         tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
         yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
+        finviz_url = f"https://finviz.com/quote.ashx?t={stock_code.upper()}"
         st.markdown(f"""
         * [TradingView（チャート分析）]({tv_url})
         * [Yahoo! Finance (US)]({yh_url})
+        * [Finviz（需給・空売り・インサイダー確認）]({finviz_url})
+        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
         """)
     
     st.markdown("---")
@@ -225,7 +301,6 @@ if generate_button and stock_code:
     with st.spinner('市場データの取得とチャート画像を生成中...'):
         macro_text = get_macro_data()
         
-        # 新規セッション＆異常値補正付きでデータ取得
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, use_repair=use_repair)
         
         if is_jp:
@@ -253,14 +328,12 @@ if generate_button and stock_code:
         latest_d = df_d.iloc[-1]
         unit_str = '円' if is_jp else 'ドル'
         
-        # 直近1営業日（最新日）の四本値
         open_price = format_price(latest_d.get('Open'), is_jp)
         high_price = format_price(latest_d.get('High'), is_jp)
         low_price = format_price(latest_d.get('Low'), is_jp)
         close_price_num = round(latest_d['Close'], 2) if not is_jp else int(round(latest_d['Close']))
         close_price = format_price(latest_d.get('Close'), is_jp)
         
-        # 直近5営業日（約1週間）・20営業日（約1ヶ月）・60営業日（約3ヶ月）の最高値・最安値
         recent_high_5d = format_price(df_d['High'].tail(5).max(), is_jp)
         recent_low_5d = format_price(df_d['Low'].tail(5).min(), is_jp)
         recent_high_20d = format_price(df_d['High'].tail(20).max(), is_jp)
@@ -271,9 +344,9 @@ if generate_button and stock_code:
         vol_avg20 = df_d['Volume'].tail(20).mean()
         vol_ratio = round(latest_d['Volume'] / vol_avg20, 2) if pd.notna(vol_avg20) and vol_avg20 > 0 else 1.0
 
-        # 移動平均線サマリーと直近10営業日テーブルの生成
         sma_summary_text, recent_10d_table_text = build_technical_summary_text(df_d, is_jp)
 
+        us_extra_section = ""
         try:
             info = stock.info
             if is_jp:
@@ -290,6 +363,7 @@ if generate_button and stock_code:
                 div_yield_pct = round((info.get('dividendRate', 0) / close_price_num) * 100, 2) if info.get('dividendRate') and close_price_num > 0 else 'N/A'
                 market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD" if info.get('marketCap') else 'N/A'
                 margin_str = ""
+                us_extra_section = build_us_extra_fundamentals(info, close_price_num)
         except Exception:
             per, pbr, div_yield_pct, market_cap_str, margin_str = 'N/A', 'N/A', 'N/A', 'N/A', ""
 
@@ -299,7 +373,7 @@ if generate_button and stock_code:
             edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
             news_str = get_news(name, True, edinet_reasons)
             edinet_section = f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
-            topix_note_section = (
+            market_specific_section = (
                 f"[TOPIX指数・需給イベント確認事項]\n"
                 f"対象銘柄（{name} / {stock_code}）のTOPIX定期入替区分（新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用951銘柄・非構成銘柄）をGoogle検索で確認し、"
                 f"四半期リバランス日（1月・4月・7月・10月の各最終営業日）に向けたパッシブ需給の影響を分析に織り込むこと（検索で確定情報がない場合は『区分不明』と明記し推測しないこと）。\n"
@@ -307,13 +381,13 @@ if generate_button and stock_code:
         else:
             news_str = get_news(name, False)
             edinet_section = ""
-            topix_note_section = ""
+            market_specific_section = us_extra_section
 
         full_text_data = (
             f"【グローバルマクロ参考値】\n{macro_text}\n\n"
-            f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker})】 ---\n"
-            f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
-            f"{topix_note_section}"
+            f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分: {'日本株' if is_jp else '米国株'}】 ---\n"
+            f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER(実績): {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
+            f"{market_specific_section}"
             f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
             f"[テクニカル基本値]\n最新営業日の四本値: 始値 {open_price} | 高値 {high_price} | 安値 {low_price} | 終値 {close_price} {unit_str}\n"
             f"期間別高安値: [直近5日] 高値 {recent_high_5d} / 安値 {recent_low_5d} | [直近20日] 高値 {recent_high_20d} / 安値 {recent_low_20d} | [直近60日] 高値 {recent_high_60d} / 安値 {recent_low_60d}\n"
@@ -365,25 +439,25 @@ if st.session_state.generated_data:
     
     if data.get("is_jp", True):
         demand_items = (
+            f"・直近の業績推移（売上高成長率、営業利益率、ROE）と財務健全性（自己資本比率）\n"
+            f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無、次回決算発表日）\n"
             f"・大口の需給動向（日次公表の信用買い残・売り残の推移、機関投資家の空売り残高、大量保有報告書の有無）\n"
             f"・TOPIX定期入替の区分（「{data['name']}（{data['stock_code']}）」が新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用のいずれに該当するか）と、四半期リバランス日（1・4・7・10月の各最終営業日）に伴うパッシブ需給影響（※検索で確定情報がない場合は推測せず『区分不明』とすること）\n"
         )
     else:
         demand_items = (
-            f"・大口の需給動向（Short Interest[空売り比率]、機関投資家の保有動向・Form 13F）\n"
-            f"・主要指数（S&P500、NASDAQ100等）の採用状況やリバランスに伴う需給イベントの有無\n"
+            f"・直近の四半期決算（EPSおよび売上高の市場コンセンサスビート/ミス状況、ガイダンス引き上げの有無、次回Earnings Date[決算発表日]）\n"
+            f"・SEC開示および大口需給動向（Form 13Fによる機関投資家の増減、Form 4によるインサイダー売買、最新のShort Interest[空売り比率]の推移）\n"
+            f"・米国マクロ指標（FOMC金利見通し、米10年債利回り、セクターローテーション）および主要指数（S&P500、NASDAQ100等）のリバランス影響\n"
         )
 
     chat_prompt = (
         f"@Google 添付したデータとチャートをもとに分析をお願いします。\n"
-        f"データ内でN/Aとなっている「{data['name']}（{data['stock_code']}）」の基本指標（PER、PBR、時価総額、配当利回り）に加え、"
+        f"データ内でN/Aとなっている「{data['name']}（{data['stock_code']}）」の基本指標に加え、"
         f"多角的な分析を行うため、以下の重要情報についても必ずGoogle検索機能を用いて最新の数値を調べ、情報を補完した上で指示書の通りに分析を行ってください。\n\n"
         f"【追加検索・補完項目】\n"
-        f"・直近の業績推移（売上高成長率、営業利益率、ROE）\n"
-        f"・財務健全性（自己資本比率）\n"
-        f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無）\n"
         f"{demand_items}"
-        f"・直近のニュース、適時開示、決算の具体的な詳細内容"
+        f"・直近のニュース、適時開示（またはSEC Filing）、アナリストのレーティング変更の具体的な詳細内容"
     )
     st.code(chat_prompt, language="text")
 
