@@ -299,14 +299,21 @@ if generate_button and stock_code:
             edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
             news_str = get_news(name, True, edinet_reasons)
             edinet_section = f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
+            topix_note_section = (
+                f"[TOPIX指数・需給イベント確認事項]\n"
+                f"対象銘柄（{name} / {stock_code}）のTOPIX定期入替区分（新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用951銘柄・非構成銘柄）をGoogle検索で確認し、"
+                f"四半期リバランス日（1月・4月・7月・10月の各最終営業日）に向けたパッシブ需給の影響を分析に織り込むこと（検索で確定情報がない場合は『区分不明』と明記し推測しないこと）。\n"
+            )
         else:
             news_str = get_news(name, False)
             edinet_section = ""
+            topix_note_section = ""
 
         full_text_data = (
             f"【グローバルマクロ参考値】\n{macro_text}\n\n"
             f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker})】 ---\n"
             f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
+            f"{topix_note_section}"
             f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
             f"[テクニカル基本値]\n最新営業日の四本値: 始値 {open_price} | 高値 {high_price} | 安値 {low_price} | 終値 {close_price} {unit_str}\n"
             f"期間別高安値: [直近5日] 高値 {recent_high_5d} / 安値 {recent_low_5d} | [直近20日] 高値 {recent_high_20d} / 安値 {recent_low_20d} | [直近60日] 高値 {recent_high_60d} / 安値 {recent_low_60d}\n"
@@ -326,7 +333,8 @@ if generate_button and stock_code:
             "text": full_text_data,
             "images": {"w": img_w, "d": img_d, "h": img_h},
             "zip_data": zip_buffer.getvalue(),
-            "stock_code": stock_code
+            "stock_code": stock_code,
+            "is_jp": is_jp
         }
         st.success("✅ データの準備が完了しました！")
 
@@ -354,15 +362,27 @@ if st.session_state.generated_data:
     
     st.subheader("📱 ① Geminiチャット送信用の命令文")
     st.markdown("AIに検索を強制するための文章です。コピーしてGeminiのチャット入力欄に貼り付けてください。")
+    
+    if data.get("is_jp", True):
+        demand_items = (
+            f"・大口の需給動向（日次公表の信用買い残・売り残の推移、機関投資家の空売り残高、大量保有報告書の有無）\n"
+            f"・TOPIX定期入替の区分（「{data['name']}（{data['stock_code']}）」が新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用のいずれに該当するか）と、四半期リバランス日（1・4・7・10月の各最終営業日）に伴うパッシブ需給影響（※検索で確定情報がない場合は推測せず『区分不明』とすること）\n"
+        )
+    else:
+        demand_items = (
+            f"・大口の需給動向（Short Interest[空売り比率]、機関投資家の保有動向・Form 13F）\n"
+            f"・主要指数（S&P500、NASDAQ100等）の採用状況やリバランスに伴う需給イベントの有無\n"
+        )
+
     chat_prompt = (
         f"@Google 添付したデータとチャートをもとに分析をお願いします。\n"
-        f"データ内でN/Aとなっている「{data['name']}」の基本指標（PER、PBR、時価総額、配当利回り）に加え、"
+        f"データ内でN/Aとなっている「{data['name']}（{data['stock_code']}）」の基本指標（PER、PBR、時価総額、配当利回り）に加え、"
         f"多角的な分析を行うため、以下の重要情報についても必ずGoogle検索機能を用いて最新の数値を調べ、情報を補完した上で指示書の通りに分析を行ってください。\n\n"
         f"【追加検索・補完項目】\n"
         f"・直近の業績推移（売上高成長率、営業利益率、ROE）\n"
         f"・財務健全性（自己資本比率）\n"
         f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無）\n"
-        f"・大口の需給動向（日次公表の信用買い残・売り残の推移、機関投資家の空売り残高、大量保有報告書の有無）\n"
+        f"{demand_items}"
         f"・直近のニュース、適時開示、決算の具体的な詳細内容"
     )
     st.code(chat_prompt, language="text")
