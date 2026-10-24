@@ -205,22 +205,29 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             )
             current_panel_idx += 2
 
+        # 極値（高値・安値）の抽出と近接ラベル重複排除（14921491等の8桁連結バグ防止）
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
+        min_dist = max(int(len(df_plot) * 0.08), 6)
         highs = []
         lows = []
         for i in range(window_size, len(df_plot) - window_size):
-            is_high = True
-            is_low = True
-            for j in range(i - window_size, i + window_size + 1):
-                if i != j:
-                    if df_plot['High'].iloc[i] <= df_plot['High'].iloc[j]:
-                        is_high = False
-                    if df_plot['Low'].iloc[i] >= df_plot['Low'].iloc[j]:
-                        is_low = False
+            val_h = df_plot['High'].iloc[i]
+            val_l = df_plot['Low'].iloc[i]
+            is_high = all(val_h >= df_plot['High'].iloc[j] for j in range(i - window_size, i + window_size + 1) if i != j)
+            is_low = all(val_l <= df_plot['Low'].iloc[j] for j in range(i - window_size, i + window_size + 1) if i != j)
+
             if is_high:
-                highs.append((i, df_plot['High'].iloc[i]))
+                if highs and (i - highs[-1][0]) < min_dist:
+                    if val_h > highs[-1][1]:
+                        highs[-1] = (i, val_h)
+                else:
+                    highs.append((i, val_h))
             if is_low:
-                lows.append((i, df_plot['Low'].iloc[i]))
+                if lows and (i - lows[-1][0]) < min_dist:
+                    if val_l < lows[-1][1]:
+                        lows[-1] = (i, val_l)
+                else:
+                    lows.append((i, val_l))
             
         current_ylim = ax_main.get_ylim()
         y_range = current_ylim[1] - current_ylim[0]
@@ -282,7 +289,8 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             for i, dt in enumerate(df_plot.index):
                 current_date = dt.date()
                 if current_date != last_date_printed:
-                    if not tick_indices or (i - tick_indices[-1]) >= 4:
+                    # 09/28と29の衝突を防ぐため最小間隔を7本以上に設定
+                    if not tick_indices or (i - tick_indices[-1]) >= 7:
                         tick_indices.append(i)
                         if dt.month != last_month_printed:
                             tick_labels.append(dt.strftime('%m/%d'))

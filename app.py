@@ -68,10 +68,10 @@ def format_price(val, is_jp):
     return str(int(round(val))) if is_jp else f"{val:.2f}"
 
 
-def build_us_extra_fundamentals(info, close_price_num):
+def build_us_extra_fundamentals(stock, info, close_price_num):
     """
-    米国株向けにyfinanceのstock.infoから予想PER、成長性、空売り需給（Short Interest）、
-    機関投資家保有比率、アナリスト目標株価を安全に抽出してテキスト化する。
+    米国株向けにyfinanceのstock.infoとstock.newsから予想PER、成長性、空売り需給（Short Interest）、
+    機関投資家保有比率、アナリスト目標株価、英語一次ニュースを安全に抽出してテキスト化する。
     """
     def fmt_pct(key):
         val = info.get(key)
@@ -105,13 +105,28 @@ def build_us_extra_fundamentals(info, close_price_num):
     else:
         target_str = "N/A"
 
+    # yfinanceネイティブの英語ニュースヘッドライン抽出
+    yf_news_lines = []
+    try:
+        raw_news = getattr(stock, 'news', None)
+        if raw_news and isinstance(raw_news, list):
+            for item in raw_news[:5]:
+                content = item.get('content', {}) if isinstance(item, dict) else {}
+                title = item.get('title') or content.get('title')
+                if title:
+                    yf_news_lines.append(f"・{title}")
+    except Exception:
+        pass
+    yf_news_str = "\n".join(yf_news_lines) if yf_news_lines else "（yfinance英語ニュース取得なし）"
+
     return (
         f"[米国株 詳細指標・成長性]\n"
         f"予想PER(Forward): {fwd_pe} | PEGレシオ: {peg} | ROE: {roe} | 売上成長率: {rev_growth} | 営業利益率: {op_margin} | Beta(感応度): {beta}\n"
-        f"[米国株 需給・空売り動向・コンセンサス]\n"
+        f"[米国株 需給・空売り動向・コンセンサス（※空売り残高は月2回公表のためタイムラグに注意）]\n"
         f"浮動株空売り比率(Short % of Float): {short_pct} | 空売りカバー日数(Days to Cover): {short_ratio}日\n"
         f"機関投資家保有比率: {inst_held} | インサイダー保有比率: {insider_held}\n"
         f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
+        f"[米国現地ニュースヘッドライン (yfinance)]\n{yf_news_str}\n"
         f"[米国株 注文仕様上の厳守事項]\n"
         f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文に非対応（単一注文の指値・成行・逆指値のみ、期間指定は最長90現地営業日）。また値幅制限（ストップ高安）が存在せず1株単位で売買可能である点を前提に戦略を組むこと。\n"
     )
@@ -316,6 +331,19 @@ if generate_button and stock_code:
         df_w = df_w.ffill().bfill()
         df_d = df_d.ffill().bfill()
         df_h = df_h.ffill().bfill()
+
+        # 東証クロージング・オークション等による日足と1時間足の最終終値ズレを同期補正
+        if not df_h.empty and not df_d.empty:
+            try:
+                if df_h.index[-1].date() == df_d.index[-1].date():
+                    d_close = df_d['Close'].iloc[-1]
+                    df_h.iloc[-1, df_h.columns.get_loc('Close')] = d_close
+                    if d_close > df_h['High'].iloc[-1]:
+                        df_h.iloc[-1, df_h.columns.get_loc('High')] = d_close
+                    if d_close < df_h['Low'].iloc[-1]:
+                        df_h.iloc[-1, df_h.columns.get_loc('Low')] = d_close
+            except Exception:
+                pass
             
         df_w = add_indicators(df_w)
         df_d = add_indicators(df_d)
@@ -363,7 +391,7 @@ if generate_button and stock_code:
                 div_yield_pct = round((info.get('dividendRate', 0) / close_price_num) * 100, 2) if info.get('dividendRate') and close_price_num > 0 else 'N/A'
                 market_cap_str = f"約{round(info.get('marketCap', 0) / 1000000000, 2)} Billion USD" if info.get('marketCap') else 'N/A'
                 margin_str = ""
-                us_extra_section = build_us_extra_fundamentals(info, close_price_num)
+                us_extra_section = build_us_extra_fundamentals(stock, info, close_price_num)
         except Exception:
             per, pbr, div_yield_pct, market_cap_str, margin_str = 'N/A', 'N/A', 'N/A', 'N/A', ""
 
@@ -446,9 +474,10 @@ if st.session_state.generated_data:
         )
     else:
         demand_items = (
-            f"・直近の四半期決算（EPSおよび売上高の市場コンセンサスビート/ミス状況、ガイダンス引き上げの有無、次回Earnings Date[決算発表日]）\n"
+            f"・直近の四半期決算（EPSおよび売上高の市場コンセンサスビート/ミス状況、Non-GAAPベースの数値、ガイダンス引き上げの有無、次回Earnings Date[決算発表日]）\n"
             f"・SEC開示および大口需給動向（Form 13Fによる機関投資家の増減、Form 4によるインサイダー売買、最新のShort Interest[空売り比率]の推移）\n"
             f"・米国マクロ指標（FOMC金利見通し、米10年債利回り、セクターローテーション）および主要指数（S&P500、NASDAQ100等）のリバランス影響\n"
+            f"・※米国株の最新決算・ガイダンス・時間外株価の変動要因については、日本語記事だけでなく必ずティッカーシンボルを用いた英語クエリ（例：`{data['stock_code']} earnings release guidance`）でも検索して一次情報を確認すること\n"
         )
 
     chat_prompt = (
