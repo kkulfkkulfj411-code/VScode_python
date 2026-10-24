@@ -33,14 +33,14 @@ def add_indicators(df):
     return df
 
 
-def _format_chart_price(val, is_int_price):
-    """日本株（整数）と米国株（小数）を判別してラベル文字列を返す"""
-    if is_int_price:
+def _format_chart_price(val, is_jp):
+    """日本株（is_jp=True）は確実に整数丸め、米国株（is_jp=False）は小数第2位でフォーマットする"""
+    if is_jp:
         return f"{int(round(val))}"
     return f"{val:.2f}"
 
 
-def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_type):
+def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_type, is_jp=True):
     if df_full.empty:
         return None
     df_full.index = pd.to_datetime(df_full.index)
@@ -51,10 +51,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     df_plot = df_plot.dropna(subset=['Open', 'High', 'Low', 'Close'])
     if df_plot.empty:
         return None
-
-    # 終値データに小数点以下の端数が含まれるかで整数表示（日本株）か小数表示（米国株等）かを判定
-    has_fraction = any((df_plot['Close'] % 1).round(4) != 0)
-    is_int_price = not has_fraction and df_plot['Close'].max() >= 50
 
     aps = []
     legend_texts = []
@@ -76,7 +72,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         aps.append(mpf.make_addplot(df_plot['BB_MID'], color='purple', width=0.8, alpha=0.6, secondary_y=False))
         aps.append(mpf.make_addplot(df_plot['BB_LOW'], color='gray', width=0.8, alpha=0.6, secondary_y=False))
 
-    # メインチャートの比率(8)を維持しつつ、RSIとMACDの線潰れ・文字被りを防ぐ比率に設定
     panel_ratios = [8]
     panels_count = 0
     
@@ -91,11 +86,12 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if has_rsi:
         panels_count += 1
         panel_ratios.append(1.0)
-        # secondary_y=Falseを徹底し、定数ラインによる左軸(29/30/31)の誤生成を防止
         aps.append(mpf.make_addplot(df_plot['RSI'], color='purple', width=1.2, panel=panels_count, secondary_y=False))
         df_plot['RSI_70'] = 70
+        df_plot['RSI_50'] = 50
         df_plot['RSI_30'] = 30
         aps.append(mpf.make_addplot(df_plot['RSI_70'], color='gray', linestyle='--', width=0.8, panel=panels_count, secondary_y=False))
+        aps.append(mpf.make_addplot(df_plot['RSI_50'], color='gray', linestyle=':', width=0.7, alpha=0.6, panel=panels_count, secondary_y=False))
         aps.append(mpf.make_addplot(df_plot['RSI_30'], color='gray', linestyle='--', width=0.8, panel=panels_count, secondary_y=False))
 
     has_macd = bool('MACD_Line' in df_plot.columns and df_plot['MACD_Line'].notna().any())
@@ -103,7 +99,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         panels_count += 1
         panel_ratios.append(1.2)
         colors = ['green' if val >= 0 else 'red' for val in df_plot['MACD_Hist']]
-        # すべてsecondary_y=Falseに統一し、ヒストグラムとMACD線のゼロラインを完全一致させる
         aps.append(mpf.make_addplot(df_plot['MACD_Hist'], type='bar', color=colors, panel=panels_count, alpha=0.5, secondary_y=False))
         aps.append(mpf.make_addplot(df_plot['MACD_Line'], color='blue', width=1.1, panel=panels_count, secondary_y=False))
         aps.append(mpf.make_addplot(df_plot['MACD_Signal'], color='orange', width=1.1, panel=panels_count, secondary_y=False))
@@ -157,7 +152,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             ax.spines['right'].set_color('black')
             
         last_close = df_plot['Close'].iloc[-1]
-        price_str = _format_chart_price(last_close, is_int_price)
+        price_str = _format_chart_price(last_close, is_jp)
         
         ax_main.text(
             1.0, last_close, f' {price_str} ', color='white',
@@ -169,7 +164,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         if has_volume and current_panel_idx < len(axes):
             ax_vol = axes[current_panel_idx]
             ax_vol.set_ylabel('')
-            # 上下端の目盛りを除外して隣接パネルとの数字被りを防止
             ax_vol.yaxis.set_major_locator(MaxNLocator(nbins=3, prune='both'))
             ax_vol.text(
                 0.01, 0.90, 'Volume', transform=ax_vol.transAxes,
@@ -180,7 +174,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         if has_rsi and current_panel_idx < len(axes):
             ax_rsi = axes[current_panel_idx]
             ax_rsi.set_ylabel('')
-            # RSIのY軸範囲を10〜90に固定し、目盛りを30と70のみに限定して上下パネルとの衝突を完全排除
             ax_rsi.set_ylim(10, 90)
             ax_rsi.set_yticks([30, 70])
             ax_rsi.text(
@@ -192,7 +185,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         if has_macd and current_panel_idx < len(axes):
             ax_macd = axes[current_panel_idx]
             ax_macd.set_ylabel('')
-            # MACDの最大・最小値に対して上下15%の余白を確保し、線が下枠に張り付いて潰れる現象を防止
             macd_vals = pd.concat([df_plot['MACD_Line'], df_plot['MACD_Signal'], df_plot['MACD_Hist']]).dropna()
             if not macd_vals.empty:
                 m_min, m_max = macd_vals.min(), macd_vals.max()
@@ -205,9 +197,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             )
             current_panel_idx += 2
 
-        # 極値（高値・安値）の抽出と近接ラベル重複排除（14921491等の8桁連結バグ防止）
+        # 極値ラベルの抽出（近接重複を防ぐため最小距離を全体の11%・最低10本分に拡大）
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
-        min_dist = max(int(len(df_plot) * 0.08), 6)
+        min_dist = max(int(len(df_plot) * 0.11), 10)
         highs = []
         lows = []
         for i in range(window_size, len(df_plot) - window_size):
@@ -236,10 +228,10 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         ax_main.set_ylim(current_ylim[0] - offset * 1.5, current_ylim[1] + offset * 1.5)
 
         for idx, val in highs:
-            val_str = _format_chart_price(val, is_int_price)
+            val_str = _format_chart_price(val, is_jp)
             ax_main.text(idx, val + offset, val_str, ha='center', va='bottom', color='green', fontsize=8, fontweight='bold')
         for idx, val in lows:
-            val_str = _format_chart_price(val, is_int_price)
+            val_str = _format_chart_price(val, is_jp)
             ax_main.text(idx, val - offset, val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
 
         tick_indices = []
@@ -289,7 +281,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             for i, dt in enumerate(df_plot.index):
                 current_date = dt.date()
                 if current_date != last_date_printed:
-                    # 09/28と29の衝突を防ぐため最小間隔を7本以上に設定
                     if not tick_indices or (i - tick_indices[-1]) >= 7:
                         tick_indices.append(i)
                         if dt.month != last_month_printed:

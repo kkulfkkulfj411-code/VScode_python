@@ -7,6 +7,7 @@ import io
 import zipfile
 import requests
 import unicodedata
+from datetime import datetime
 
 from data_fetcher import (
     get_macro_data, get_edinet_documents, get_news,
@@ -21,6 +22,24 @@ st.set_page_config(page_title="AI株式分析データジェネレーター", la
 # --- セッションステート ---
 if "generated_data" not in st.session_state:
     st.session_state.generated_data = None
+if "cache_cleared_time" not in st.session_state:
+    st.session_state.cache_cleared_time = None
+
+
+# --- サイドバー表示用の軽量な銘柄名取得関数（キャッシュ付き） ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_stock_display_name(code, is_jp_flag):
+    if not code:
+        return ""
+    try:
+        if is_jp_flag:
+            name = get_japanese_name(code)
+            return name if name else ""
+        else:
+            name = get_us_stock_name(code)
+            return name if name else ""
+    except Exception:
+        return ""
 
 
 # --- キャッシュ回避＆異常値補正対応のデータ取得関数 ---
@@ -105,7 +124,6 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
     else:
         target_str = "N/A"
 
-    # yfinanceネイティブの英語ニュースヘッドライン抽出
     yf_news_lines = []
     try:
         raw_news = getattr(stock, 'news', None)
@@ -221,6 +239,7 @@ with st.sidebar:
     
     stock_code = ""
     is_jp = False
+    selected_label_name = ""
     
     if not raw_input:
         stock_code = ""
@@ -252,8 +271,10 @@ with st.sidebar:
         all_matches = jp_matches + us_matches
         
         if all_matches:
-            selected = st.selectbox("複数の候補が見つかりました。対象を選択してください:", all_matches)
-            stock_code = selected.split(" - ")[0].strip().upper()
+            selected = st.selectbox("候補が見つかりました。対象を選択してください:", all_matches)
+            parts = selected.split(" - ", 1)
+            stock_code = parts[0].strip().upper()
+            selected_label_name = parts[1].strip() if len(parts) > 1 else ""
             is_jp = bool(re.match(jp_code_pattern, stock_code))
         else:
             if market_filter != "日本株のみ" and re.match(r'^[A-Za-z.\-]+$', raw_input):
@@ -262,6 +283,15 @@ with st.sidebar:
             else:
                 st.warning("該当する銘柄が見つかりませんでした。市場切替や証券コード直接入力をお試しください。")
                 stock_code = ""
+
+    # ★確定している対象銘柄の即時視認表示（日本株・米国株共通）
+    if stock_code:
+        display_name = selected_label_name or resolve_stock_display_name(stock_code, is_jp)
+        market_badge = "日本株" if is_jp else "米国株"
+        if display_name and display_name != stock_code:
+            st.success(f"🎯 **対象確定**: [{stock_code}] **{display_name}** ({market_badge})")
+        else:
+            st.info(f"🎯 **対象コード確定**: [{stock_code}] ({market_badge}としてデータ取得を実行します)")
     
     st.markdown("---")
     st.subheader("⚙️ データ取得・キャッシュ設定")
@@ -273,7 +303,13 @@ with st.sidebar:
     if st.button("🔄 キャッシュをクリアして初期化", use_container_width=True):
         st.cache_data.clear()
         st.session_state.generated_data = None
+        st.session_state.cache_cleared_time = datetime.now().strftime("%H:%M:%S")
         st.rerun()
+
+    # ★キャッシュクリア完了の視覚表示
+    if st.session_state.cache_cleared_time:
+        st.toast(f"キャッシュをクリアしました ({st.session_state.cache_cleared_time})", icon="✅")
+        st.success(f"✅ キャッシュと生成データをクリアしました（{st.session_state.cache_cleared_time}）")
 
     st.markdown("---")
     st.subheader("🔗 調査サイトへ一発アクセス")
@@ -311,6 +347,7 @@ with st.sidebar:
 if generate_button and stock_code:
     st.cache_data.clear()
     st.session_state.generated_data = None
+    st.session_state.cache_cleared_time = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
     
     with st.spinner('市場データの取得とチャート画像を生成中...'):
@@ -349,9 +386,10 @@ if generate_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly')
-        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily')
-        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly')
+        # is_jpフラグを明示的に渡して日本株の小数点表示バグを防止
+        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly', is_jp=is_jp)
+        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily', is_jp=is_jp)
+        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly', is_jp=is_jp)
         
         latest_d = df_d.iloc[-1]
         unit_str = '円' if is_jp else 'ドル'
