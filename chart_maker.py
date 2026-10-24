@@ -4,13 +4,16 @@ import mplfinance as mpf
 import matplotlib.font_manager as fm
 import os
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter, MaxNLocator
 
 SYS_FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
 if not os.path.exists(SYS_FONT_PATH):
     SYS_FONT_PATH = 'C:/Windows/Fonts/meiryo.ttc'
 
+
 def add_indicators(df):
-    if df.empty: return df
+    if df.empty:
+        return df
     df['SMA25'] = ta.trend.sma_indicator(df['Close'], window=25)
     df['SMA75'] = ta.trend.sma_indicator(df['Close'], window=75)
     df['SMA200'] = ta.trend.sma_indicator(df['Close'], window=200)
@@ -29,70 +32,88 @@ def add_indicators(df):
     df['MACD'] = df['MACD_Hist']
     return df
 
+
+def _format_chart_price(val, is_int_price):
+    """日本株（整数）と米国株（小数）を判別してラベル文字列を返す"""
+    if is_int_price:
+        return f"{int(round(val))}"
+    return f"{val:.2f}"
+
+
 def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_type):
-    if df_full.empty: return None
+    if df_full.empty:
+        return None
     df_full.index = pd.to_datetime(df_full.index)
-    if df_full.index.tz is not None: df_full.index = df_full.index.tz_convert(None)
+    if df_full.index.tz is not None:
+        df_full.index = df_full.index.tz_convert(None)
     
     df_plot = df_full.tail(tail_count).copy()
     df_plot = df_plot.dropna(subset=['Open', 'High', 'Low', 'Close'])
-    if df_plot.empty: return None
+    if df_plot.empty:
+        return None
+
+    # 終値データに小数点以下の端数が含まれるかで整数表示（日本株）か小数表示（米国株等）かを判定
+    has_fraction = any((df_plot['Close'] % 1).round(4) != 0)
+    is_int_price = not has_fraction and df_plot['Close'].max() >= 50
 
     aps = []
-    
     legend_texts = []
     if 'SMA25' in df_plot.columns and df_plot['SMA25'].notna().any():
-        aps.append(mpf.make_addplot(df_plot['SMA25'], color='blue', width=1.2))
+        aps.append(mpf.make_addplot(df_plot['SMA25'], color='blue', width=1.2, secondary_y=False))
         legend_texts.append("SMA25(青)")
     if 'SMA75' in df_plot.columns and df_plot['SMA75'].notna().any():
-        aps.append(mpf.make_addplot(df_plot['SMA75'], color='orange', width=1.2))
+        aps.append(mpf.make_addplot(df_plot['SMA75'], color='orange', width=1.2, secondary_y=False))
         legend_texts.append("SMA75(橙)")
     if 'SMA200' in df_plot.columns and df_plot['SMA200'].notna().any():
-        aps.append(mpf.make_addplot(df_plot['SMA200'], color='red', width=1.2))
+        aps.append(mpf.make_addplot(df_plot['SMA200'], color='red', width=1.2, secondary_y=False))
         legend_texts.append("SMA200(赤)")
         
     if legend_texts:
         title = f"{title}   [{' / '.join(legend_texts)}]"
     
     if 'BB_UP' in df_plot.columns and df_plot['BB_UP'].notna().any():
-        aps.append(mpf.make_addplot(df_plot['BB_UP'], color='gray', width=0.8, alpha=0.6))
-        aps.append(mpf.make_addplot(df_plot['BB_MID'], color='purple', width=0.8, alpha=0.6))
-        aps.append(mpf.make_addplot(df_plot['BB_LOW'], color='gray', width=0.8, alpha=0.6))
+        aps.append(mpf.make_addplot(df_plot['BB_UP'], color='gray', width=0.8, alpha=0.6, secondary_y=False))
+        aps.append(mpf.make_addplot(df_plot['BB_MID'], color='purple', width=0.8, alpha=0.6, secondary_y=False))
+        aps.append(mpf.make_addplot(df_plot['BB_LOW'], color='gray', width=0.8, alpha=0.6, secondary_y=False))
 
-# 🌟修正点：メインチャートの比率を8に広げ、RSIとMACDを0.75（従来の半分）に縮小
+    # メインチャートの比率(8)を維持しつつ、RSIとMACDの線潰れ・文字被りを防ぐ比率に設定
     panel_ratios = [8]
     panels_count = 0
     
     has_volume = bool('Volume' in df_plot.columns and df_plot['Volume'].notna().any())
     if has_volume:
         panels_count += 1
-        panel_ratios.append(1.5)
+        panel_ratios.append(1.4)
         if 'Vol_SMA20' in df_plot.columns and df_plot['Vol_SMA20'].notna().any():
-            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count))
+            aps.append(mpf.make_addplot(df_plot['Vol_SMA20'], color='darkgreen', width=1.0, panel=panels_count, secondary_y=False))
 
     has_rsi = bool('RSI' in df_plot.columns and df_plot['RSI'].notna().any())
     if has_rsi:
         panels_count += 1
-        panel_ratios.append(0.75)
-        aps.append(mpf.make_addplot(df_plot['RSI'], color='purple', width=1.2, panel=panels_count))
+        panel_ratios.append(1.0)
+        # secondary_y=Falseを徹底し、定数ラインによる左軸(29/30/31)の誤生成を防止
+        aps.append(mpf.make_addplot(df_plot['RSI'], color='purple', width=1.2, panel=panels_count, secondary_y=False))
         df_plot['RSI_70'] = 70
         df_plot['RSI_30'] = 30
-        aps.append(mpf.make_addplot(df_plot['RSI_70'], color='gray', linestyle='--', width=0.8, panel=panels_count))
-        aps.append(mpf.make_addplot(df_plot['RSI_30'], color='gray', linestyle='--', width=0.8, panel=panels_count))
+        aps.append(mpf.make_addplot(df_plot['RSI_70'], color='gray', linestyle='--', width=0.8, panel=panels_count, secondary_y=False))
+        aps.append(mpf.make_addplot(df_plot['RSI_30'], color='gray', linestyle='--', width=0.8, panel=panels_count, secondary_y=False))
 
     has_macd = bool('MACD_Line' in df_plot.columns and df_plot['MACD_Line'].notna().any())
     if has_macd:
         panels_count += 1
-        panel_ratios.append(0.75)
+        panel_ratios.append(1.2)
         colors = ['green' if val >= 0 else 'red' for val in df_plot['MACD_Hist']]
-        aps.append(mpf.make_addplot(df_plot['MACD_Hist'], type='bar', color=colors, panel=panels_count, alpha=0.5))
-        aps.append(mpf.make_addplot(df_plot['MACD_Line'], color='blue', width=1.0, panel=panels_count))
-        aps.append(mpf.make_addplot(df_plot['MACD_Signal'], color='orange', width=1.0, panel=panels_count))
+        # すべてsecondary_y=Falseに統一し、ヒストグラムとMACD線のゼロラインを完全一致させる
+        aps.append(mpf.make_addplot(df_plot['MACD_Hist'], type='bar', color=colors, panel=panels_count, alpha=0.5, secondary_y=False))
+        aps.append(mpf.make_addplot(df_plot['MACD_Line'], color='blue', width=1.1, panel=panels_count, secondary_y=False))
+        aps.append(mpf.make_addplot(df_plot['MACD_Signal'], color='orange', width=1.1, panel=panels_count, secondary_y=False))
+        df_plot['MACD_Zero'] = 0
+        aps.append(mpf.make_addplot(df_plot['MACD_Zero'], color='gray', linestyle=':', width=0.8, panel=panels_count, secondary_y=False))
 
     try:
         meiryo_prop = fm.FontProperties(fname=SYS_FONT_PATH)
         my_style = mpf.make_mpf_style(base_mpf_style='yahoo', rc={'font.family': meiryo_prop.get_name()})
-    except:
+    except Exception:
         my_style = 'yahoo'
 
     plot_kwargs = dict(
@@ -114,20 +135,20 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
         
-        from matplotlib.ticker import ScalarFormatter
         for ax in fig.axes:
             formatter = ScalarFormatter(useOffset=False, useMathText=False)
             formatter.set_scientific(False)
             ax.yaxis.set_major_formatter(formatter)
             ax.yaxis.offsetText.set_visible(False)
+            ax.tick_params(axis='y', labelsize=8.5)
             
         for ax in axes:
             ax.spines['top'].set_visible(True)
             ax.spines['bottom'].set_visible(True)
             ax.spines['left'].set_visible(True)
             ax.spines['right'].set_visible(True)
-            ax.spines['top'].set_linewidth(1.5)
-            ax.spines['bottom'].set_linewidth(1.5)
+            ax.spines['top'].set_linewidth(1.2)
+            ax.spines['bottom'].set_linewidth(1.2)
             ax.spines['left'].set_linewidth(1.0)
             ax.spines['right'].set_linewidth(1.0)
             ax.spines['top'].set_color('black')
@@ -136,26 +157,52 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             ax.spines['right'].set_color('black')
             
         last_close = df_plot['Close'].iloc[-1]
-        price_str = f"{int(last_close)}" if last_close > 100 else f"{last_close:.2f}"
+        price_str = _format_chart_price(last_close, is_int_price)
         
-        ax_main.text(1.0, last_close, f' {price_str} ', color='white', 
-                     backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
-                     transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10)
+        ax_main.text(
+            1.0, last_close, f' {price_str} ', color='white',
+            backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
+            transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10
+        )
                      
         current_panel_idx = 2  
         if has_volume and current_panel_idx < len(axes):
             ax_vol = axes[current_panel_idx]
-            ax_vol.text(0.01, 0.85, 'Volume', transform=ax_vol.transAxes, fontsize=10, fontweight='bold', color='black', alpha=0.7)
+            ax_vol.set_ylabel('')
+            # 上下端の目盛りを除外して隣接パネルとの数字被りを防止
+            ax_vol.yaxis.set_major_locator(MaxNLocator(nbins=3, prune='both'))
+            ax_vol.text(
+                0.01, 0.90, 'Volume', transform=ax_vol.transAxes,
+                va='top', ha='left', fontsize=8.5, fontweight='bold', color='black', alpha=0.75
+            )
             current_panel_idx += 2
             
         if has_rsi and current_panel_idx < len(axes):
             ax_rsi = axes[current_panel_idx]
-            ax_rsi.text(0.01, 0.85, 'RSI', transform=ax_rsi.transAxes, fontsize=10, fontweight='bold', color='black', alpha=0.7)
+            ax_rsi.set_ylabel('')
+            # RSIのY軸範囲を10〜90に固定し、目盛りを30と70のみに限定して上下パネルとの衝突を完全排除
+            ax_rsi.set_ylim(10, 90)
+            ax_rsi.set_yticks([30, 70])
+            ax_rsi.text(
+                0.01, 0.90, 'RSI', transform=ax_rsi.transAxes,
+                va='top', ha='left', fontsize=8.5, fontweight='bold', color='black', alpha=0.75
+            )
             current_panel_idx += 2
             
         if has_macd and current_panel_idx < len(axes):
             ax_macd = axes[current_panel_idx]
-            ax_macd.text(0.01, 0.85, 'MACD', transform=ax_macd.transAxes, fontsize=10, fontweight='bold', color='black', alpha=0.7)
+            ax_macd.set_ylabel('')
+            # MACDの最大・最小値に対して上下15%の余白を確保し、線が下枠に張り付いて潰れる現象を防止
+            macd_vals = pd.concat([df_plot['MACD_Line'], df_plot['MACD_Signal'], df_plot['MACD_Hist']]).dropna()
+            if not macd_vals.empty:
+                m_min, m_max = macd_vals.min(), macd_vals.max()
+                m_span = max(m_max - m_min, 1e-5)
+                ax_macd.set_ylim(m_min - m_span * 0.15, m_max + m_span * 0.15)
+            ax_macd.yaxis.set_major_locator(MaxNLocator(nbins=3, prune='both'))
+            ax_macd.text(
+                0.01, 0.90, 'MACD', transform=ax_macd.transAxes,
+                va='top', ha='left', fontsize=8.5, fontweight='bold', color='black', alpha=0.75
+            )
             current_panel_idx += 2
 
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
@@ -170,23 +217,22 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                         is_high = False
                     if df_plot['Low'].iloc[i] >= df_plot['Low'].iloc[j]:
                         is_low = False
-            if is_high: highs.append((i, df_plot['High'].iloc[i]))
-            if is_low: lows.append((i, df_plot['Low'].iloc[i]))
+            if is_high:
+                highs.append((i, df_plot['High'].iloc[i]))
+            if is_low:
+                lows.append((i, df_plot['Low'].iloc[i]))
             
-        # ★追加・修正: チャート完成後に、Y軸の「天井と床」を強制的に少し広げて余白を作る
-        current_ylim = ax_main.get_ylim() # 現在のY軸の上限・下限を取得
-        y_range = current_ylim[1] - current_ylim[0] # 画面に表示されている値幅
-        offset = y_range * 0.025  # 値幅の2.5%をテキストの浮遊距離とする
+        current_ylim = ax_main.get_ylim()
+        y_range = current_ylim[1] - current_ylim[0]
+        offset = y_range * 0.025
         
-        # 上下に余白（ヘッドルーム）を追加して再設定（これで枠外に飛び出さない）
         ax_main.set_ylim(current_ylim[0] - offset * 1.5, current_ylim[1] + offset * 1.5)
 
-        # テキストの描画
         for idx, val in highs:
-            val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
+            val_str = _format_chart_price(val, is_int_price)
             ax_main.text(idx, val + offset, val_str, ha='center', va='bottom', color='green', fontsize=8, fontweight='bold')
         for idx, val in lows:
-            val_str = f"{int(val)}" if val > 100 else f"{val:.1f}"
+            val_str = _format_chart_price(val, is_int_price)
             ax_main.text(idx, val - offset, val_str, ha='center', va='top', color='red', fontsize=8, fontweight='bold')
 
         tick_indices = []
@@ -248,7 +294,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         ax_main.set_xticks(tick_indices)
         ax_main.set_xticklabels(tick_labels, rotation=45)
             
-        fig.savefig(filename, dpi=300, bbox_inches='tight')
+        fig.savefig(filename, dpi=200, bbox_inches='tight')
         plt.close(fig)
         return filename
     except Exception:
