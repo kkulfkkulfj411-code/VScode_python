@@ -7,7 +7,8 @@ import io
 import zipfile
 import requests
 import unicodedata
-from datetime import datetime
+import calendar
+from datetime import datetime, timedelta, timezone, time as dt_time
 
 from data_fetcher import (
     get_macro_data, get_edinet_documents, get_news,
@@ -40,6 +41,74 @@ def resolve_stock_display_name(code, is_jp_flag):
             return name if name else ""
     except Exception:
         return ""
+
+
+# --- HYPER SBI 2 期間指定カレンダー自動算出関数（JST固定・東証祝日・権利最終日考慮） ---
+def get_sbi_order_limit_dates():
+    """
+    日本標準時(JST)の現在時刻（15:30前後）と東証の祝日・年末年始休場日を考慮し、
+    HYPER SBI 2の期間指定における「起算日(1営業日目)」「3/5/10営業日目」「最長上限(15営業日目)」
+    および「当月・翌月の月末権利付き最終日」を正確に算出する。
+    """
+    jp_holidays = {
+        "2026-01-01", "2026-01-02", "2026-01-12", "2026-02-11", "2026-02-23",
+        "2026-03-20", "2026-04-29", "2026-05-04", "2026-05-05", "2026-05-06",
+        "2026-07-20", "2026-08-11", "2026-09-21", "2026-09-22", "2026-09-23",
+        "2026-10-12", "2026-11-03", "2026-11-23", "2026-12-31",
+        "2027-01-01", "2027-01-04", "2027-01-11", "2027-02-11", "2027-02-23",
+        "2027-03-22", "2027-04-29", "2027-05-03", "2027-05-04", "2027-05-05",
+        "2027-07-19", "2027-08-11", "2027-09-20", "2027-09-23", "2027-10-11",
+        "2027-11-03", "2027-11-23", "2027-12-31"
+    }
+    weekdays_jp = ["月", "火", "水", "木", "金", "土", "日"]
+    jst = timezone(timedelta(hours=9))
+    now = datetime.now(jst)
+    curr_date = now.date()
+
+    def is_tse_open(d):
+        return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in jp_holidays
+
+    def fmt_d(d):
+        return f"{d.strftime('%m/%d')}({weekdays_jp[d.weekday()]})"
+
+    # 平日の15:30より前なら当日が1営業日目、15:30以降または休場日なら翌営業日が1営業日目
+    if is_tse_open(curr_date) and now.time() < dt_time(15, 30):
+        start_date = curr_date
+    else:
+        start_date = curr_date + timedelta(days=1)
+        while not is_tse_open(start_date):
+            start_date += timedelta(days=1)
+
+    biz_days = []
+    d_cursor = start_date
+    while len(biz_days) < 15:
+        if is_tse_open(d_cursor):
+            biz_days.append(d_cursor)
+        d_cursor += timedelta(days=1)
+
+    # 月末基準の権利付き最終日（月末最終営業日の2営業日前）の算出
+    def get_month_end_kenri_date(year, month):
+        last_day = calendar.monthrange(year, month)[1]
+        d = datetime(year, month, last_day).date()
+        open_days = []
+        while len(open_days) < 3:
+            if is_tse_open(d):
+                open_days.append(d)
+            d -= timedelta(days=1)
+        return open_days[2]  # 月末最終営業日から2営業日前
+
+    y1, m1 = start_date.year, start_date.month
+    y2, m2 = (y1 + 1, 1) if m1 == 12 else (y1, m1 + 1)
+    kenri_curr = get_month_end_kenri_date(y1, m1)
+    kenri_next = get_month_end_kenri_date(y2, m2)
+
+    return (
+        f"[HYPER SBI 2 期間指定カレンダー（JST {now.strftime('%m/%d %H:%M')} 時点・東証祝日考慮済み）]\n"
+        f"・初回有効営業日(1営業日目): {fmt_d(biz_days[0])}\n"
+        f"・第1注文(新規買い)推奨期限目安: 3営業日目={fmt_d(biz_days[2])} | 5営業日目={fmt_d(biz_days[4])} | 10営業日目={fmt_d(biz_days[9])}\n"
+        f"・第2注文(決済OCO)システム最長上限(15営業日目): {fmt_d(biz_days[14])}\n"
+        f"・月末銘柄の権利付き最終日目安: {m1}月末基準={fmt_d(kenri_curr)} / {m2}月末基準={fmt_d(kenri_next)} （※当該銘柄の権利確定月である場合、権利付き最終日をまたぐ期間指定は不可のためその日が上限となる）\n"
+    )
 
 
 # --- キャッシュ回避＆異常値補正対応のデータ取得関数 ---
@@ -146,7 +215,7 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
         f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
         f"[米国現地ニュースヘッドライン (yfinance)]\n{yf_news_str}\n"
         f"[米国株 注文仕様上の厳守事項]\n"
-        f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文に非対応（単一注文の指値・成行・逆指値のみ、期間指定は最長90現地営業日）。また値幅制限（ストップ高安）が存在せず1株単位で売買可能である点を前提に戦略を組むこと。\n"
+        f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文および執行条件（不成・引成等）に非対応であり、単一注文（指値・成行・逆指値、期間指定は当日中または最長90現地営業日）のみ可能。また値幅制限（ストップ高安）が存在せず1株単位で売買可能である点を前提に戦略を組むこと。\n"
     )
 
 
@@ -284,7 +353,7 @@ with st.sidebar:
                 st.warning("該当する銘柄が見つかりませんでした。市場切替や証券コード直接入力をお試しください。")
                 stock_code = ""
 
-    # ★確定している対象銘柄の即時視認表示（日本株・米国株共通）
+    # 確定している対象銘柄の即時視認表示（日本株・米国株共通）
     if stock_code:
         display_name = selected_label_name or resolve_stock_display_name(stock_code, is_jp)
         market_badge = "日本株" if is_jp else "米国株"
@@ -303,10 +372,11 @@ with st.sidebar:
     if st.button("🔄 キャッシュをクリアして初期化", use_container_width=True):
         st.cache_data.clear()
         st.session_state.generated_data = None
-        st.session_state.cache_cleared_time = datetime.now().strftime("%H:%M:%S")
+        jst = timezone(timedelta(hours=9))
+        st.session_state.cache_cleared_time = datetime.now(jst).strftime("%H:%M:%S")
         st.rerun()
 
-    # ★キャッシュクリア完了の視覚表示
+    # キャッシュクリア完了の視覚表示
     if st.session_state.cache_cleared_time:
         st.toast(f"キャッシュをクリアしました ({st.session_state.cache_cleared_time})", icon="✅")
         st.success(f"✅ キャッシュと生成データをクリアしました（{st.session_state.cache_cleared_time}）")
@@ -439,7 +509,9 @@ if generate_button and stock_code:
             edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
             news_str = get_news(name, True, edinet_reasons)
             edinet_section = f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
+            order_calendar_section = get_sbi_order_limit_dates()
             market_specific_section = (
+                f"{order_calendar_section}"
                 f"[TOPIX指数・需給イベント確認事項]\n"
                 f"対象銘柄（{name} / {stock_code}）のTOPIX定期入替区分（新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用951銘柄・非構成銘柄）をGoogle検索で確認し、"
                 f"四半期リバランス日（1月・4月・7月・10月の各最終営業日）に向けたパッシブ需給の影響を分析に織り込むこと（検索で確定情報がない場合は『区分不明』と明記し推測しないこと）。\n"
@@ -506,7 +578,7 @@ if st.session_state.generated_data:
     if data.get("is_jp", True):
         demand_items = (
             f"・直近の業績推移（売上高成長率、営業利益率、ROE）と財務健全性（自己資本比率）\n"
-            f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無、次回決算発表日）\n"
+            f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無、次回決算発表日、配当権利確定月）\n"
             f"・大口の需給動向（日次公表の信用買い残・売り残の推移、機関投資家の空売り残高、大量保有報告書の有無）\n"
             f"・TOPIX定期入替の区分（「{data['name']}（{data['stock_code']}）」が新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用のいずれに該当するか）と、四半期リバランス日（1・4・7・10月の各最終営業日）に伴うパッシブ需給影響（※検索で確定情報がない場合は推測せず『区分不明』とすること）\n"
         )
