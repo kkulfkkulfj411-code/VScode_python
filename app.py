@@ -8,7 +8,7 @@ import zipfile
 import requests
 import unicodedata
 import calendar
-from datetime import datetime, timedelta, timezone, time as dt_time
+from datetime import datetime, date, timedelta, timezone, time as dt_time
 
 from data_fetcher import (
     get_macro_data, get_edinet_documents, get_news,
@@ -43,6 +43,62 @@ def resolve_stock_display_name(code, is_jp_flag):
         return ""
 
 
+# --- 東証休場日（祝日・年末年始）の動的生成関数（年次ハードコード不要・半永久対応） ---
+def get_dynamic_jp_holidays(year: int) -> set:
+    """
+    指定された年の日本の祝日および東証年末年始休場日(1/1〜1/3, 12/31)を
+    標準ライブラリのみで動的に算出する（2028年以降もコード修正不要）。
+    """
+    holidays = set()
+
+    # 1. 東証年末年始休場日 ＆ 固定祝日
+    fixed_days = [
+        (1, 1), (1, 2), (1, 3),   # 年始休場
+        (2, 11), (2, 23),         # 建国記念の日、天皇誕生日
+        (4, 29),                  # 昭和の日
+        (5, 3), (5, 4), (5, 5),   # 憲法記念日、みどりの日、こどもの日
+        (8, 11),                  # 山の日
+        (11, 3), (11, 23),        # 文化の日、勤労感謝の日
+        (12, 31)                  # 年末休場
+    ]
+    for m, d in fixed_days:
+        holidays.add(date(year, m, d))
+
+    # 2. ハッピーマンデー（第N月曜日）の算出
+    def nth_monday(y, m, n):
+        first_day = date(y, m, 1)
+        first_monday_day = 1 + (7 - first_day.weekday()) % 7
+        return date(y, m, first_monday_day + (n - 1) * 7)
+
+    holidays.add(nth_monday(year, 1, 2))   # 成人の日（1月第2月曜）
+    holidays.add(nth_monday(year, 7, 3))   # 海の日（7月第3月曜）
+    holidays.add(nth_monday(year, 9, 3))   # 敬老の日（9月第3月曜）
+    holidays.add(nth_monday(year, 10, 2))  # スポーツの日（10月第2月曜）
+
+    # 3. 春分の日・秋分の日の簡易算出（2099年まで対応）
+    vernal_day = int(20.8431 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
+    autumnal_day = int(23.2488 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
+    holidays.add(date(year, 3, vernal_day))
+    holidays.add(date(year, 9, autumnal_day))
+
+    # 4. 国民の休日（敬老の日と秋分の日に挟まれた平日がある場合）
+    keiro = nth_monday(year, 9, 3)
+    shubun = date(year, 9, autumnal_day)
+    if (shubun - keiro).days == 2:
+        holidays.add(keiro + timedelta(days=1))
+
+    # 5. 振替休日（祝日が日曜日の場合、翌平日を休日に追加）
+    base_holidays = sorted(list(holidays))
+    for h in base_holidays:
+        if h.weekday() == 6:  # 日曜日
+            sub = h + timedelta(days=1)
+            while sub in holidays:
+                sub += timedelta(days=1)
+            holidays.add(sub)
+
+    return holidays
+
+
 # --- HYPER SBI 2 期間指定カレンダー自動算出関数（JST固定・東証祝日・権利最終日考慮） ---
 def get_sbi_order_limit_dates():
     """
@@ -50,23 +106,16 @@ def get_sbi_order_limit_dates():
     HYPER SBI 2の期間指定における「起算日(1営業日目)」「3/5/10営業日目」「最長上限(15営業日目)」
     および「当月・翌月の月末権利付き最終日」を正確に算出する。
     """
-    jp_holidays = {
-        "2026-01-01", "2026-01-02", "2026-01-12", "2026-02-11", "2026-02-23",
-        "2026-03-20", "2026-04-29", "2026-05-04", "2026-05-05", "2026-05-06",
-        "2026-07-20", "2026-08-11", "2026-09-21", "2026-09-22", "2026-09-23",
-        "2026-10-12", "2026-11-03", "2026-11-23", "2026-12-31",
-        "2027-01-01", "2027-01-04", "2027-01-11", "2027-02-11", "2027-02-23",
-        "2027-03-22", "2027-04-29", "2027-05-03", "2027-05-04", "2027-05-05",
-        "2027-07-19", "2027-08-11", "2027-09-20", "2027-09-23", "2027-10-11",
-        "2027-11-03", "2027-11-23", "2027-12-31"
-    }
     weekdays_jp = ["月", "火", "水", "木", "金", "土", "日"]
     jst = timezone(timedelta(hours=9))
     now = datetime.now(jst)
     curr_date = now.date()
 
+    # 当年と翌年の休場日セットを動的取得
+    jp_holidays = get_dynamic_jp_holidays(curr_date.year) | get_dynamic_jp_holidays(curr_date.year + 1)
+
     def is_tse_open(d):
-        return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in jp_holidays
+        return d.weekday() < 5 and d not in jp_holidays
 
     def fmt_d(d):
         return f"{d.strftime('%m/%d')}({weekdays_jp[d.weekday()]})"
@@ -95,7 +144,7 @@ def get_sbi_order_limit_dates():
             if is_tse_open(d):
                 open_days.append(d)
             d -= timedelta(days=1)
-        return open_days[2]  # 月末最終営業日から2営業日前
+        return open_days[2]
 
     y1, m1 = start_date.year, start_date.month
     y2, m2 = (y1 + 1, 1) if m1 == 12 else (y1, m1 + 1)
@@ -103,7 +152,7 @@ def get_sbi_order_limit_dates():
     kenri_next = get_month_end_kenri_date(y2, m2)
 
     return (
-        f"[HYPER SBI 2 期間指定カレンダー（JST {now.strftime('%m/%d %H:%M')} 時点・東証祝日考慮済み）]\n"
+        f"[HYPER SBI 2 期間指定カレンダー（JST {now.strftime('%m/%d %H:%M')} 時点・東証祝日自動算出）]\n"
         f"・初回有効営業日(1営業日目): {fmt_d(biz_days[0])}\n"
         f"・第1注文(新規買い)推奨期限目安: 3営業日目={fmt_d(biz_days[2])} | 5営業日目={fmt_d(biz_days[4])} | 10営業日目={fmt_d(biz_days[9])}\n"
         f"・第2注文(決済OCO)システム最長上限(15営業日目): {fmt_d(biz_days[14])}\n"
@@ -113,10 +162,6 @@ def get_sbi_order_limit_dates():
 
 # --- キャッシュ回避＆異常値補正対応のデータ取得関数 ---
 def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
-    """
-    新規セッションでキャッシュを回避してデータを取得する。
-    yfinanceの仕様変更等でカスタムSessionやrepairがエラーを吐いた場合は安全にフォールバックする。
-    """
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -149,7 +194,6 @@ def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
     return stock, df_w, df_d, df_h
 
 
-# --- 安全な数値フォーマット＆時系列テキスト生成関数 ---
 def format_price(val, is_jp):
     if pd.isna(val):
         return "N/A"
@@ -157,10 +201,6 @@ def format_price(val, is_jp):
 
 
 def build_us_extra_fundamentals(stock, info, close_price_num):
-    """
-    米国株向けにyfinanceのstock.infoとstock.newsから予想PER、成長性、空売り需給（Short Interest）、
-    機関投資家保有比率、アナリスト目標株価、英語一次ニュースを安全に抽出してテキスト化する。
-    """
     def fmt_pct(key):
         val = info.get(key)
         return f"{round(val * 100, 2)}%" if isinstance(val, (int, float)) and pd.notna(val) else "N/A"
@@ -209,21 +249,17 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
     return (
         f"[米国株 詳細指標・成長性]\n"
         f"予想PER(Forward): {fwd_pe} | PEGレシオ: {peg} | ROE: {roe} | 売上成長率: {rev_growth} | 営業利益率: {op_margin} | Beta(感応度): {beta}\n"
-        f"[米国株 需給・空売り動向・コンセンサス（※空売り残高は月2回公表のためタイムラグに注意）]\n"
+        f"[米国株 需給・空売り動向・コンセンサス]\n"
         f"浮動株空売り比率(Short % of Float): {short_pct} | 空売りカバー日数(Days to Cover): {short_ratio}日\n"
         f"機関投資家保有比率: {inst_held} | インサイダー保有比率: {insider_held}\n"
         f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
         f"[米国現地ニュースヘッドライン (yfinance)]\n{yf_news_str}\n"
         f"[米国株 注文仕様上の厳守事項]\n"
-        f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文および執行条件（不成・引成等）に非対応であり、単一注文（指値・成行・逆指値、期間指定は当日中または最長90現地営業日）のみ可能。また値幅制限（ストップ高安）が存在せず1株単位で売買可能である点を前提に戦略を組むこと。\n"
+        f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文および執行条件に非対応。単一注文（指値・成行・逆指値、期間指定は当日中または最長90現地営業日）のみ可能。1株単位で売買可能。\n"
     )
 
 
 def build_technical_summary_text(df_d, is_jp):
-    """
-    日足データから移動平均線の状態（現在値・5日前比の傾き・乖離率）と
-    直近10営業日の時系列テーブルをエラーなく安全にテキスト化する。
-    """
     unit = "円" if is_jp else "ドル"
     close_series = df_d['Close']
     vol_avg20_series = df_d['Volume'].rolling(20).mean()
@@ -299,11 +335,10 @@ with st.sidebar:
         ["日本株のみ", "すべて（日米）", "米国株のみ"],
         index=0,
         horizontal=True,
-        help="日本株の英字社名（MTGなど）が米国株と混同されるのを防ぎます。"
+        help="日本株の英字社名が米国株と混同されるのを防ぎます。"
     )
     raw_input = st.text_input("銘柄コード または 企業名（日米対応・一部でも可）", value="6844").strip()
     
-    # 日本株の証券コード判定パターン（数字4桁 または 数字3桁+英字1文字）
     jp_code_pattern = r'^[0-9]{3}[0-9A-Za-z]$'
     
     stock_code = ""
@@ -353,7 +388,6 @@ with st.sidebar:
                 st.warning("該当する銘柄が見つかりませんでした。市場切替や証券コード直接入力をお試しください。")
                 stock_code = ""
 
-    # 確定している対象銘柄の即時視認表示（日本株・米国株共通）
     if stock_code:
         display_name = selected_label_name or resolve_stock_display_name(stock_code, is_jp)
         market_badge = "日本株" if is_jp else "米国株"
@@ -367,7 +401,7 @@ with st.sidebar:
     use_repair = st.checkbox(
         "株式分割バグ・異常値を自動補正 (repair=True)",
         value=True,
-        help="株式分割直後のスパイクノイズ（異常なヒゲ）を補正します。取得が重い場合はオフにしてください。"
+        help="株式分割直後のスパイクノイズを補正します。"
     )
     if st.button("🔄 キャッシュをクリアして初期化", use_container_width=True):
         st.cache_data.clear()
@@ -376,7 +410,6 @@ with st.sidebar:
         st.session_state.cache_cleared_time = datetime.now(jst).strftime("%H:%M:%S")
         st.rerun()
 
-    # キャッシュクリア完了の視覚表示
     if st.session_state.cache_cleared_time:
         st.toast(f"キャッシュをクリアしました ({st.session_state.cache_cleared_time})", icon="✅")
         st.success(f"✅ キャッシュと生成データをクリアしました（{st.session_state.cache_cleared_time}）")
@@ -391,21 +424,21 @@ with st.sidebar:
         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
         
         st.markdown(f"""
-        * [Yahoo!ファイナンス（四季報・信用残）]({yahoo_url})
-        * [株探（適時開示・IR速報）]({kabutan_disclose_url})
-        * [株探（財務・業績推移）]({kabutan_finance_url})
-        * [TradingView（詳細チャート）]({tv_url})
-        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
+        * [Yahoo!ファイナンス]({yahoo_url})
+        * [株探（適時開示）]({kabutan_disclose_url})
+        * [株探（財務）]({kabutan_finance_url})
+        * [TradingView]({tv_url})
+        * [SBI証券](https://www.sbisec.co.jp/)
         """)
     elif not is_jp and stock_code:
         tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
         yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
         finviz_url = f"https://finviz.com/quote.ashx?t={stock_code.upper()}"
         st.markdown(f"""
-        * [TradingView（チャート分析）]({tv_url})
+        * [TradingView]({tv_url})
         * [Yahoo! Finance (US)]({yh_url})
-        * [Finviz（需給・空売り・インサイダー確認）]({finviz_url})
-        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
+        * [Finviz]({finviz_url})
+        * [SBI証券](https://www.sbisec.co.jp/)
         """)
     
     st.markdown("---")
@@ -422,7 +455,6 @@ if generate_button and stock_code:
     
     with st.spinner('市場データの取得とチャート画像を生成中...'):
         macro_text = get_macro_data()
-        
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, use_repair=use_repair)
         
         if is_jp:
@@ -439,7 +471,6 @@ if generate_button and stock_code:
         df_d = df_d.ffill().bfill()
         df_h = df_h.ffill().bfill()
 
-        # 東証クロージング・オークション等による日足と1時間足の最終終値ズレを同期補正
         if not df_h.empty and not df_d.empty:
             try:
                 if df_h.index[-1].date() == df_d.index[-1].date():
@@ -456,7 +487,6 @@ if generate_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
-        # is_jpフラグを明示的に渡して日本株の小数点表示バグを防止
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly', is_jp=is_jp)
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily', is_jp=is_jp)
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly', is_jp=is_jp)
@@ -513,7 +543,7 @@ if generate_button and stock_code:
             market_specific_section = (
                 f"{order_calendar_section}"
                 f"[TOPIX指数・需給イベント確認事項]\n"
-                f"対象銘柄（{name} / {stock_code}）のTOPIX定期入替区分（新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用951銘柄・非構成銘柄）をGoogle検索で確認し、"
+                f"対象銘柄（{name} / {stock_code}）のTOPIX定期入替区分（新規採用・移行措置[段階的ウエイト低減]・継続採用・非構成銘柄）をGoogle検索で確認し、"
                 f"四半期リバランス日（1月・4月・7月・10月の各最終営業日）に向けたパッシブ需給の影響を分析に織り込むこと（検索で確定情報がない場合は『区分不明』と明記し推測しないこと）。\n"
             )
         else:
@@ -576,27 +606,15 @@ if st.session_state.generated_data:
     st.markdown("AIに検索を強制するための文章です。コピーしてGeminiのチャット入力欄に貼り付けてください。")
     
     if data.get("is_jp", True):
-        demand_items = (
-            f"・直近の業績推移（売上高成長率、営業利益率、ROE）と財務健全性（自己資本比率）\n"
-            f"・決算の市場見通し（コンセンサス予想との乖離、上方/下方修正の有無、次回決算発表日、配当権利確定月）\n"
-            f"・大口の需給動向（日次公表の信用買い残・売り残の推移、機関投資家の空売り残高、大量保有報告書の有無）\n"
-            f"・TOPIX定期入替の区分（「{data['name']}（{data['stock_code']}）」が新規採用35銘柄・移行措置683銘柄[段階的ウエイト低減]・継続採用のいずれに該当するか）と、四半期リバランス日（1・4・7・10月の各最終営業日）に伴うパッシブ需給影響（※検索で確定情報がない場合は推測せず『区分不明』とすること）\n"
-        )
+        search_focus = f"・日本株重点検索：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、次回決算日、配当権利月、日次信用残・機関空売り残高、TOPIX定期入替区分（不明時は『区分不明』と記載）"
     else:
-        demand_items = (
-            f"・直近の四半期決算（EPSおよび売上高の市場コンセンサスビート/ミス状況、Non-GAAPベースの数値、ガイダンス引き上げの有無、次回Earnings Date[決算発表日]）\n"
-            f"・SEC開示および大口需給動向（Form 13Fによる機関投資家の増減、Form 4によるインサイダー売買、最新のShort Interest[空売り比率]の推移）\n"
-            f"・米国マクロ指標（FOMC金利見通し、米10年債利回り、セクターローテーション）および主要指数（S&P500、NASDAQ100等）のリバランス影響\n"
-            f"・※米国株の最新決算・ガイダンス・時間外株価の変動要因については、日本語記事だけでなく必ずティッカーシンボルを用いた英語クエリ（例：`{data['stock_code']} earnings release guidance`）でも検索して一次情報を確認すること\n"
-        )
+        search_focus = f"・米国株重点検索：「{data['name']}（{data['stock_code']}）」の最新四半期決算（英語クエリ `{data['stock_code']} earnings release guidance` 必須）、次回Earnings Date、Form 13F/Form 4、Short Interest推移"
 
     chat_prompt = (
-        f"@Google 添付したデータとチャートをもとに分析をお願いします。\n"
-        f"データ内でN/Aとなっている「{data['name']}（{data['stock_code']}）」の基本指標に加え、"
-        f"多角的な分析を行うため、以下の重要情報についても必ずGoogle検索機能を用いて最新の数値を調べ、情報を補完した上で指示書の通りに分析を行ってください。\n\n"
-        f"【追加検索・補完項目】\n"
-        f"{demand_items}"
-        f"・直近のニュース、適時開示（またはSEC Filing）、アナリストのレーティング変更の具体的な詳細内容"
+        "【株式スイング分析リクエスト】\n"
+        "@Google 添付したデータとチャート画像をもとに、指示書の【Step 0】〜【7】に従って分析をお願いします。\n"
+        f"{search_focus}\n"
+        "・※末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）を厳守し、「銘柄名」「証券コード」「IFDOCO」の文言は一切含めずに出力してください。"
     )
     st.code(chat_prompt, language="text")
 
