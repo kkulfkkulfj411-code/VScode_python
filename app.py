@@ -611,13 +611,13 @@ if st.session_state.generated_data:
         search_focus = f"・米国株重点検索：「{data['name']}（{data['stock_code']}）」の最新四半期決算（英語クエリ `{data['stock_code']} earnings release guidance` 必須）、次回Earnings Date、Form 13F/Form 4、Short Interest推移"
 
     chat_prompt = (
-        "【株式スイング分析リクエスト】\n"
+        f"【株式スイング分析リクエスト：{data['name']}（{data['stock_code']}）】\n"
         "@Google 添付したデータとチャート画像をもとに、指示書の【Step 0】〜【7】に従って分析をお願いします。\n"
         f"{search_focus}\n"
-        "・※末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）を厳守し、「銘柄名」「証券コード」「IFDOCO」の文言は一切含めずに出力してください。"
+        "・※回答の1行目には必ず `# 📊 【銘柄分析】銘柄名（コード）` の見出しを出力し、末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）を厳守して「銘柄名」「証券コード」「IFDOCO」の文言は一切含めずに出力してください。"
     )
+    
     st.code(chat_prompt, language="text")
-
     st.subheader("📱 ② 個別データ（添付用テキスト）")
     st.markdown("以下のテキストをコピーして、上記の命令文と一緒にGeminiへ貼り付けて送信してください。")
     st.code(data["text"], language="text")
