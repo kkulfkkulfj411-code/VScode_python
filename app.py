@@ -162,6 +162,10 @@ def get_sbi_order_limit_dates():
 
 # --- キャッシュ回避＆異常値補正対応のデータ取得関数 ---
 def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
+    """
+    新規セッションでキャッシュを回避してデータを取得する。
+    yfinanceの仕様変更等でカスタムSessionやrepairがエラーを吐いた場合は安全にフォールバックする。
+    """
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -194,6 +198,7 @@ def get_fresh_ticker_and_history(ticker_symbol, use_repair=True):
     return stock, df_w, df_d, df_h
 
 
+# --- 安全な数値フォーマット＆時系列テキスト生成関数 ---
 def format_price(val, is_jp):
     if pd.isna(val):
         return "N/A"
@@ -201,6 +206,10 @@ def format_price(val, is_jp):
 
 
 def build_us_extra_fundamentals(stock, info, close_price_num):
+    """
+    米国株向けにyfinanceのstock.infoとstock.newsから予想PER、成長性、空売り需給（Short Interest）、
+    機関投資家保有比率、アナリスト目標株価、英語一次ニュースを安全に抽出してテキスト化する。
+    """
     def fmt_pct(key):
         val = info.get(key)
         return f"{round(val * 100, 2)}%" if isinstance(val, (int, float)) and pd.notna(val) else "N/A"
@@ -249,17 +258,19 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
     return (
         f"[米国株 詳細指標・成長性]\n"
         f"予想PER(Forward): {fwd_pe} | PEGレシオ: {peg} | ROE: {roe} | 売上成長率: {rev_growth} | 営業利益率: {op_margin} | Beta(感応度): {beta}\n"
-        f"[米国株 需給・空売り動向・コンセンサス]\n"
+        f"[米国株 需給・空売り動向・コンセンサス（※空売り残高は月2回公表のためタイムラグに注意）]\n"
         f"浮動株空売り比率(Short % of Float): {short_pct} | 空売りカバー日数(Days to Cover): {short_ratio}日\n"
         f"機関投資家保有比率: {inst_held} | インサイダー保有比率: {insider_held}\n"
         f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
         f"[米国現地ニュースヘッドライン (yfinance)]\n{yf_news_str}\n"
-        f"[米国株 注文仕様上の厳守事項]\n"
-        f"SBI証券の米国株取引はIFD/OCO/IFDOCO注文および執行条件に非対応。単一注文（指値・成行・逆指値、期間指定は当日中または最長90現地営業日）のみ可能。1株単位で売買可能。\n"
     )
 
 
 def build_technical_summary_text(df_d, is_jp):
+    """
+    日足データから移動平均線の状態（現在値・5日前比の傾き・乖離率）と
+    直近10営業日の時系列テーブルをエラーなく安全にテキスト化する。
+    """
     unit = "円" if is_jp else "ドル"
     close_series = df_d['Close']
     vol_avg20_series = df_d['Volume'].rolling(20).mean()
@@ -335,10 +346,11 @@ with st.sidebar:
         ["日本株のみ", "すべて（日米）", "米国株のみ"],
         index=0,
         horizontal=True,
-        help="日本株の英字社名が米国株と混同されるのを防ぎます。"
+        help="日本株の英字社名（MTGなど）が米国株と混同されるのを防ぎます。"
     )
     raw_input = st.text_input("銘柄コード または 企業名（日米対応・一部でも可）", value="6844").strip()
     
+    # 日本株の証券コード判定パターン（数字4桁 または 数字3桁+英字1文字）
     jp_code_pattern = r'^[0-9]{3}[0-9A-Za-z]$'
     
     stock_code = ""
@@ -388,6 +400,7 @@ with st.sidebar:
                 st.warning("該当する銘柄が見つかりませんでした。市場切替や証券コード直接入力をお試しください。")
                 stock_code = ""
 
+    # 確定している対象銘柄の即時視認表示（日本株・米国株共通）
     if stock_code:
         display_name = selected_label_name or resolve_stock_display_name(stock_code, is_jp)
         market_badge = "日本株" if is_jp else "米国株"
@@ -401,7 +414,7 @@ with st.sidebar:
     use_repair = st.checkbox(
         "株式分割バグ・異常値を自動補正 (repair=True)",
         value=True,
-        help="株式分割直後のスパイクノイズを補正します。"
+        help="株式分割直後のスパイクノイズ（異常なヒゲ）を補正します。取得が重い場合はオフにしてください。"
     )
     if st.button("🔄 キャッシュをクリアして初期化", use_container_width=True):
         st.cache_data.clear()
@@ -410,6 +423,7 @@ with st.sidebar:
         st.session_state.cache_cleared_time = datetime.now(jst).strftime("%H:%M:%S")
         st.rerun()
 
+    # キャッシュクリア完了の視覚表示
     if st.session_state.cache_cleared_time:
         st.toast(f"キャッシュをクリアしました ({st.session_state.cache_cleared_time})", icon="✅")
         st.success(f"✅ キャッシュと生成データをクリアしました（{st.session_state.cache_cleared_time}）")
@@ -424,21 +438,21 @@ with st.sidebar:
         tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
         
         st.markdown(f"""
-        * [Yahoo!ファイナンス]({yahoo_url})
-        * [株探（適時開示）]({kabutan_disclose_url})
-        * [株探（財務）]({kabutan_finance_url})
-        * [TradingView]({tv_url})
-        * [SBI証券](https://www.sbisec.co.jp/)
+        * [Yahoo!ファイナンス（四季報・信用残）]({yahoo_url})
+        * [株探（適時開示・IR速報）]({kabutan_disclose_url})
+        * [株探（財務・業績推移）]({kabutan_finance_url})
+        * [TradingView（詳細チャート）]({tv_url})
+        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
         """)
     elif not is_jp and stock_code:
         tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
         yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
         finviz_url = f"https://finviz.com/quote.ashx?t={stock_code.upper()}"
         st.markdown(f"""
-        * [TradingView]({tv_url})
+        * [TradingView（チャート分析）]({tv_url})
         * [Yahoo! Finance (US)]({yh_url})
-        * [Finviz]({finviz_url})
-        * [SBI証券](https://www.sbisec.co.jp/)
+        * [Finviz（需給・空売り・インサイダー確認）]({finviz_url})
+        * [SBI証券（メインサイト）](https://www.sbisec.co.jp/)
         """)
     
     st.markdown("---")
@@ -455,6 +469,7 @@ if generate_button and stock_code:
     
     with st.spinner('市場データの取得とチャート画像を生成中...'):
         macro_text = get_macro_data()
+        
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, use_repair=use_repair)
         
         if is_jp:
@@ -471,6 +486,7 @@ if generate_button and stock_code:
         df_d = df_d.ffill().bfill()
         df_h = df_h.ffill().bfill()
 
+        # 東証クロージング・オークション等による日足と1時間足の最終終値ズレを同期補正
         if not df_h.empty and not df_d.empty:
             try:
                 if df_h.index[-1].date() == df_d.index[-1].date():
@@ -487,6 +503,7 @@ if generate_button and stock_code:
         df_d = add_indicators(df_d)
         df_h = add_indicators(df_h)
         
+        # is_jpフラグを明示的に渡して日本株の小数点表示バグを防止
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly', is_jp=is_jp)
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily', is_jp=is_jp)
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly', is_jp=is_jp)
@@ -540,18 +557,15 @@ if generate_button and stock_code:
             news_str = get_news(name, True, edinet_reasons)
             edinet_section = f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
             order_calendar_section = get_sbi_order_limit_dates()
-            market_specific_section = (
-                f"{order_calendar_section}"
-                f"[TOPIX指数・需給イベント確認事項]\n"
-                f"対象銘柄（{name} / {stock_code}）のTOPIX定期入替区分（新規採用・移行措置[段階的ウエイト低減]・継続採用・非構成銘柄）をGoogle検索で確認し、"
-                f"四半期リバランス日（1月・4月・7月・10月の各最終営業日）に向けたパッシブ需給の影響を分析に織り込むこと（検索で確定情報がない場合は『区分不明』と明記し推測しないこと）。\n"
-            )
+            market_specific_section = f"{order_calendar_section}"
         else:
             news_str = get_news(name, False)
             edinet_section = ""
             market_specific_section = us_extra_section
 
+        # 1行目に銘柄名とコードを配置してチャットタイトル自動生成の精度を高める
         full_text_data = (
+            f"【分析対象銘柄：{name}（{stock_code} / {ticker}）】\n\n"
             f"【グローバルマクロ参考値】\n{macro_text}\n\n"
             f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分: {'日本株' if is_jp else '米国株'}】 ---\n"
             f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER(実績): {per} | PBR: {pbr} | 配当利回り: {div_yield_pct}%{margin_str}\n"
@@ -602,22 +616,22 @@ if st.session_state.generated_data:
         
     st.markdown("---")
     
-    st.subheader("📱 ① Geminiチャット送信用の命令文")
-    st.markdown("AIに検索を強制するための文章です。コピーしてGeminiのチャット入力欄に貼り付けてください。")
+    st.subheader("📱 ① Geminiチャット送信用の命令文（スキル自動発動＆タイトル反映用）")
+    st.markdown("通常のGeminiチャット入力欄にコピー＆ペーストしてください（登録済みスキル `stock-swing-analyzer` が自動発動します）。")
     
     if data.get("is_jp", True):
-        search_focus = f"・日本株重点検索：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、次回決算日、配当権利月、日次信用残・機関空売り残高、TOPIX定期入替区分（不明時は『区分不明』と記載）"
+        search_focus = f"・重点検索：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、次回決算日、配当権利月、日次信用残・機関空売り残高、TOPIX定期入替区分（不明時は『区分不明』と記載）"
     else:
-        search_focus = f"・米国株重点検索：「{data['name']}（{data['stock_code']}）」の最新四半期決算（英語クエリ `{data['stock_code']} earnings release guidance` 必須）、次回Earnings Date、Form 13F/Form 4、Short Interest推移"
+        search_focus = f"・重点検索：「{data['name']}（{data['stock_code']}）」の最新四半期決算（英語クエリ `{data['stock_code']} earnings release guidance` 必須）、次回Earnings Date、Form 13F/Form 4、Short Interest推移"
 
     chat_prompt = (
         f"【株式スイング分析リクエスト：{data['name']}（{data['stock_code']}）】\n"
-        "@Google 添付したデータとチャート画像をもとに、指示書の【Step 0】〜【7】に従って分析をお願いします。\n"
+        "@Google 添付したデータとチャート画像をもとに、スキルの【Step 0】〜【7】に従って分析をお願いします。\n"
         f"{search_focus}\n"
-        "・※回答の1行目には必ず `# 📊 【銘柄分析】銘柄名（コード）` の見出しを出力し、末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）を厳守して「銘柄名」「証券コード」「IFDOCO」の文言は一切含めずに出力してください。"
+        f"・出力厳守：回答の1行目には必ず `# 📊 【銘柄分析】{data['name']}（{data['stock_code']}）` を出力し、末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）で「銘柄名」「証券コード」「IFDOCO」を一切含めずに出力してください。"
     )
-    
     st.code(chat_prompt, language="text")
+
     st.subheader("📱 ② 個別データ（添付用テキスト）")
     st.markdown("以下のテキストをコピーして、上記の命令文と一緒にGeminiへ貼り付けて送信してください。")
     st.code(data["text"], language="text")
