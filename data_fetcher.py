@@ -153,8 +153,23 @@ def _load_edinet_csv():
     return df_code
 
 
+# 長期高止まりによる麻痺（ゆでガエル化）を防ぐ絶対パニック上限（ハードキャップ）
+MACRO_HARD_CAPS = {
+    "^VIX": 30.0,
+    "^VIX3M": 28.0,
+    "^VVIX": 130.0,
+    "^SKEW": 162.0,
+    "^MOVE": 135.0,
+}
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_macro_data_and_history():
+    """
+    過去1年（約252営業日）のマクロ10指標を取得し、
+    過去252日パーセンタイル分位（80%注意基準・90%警戒基準）＋20日Zスコア＋絶対ハードキャップにより
+    SKEW等のベースライン推移ズレを自動補正したマトリクスと履歴辞書を返す。
+    """
     macro_specs = [
         ("^VIX", "VIX (S&P500恐怖指数)", 2, ""),
         ("^VIX3M", "VIX3M (3ヶ月中期VIX)", 2, ""),
@@ -170,11 +185,20 @@ def get_macro_data_and_history():
 
     def _fetch_one(sym):
         try:
-            df = yf.Ticker(sym).history(period="4mo", interval="1d", auto_adjust=False)
+            target_tz = 'Asia/Tokyo' if sym in ['^N225', 'USDJPY=X'] else 'America/New_York'
+            # 252営業日（1年）分を取得して中期レジーム分位による自動補正を可能にする
+            df = yf.Ticker(sym).history(period="1y", interval="1d", auto_adjust=False)
             if not df.empty:
+                if "Repaired?" in df.columns:
+                    df = df.drop(columns=["Repaired?"])
                 df.index = pd.to_datetime(df.index)
                 if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
+                    try:
+                        df.index = df.index.tz_convert(target_tz).tz_localize(None)
+                    except Exception:
+                        df.index = df.index.tz_localize(None)
+                df.index = df.index.normalize()
+                df = df[~df.index.duplicated(keep='last')].sort_index()
                 df = df.dropna(subset=['Close'])
             return sym, df
         except Exception:
@@ -198,47 +222,69 @@ def get_macro_data_and_history():
             return "N/A"
         return f"{int(round(val))}{unit}" if digits == 0 else f"{val:.{digits}f}{unit}"
 
-    def _judge_regime(sym, curr, z_score, diff_1d):
-        if pd.isna(curr):
-            return "N/A"
-        if sym == "^VIX":
-            if curr >= 25:
-                return "🔴パニック圏(ピークアウト待ち)" if diff_1d > 0 else "🟡高ボラ収縮開始(反発監視)"
-            elif curr >= 20:
-                return "🟠警戒圏(ロット抑制)"
-            return "🟢平穏"
-        if sym == "^VVIX":
-            if curr >= 115:
-                return "🔴VIX急騰警報(115超)"
-            elif curr >= 100:
-                return "🟠変動拡大注意(100超)"
-            return "🟢安定"
-        if sym == "^SKEW":
-            if curr >= 145:
-                return "🔴テールリスク極大(145超)"
-            elif curr >= 135:
-                return "🟠機関プット買い警戒(135超)"
-            return "🟢通常"
-        if sym == "^MOVE":
-            if curr >= 120:
-                return "🔴金利発ショック警戒(120超)"
-            elif curr >= 105:
-                return "🟠債券ボラ高止まり"
-            return "🟢安定"
+    def _judge_dynamic_regime(sym, digits, curr, z_score, diff_1d, c_series):
+        """
+        過去252日（1年）の80%分位(warn_th)と90%分位/ハードキャップ(alert_th)、
+        および20日Zスコアを組み合わせて現在のレジームに合わせた動的判定を行う。
+        """
+        if pd.isna(curr) or c_series.empty:
+            return "N/A", None, None
+
+        win252 = c_series.tail(252)
+        pct252 = int(round((win252 <= curr).mean() * 100))
+        q80 = float(win252.quantile(0.80))
+        q90 = float(win252.quantile(0.90))
+        q20 = float(win252.quantile(0.20))
+
+        # ボラティリティ系指標の動的補正判定
+        if sym in ["^VIX", "^VVIX", "^SKEW", "^MOVE"]:
+            hard_cap = MACRO_HARD_CAPS.get(sym, float("inf"))
+            # 動的注意ライン＝1年80%分位、動的警戒ライン＝1年90%分位と絶対上限の小さい方
+            warn_th = min(q80, hard_cap * 0.92)
+            alert_th = min(max(q90, warn_th + 0.1), hard_cap)
+            th_label = f"基準:{warn_th:.{digits}f}/{alert_th:.{digits}f}"
+
+            z_v = 0.0 if pd.isna(z_score) else z_score
+
+            if curr >= hard_cap:
+                status = f"🔴絶対警戒圏(上限{hard_cap:g}突破)"
+            elif curr >= alert_th and z_v >= 1.0:
+                if sym == "^VIX":
+                    status = f"🔴パニック圏({th_label})" if diff_1d > 0 else f"🟡高ボラ収縮開始({th_label})"
+                elif sym == "^SKEW":
+                    status = f"🔴テールリスク極大({th_label})"
+                elif sym == "^VVIX":
+                    status = f"🔴VIX急騰警報({th_label})"
+                else:
+                    status = f"🔴金利発ショック警戒({th_label})"
+            elif z_v >= 2.0:
+                status = f"🔺急騰スパイク(+2σ超 | {th_label})"
+            elif (curr >= warn_th and z_v >= 0.3) or curr >= alert_th or z_v >= 1.5:
+                status = f"🟠警戒・変動拡大(1年{pct252}%分位 | {th_label})"
+            elif curr >= warn_th and z_v < 0.3:
+                status = f"🟡高止まり安定(Z:{z_v:+.1f}σ | {th_label})"
+            else:
+                status = f"🟢平穏・通常(1年{pct252}%分位 | 80%基準:{warn_th:.{digits}f})"
+
+            return status, warn_th, alert_th
+
+        # クレジット・株式・金利・為替の判定（Zスコア＋252日分位）
         if not pd.isna(z_score):
             if z_score >= 2.0:
-                return "🔺急騰スパイク(+2σ超)"
+                return f"🔺急騰スパイク(+2σ超 | 1年{pct252}%分位)", q80, q90
             elif z_score <= -2.0:
-                return "🔻急落スパイク(-2σ超)"
+                return f"🔻急落スパイク(-2σ超 | 1年{pct252}%分位)", q20, None
             elif z_score >= 1.0:
-                return "↗上昇基調"
+                return f"↗上昇基調(1年{pct252}%分位)", q80, None
             elif z_score <= -1.0:
-                return "↘下落基調"
-        return "➡️中立圏"
+                return f"↘下落基調(1年{pct252}%分位)", q20, None
+        return f"➡️中立圏(1年{pct252}%分位)", q80, None
 
     rows = [
-        "指標名 | 現在値 | 当日レンジ(安〜高) | 前日比(1D) | 5日比(5D) | 5日瞬間高値 | 20日比(20D) | 20日Zスコア | 60日位置 | 状態・警戒判定"
+        "指標名 | 現在値 | 当日レンジ(安〜高) | 前日比(1D) | 5日比(5D) | 5日瞬間高値 | 20日比(20D) | 20日Zスコア | 60日位置 | 状態・警戒判定(252日自動補正)"
     ]
+
+    dynamic_thresholds = {}
 
     for sym, label, digits, unit in macro_specs:
         df = histories.get(sym, pd.DataFrame())
@@ -246,9 +292,23 @@ def get_macro_data_and_history():
             rows.append(f"{label} | 取得失敗 | - | - | - | - | - | - | - | -")
             continue
 
-        c_series = df['Close']
-        h_series = df['High'] if 'High' in df.columns else c_series
-        l_series = df['Low'] if 'Low' in df.columns else c_series
+        c_series = df['Close'].dropna()
+        if c_series.empty:
+            rows.append(f"{label} | 取得失敗 | - | - | - | - | - | - | - | -")
+            continue
+
+        # High / Low に欠損や0がある場合はCloseで安全に補完
+        if 'High' in df.columns:
+            h_series = df['High'].reindex(c_series.index).replace(0, np.nan).fillna(c_series)
+            h_series = np.maximum(h_series, c_series)
+        else:
+            h_series = c_series
+
+        if 'Low' in df.columns:
+            l_series = df['Low'].reindex(c_series.index).replace(0, np.nan).fillna(c_series)
+            l_series = np.minimum(l_series, c_series)
+        else:
+            l_series = c_series
 
         curr = c_series.iloc[-1]
         day_h = h_series.iloc[-1]
@@ -285,7 +345,8 @@ def get_macro_data_and_history():
         else:
             pos_str = "N/A"
 
-        regime_str = _judge_regime(sym, curr, z_val, diff_1d_val)
+        regime_str, warn_th, alert_th = _judge_dynamic_regime(sym, digits, curr, z_val, diff_1d_val, c_series)
+        dynamic_thresholds[sym] = {"warn": warn_th, "alert": alert_th}
 
         rows.append(
             f"{label} | {_fmt_v(curr, digits, unit)} | "
@@ -293,6 +354,9 @@ def get_macro_data_and_history():
             f"{chg_1d_str} | {chg_5d_str} | {_fmt_v(max_5d_h, digits, unit)} | "
             f"{chg_20d_str} | {z_str} | {pos_str} | {regime_str}"
         )
+
+    # chart_maker.py 側で動的基準線を描画できるよう辞書に格納
+    histories["_thresholds"] = dynamic_thresholds
 
     vix_df = histories.get("^VIX", pd.DataFrame())
     vix3m_df = histories.get("^VIX3M", pd.DataFrame())
@@ -313,7 +377,7 @@ def get_macro_data_and_history():
     macro_text = (
         f"・CNN Fear & Greed Index: {fg_str}\n"
         f"{term_line}\n\n"
-        f"[グローバルマクロ＆ボラティリティ時系列マトリクス（瞬間高安値・Zスコア付）]\n"
+        f"[グローバルマクロ＆ボラティリティ時系列マトリクス（瞬間高安値・Zスコア・252日動的基準補正付）]\n"
         + "\n".join(rows)
     )
     return macro_text, histories

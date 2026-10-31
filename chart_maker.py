@@ -323,6 +323,7 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
     """
     ボラティリティ指数（VIX, VIX3M, VVIX, SKEW, MOVE）とマクロ指標（HYG, SOX, 米10年債, 日経平均, ドル円）を
     同一時間軸（X軸完全同期・5段2軸オーバーレイ）で1枚の画像に統合描画する。
+    ※過去252営業日の80%分位（注意線）および90%分位/上限（警戒線）を動的計算して水平補助線に反映する。
     """
     if not macro_df_dict:
         return None
@@ -330,30 +331,60 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
     try:
         font_prop = _get_font_prop()
         if font_prop:
-            plt.rcParams['font.family'] = font_prop.get_name()
+            try:
+                plt.rcParams['font.family'] = font_prop.get_name()
+            except Exception:
+                pass
 
         fig, axes = plt.subplots(5, 1, figsize=(13, 12), sharex=True)
         fig.subplots_adjust(hspace=0.10)
 
+        thresholds_meta = macro_df_dict.get("_thresholds", {})
+        hard_caps_default = {"^VIX": 30.0, "^VVIX": 130.0, "^SKEW": 162.0, "^MOVE": 135.0}
+
         def _prep_series(key):
             df = macro_df_dict.get(key)
-            if df is None or df.empty:
-                return pd.Series(dtype=float), pd.Series(dtype=float)
-            s_close = df['Close'].dropna().tail(tail_days)
-            s_high = df['High'].dropna().tail(tail_days) if 'High' in df.columns else s_close
-            return s_close, s_high
+            if not isinstance(df, pd.DataFrame) or df.empty or 'Close' not in df.columns:
+                return pd.Series(dtype=float), pd.Series(dtype=float), None, None
+
+            c_all = df['Close'].dropna()
+            if c_all.empty:
+                return pd.Series(dtype=float), pd.Series(dtype=float), None, None
+
+            s_close = c_all.tail(tail_days)
+            if 'High' in df.columns:
+                h_raw = df['High'].reindex(s_close.index).replace(0, np.nan).fillna(s_close)
+                s_high = np.maximum(h_raw, s_close)
+            else:
+                s_high = s_close
+
+            # 動的閾値の取得（data_fetcher側で計算済みの値があれば使用、なければ252日分位から算出）
+            th_info = thresholds_meta.get(key, {})
+            warn_th = th_info.get("warn")
+            alert_th = th_info.get("alert")
+
+            if warn_th is None and len(c_all) >= 20:
+                win252 = c_all.tail(252)
+                cap = hard_caps_default.get(key, float("inf"))
+                warn_th = min(float(win252.quantile(0.80)), cap * 0.92)
+                alert_th = min(max(float(win252.quantile(0.90)), warn_th + 0.1), cap)
+
+            return s_close, s_high, warn_th, alert_th
 
         # Panel 1: VIX & VIX3M (左軸) + VIX/VIX3M比 (右軸)
         ax1 = axes[0]
-        vix_c, vix_h = _prep_series('^VIX')
-        vix3m_c, _ = _prep_series('^VIX3M')
+        vix_c, vix_h, vix_warn, vix_alert = _prep_series('^VIX')
+        vix3m_c, _, _, _ = _prep_series('^VIX3M')
         if not vix_c.empty:
-            ax1.plot(vix_c.index, vix_c.values, color='#d62728', lw=1.6, label=f"VIX (終値: {vix_c.iloc[-1]:.2f})")
+            v_th_str = f" | 動的基準:{vix_warn:.1f}/{vix_alert:.1f}" if vix_warn and vix_alert else ""
+            ax1.plot(vix_c.index, vix_c.values, color='#d62728', lw=1.6, label=f"VIX (終値: {vix_c.iloc[-1]:.2f}{v_th_str})")
             ax1.plot(vix_h.index, vix_h.values, color='#d62728', lw=0.8, ls=':', alpha=0.6, label=f"VIX (瞬間高値: {vix_h.max():.2f})")
+            if vix_warn is not None:
+                ax1.axhline(vix_warn, color='orange', ls='--', lw=0.8, alpha=0.7)
+            if vix_alert is not None:
+                ax1.axhline(vix_alert, color='red', ls='--', lw=0.9, alpha=0.7)
         if not vix3m_c.empty:
             ax1.plot(vix3m_c.index, vix3m_c.values, color='#1f77b4', lw=1.2, ls='--', label=f"VIX3M ({vix3m_c.iloc[-1]:.2f})")
-        ax1.axhline(20, color='orange', ls='--', lw=0.8, alpha=0.7)
-        ax1.axhline(25, color='red', ls='--', lw=0.9, alpha=0.7)
         ax1.set_ylabel("VIX / VIX3M", fontsize=9, fontweight='bold')
         ax1.legend(loc='upper left', fontsize=8, framealpha=0.85)
 
@@ -370,39 +401,46 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
                     ax1_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
 
         ax1.set_title(
-            "Global Macro & Volatility Time-Series Matrix (直近60営業日・X軸完全同期 / 点線はザラ場瞬間高値)",
+            "Global Macro & Volatility Time-Series Matrix (直近60営業日・X軸完全同期 / 破線は252日動的補正基準線)",
             fontsize=11, fontweight='bold', pad=8
         )
 
         # Panel 2: VVIX (左軸) & MOVE指数 (右軸)
         ax2 = axes[1]
-        vvix_c, vvix_h = _prep_series('^VVIX')
-        move_c, move_h = _prep_series('^MOVE')
+        vvix_c, vvix_h, vvix_warn, _ = _prep_series('^VVIX')
+        move_c, move_h, move_warn, _ = _prep_series('^MOVE')
         if not vvix_c.empty:
-            ax2.plot(vvix_c.index, vvix_c.values, color='#ff7f0e', lw=1.6, label=f"VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高: {vvix_h.max():.1f})")
+            vv_th_str = f" | 80%基準:{vvix_warn:.1f}" if vvix_warn else ""
+            ax2.plot(vvix_c.index, vvix_c.values, color='#ff7f0e', lw=1.6, label=f"VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高: {vvix_h.max():.1f}{vv_th_str})")
             ax2.plot(vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55)
-            ax2.axhline(110, color='#ff7f0e', ls='--', lw=0.8, alpha=0.6)
+            if vvix_warn is not None:
+                ax2.axhline(vvix_warn, color='#ff7f0e', ls='--', lw=0.8, alpha=0.65)
         ax2.set_ylabel("VVIX", color='#d95f02', fontsize=9, fontweight='bold')
         ax2.tick_params(axis='y', labelcolor='#d95f02', labelsize=8.5)
         ax2.legend(loc='upper left', fontsize=8, framealpha=0.85)
 
         if not move_c.empty:
             ax2_r = ax2.twinx()
-            ax2_r.plot(move_c.index, move_c.values, color='#2ca02c', lw=1.5, label=f"MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f})")
+            mv_th_str = f" | 80%基準:{move_warn:.1f}" if move_warn else ""
+            ax2_r.plot(move_c.index, move_c.values, color='#2ca02c', lw=1.5, label=f"MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f}{mv_th_str})")
             ax2_r.plot(move_h.index, move_h.values, color='#2ca02c', lw=0.7, ls=':', alpha=0.55)
-            ax2_r.axhline(120, color='#2ca02c', ls='--', lw=0.8, alpha=0.6)
+            if move_warn is not None:
+                ax2_r.axhline(move_warn, color='#2ca02c', ls='--', lw=0.8, alpha=0.65)
             ax2_r.set_ylabel("MOVE Index", color='#2ca02c', fontsize=9, fontweight='bold')
             ax2_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
             ax2_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
 
-        # Panel 3: SKEW指数 (左軸) & HYG (右軸)
+        # Panel 3: SKEW指数 (左軸・252日分位で自動補正) & HYG (右軸)
         ax3 = axes[2]
-        skew_c, _ = _prep_series('^SKEW')
-        hyg_c, _ = _prep_series('HYG')
+        skew_c, _, skew_warn, skew_alert = _prep_series('^SKEW')
+        hyg_c, _, _, _ = _prep_series('HYG')
         if not skew_c.empty:
-            ax3.plot(skew_c.index, skew_c.values, color='#8c564b', lw=1.5, label=f"SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f})")
-            ax3.axhline(135, color='#8c564b', ls='--', lw=0.8, alpha=0.6)
-            ax3.axhline(150, color='red', ls=':', lw=0.8, alpha=0.6)
+            sk_th_str = f" | 動的基準:{skew_warn:.1f}/{skew_alert:.1f}" if skew_warn and skew_alert else ""
+            ax3.plot(skew_c.index, skew_c.values, color='#8c564b', lw=1.5, label=f"SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{sk_th_str})")
+            if skew_warn is not None:
+                ax3.axhline(skew_warn, color='#8c564b', ls='--', lw=0.8, alpha=0.65)
+            if skew_alert is not None:
+                ax3.axhline(skew_alert, color='red', ls=':', lw=0.9, alpha=0.7)
         ax3.set_ylabel("CBOE SKEW", color='#8c564b', fontsize=9, fontweight='bold')
         ax3.tick_params(axis='y', labelcolor='#8c564b', labelsize=8.5)
         ax3.legend(loc='upper left', fontsize=8, framealpha=0.85)
@@ -416,8 +454,8 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
 
         # Panel 4: SOX指数 (左軸) & 米10年債利回り (右軸)
         ax4 = axes[3]
-        sox_c, _ = _prep_series('^SOX')
-        tnx_c, tnx_h = _prep_series('^TNX')
+        sox_c, _, _, _ = _prep_series('^SOX')
+        tnx_c, tnx_h, _, _ = _prep_series('^TNX')
         if not sox_c.empty:
             ax4.plot(sox_c.index, sox_c.values, color='#1f77b4', lw=1.6, label=f"SOX 半導体指数 ({sox_c.iloc[-1]:.1f})")
         ax4.set_ylabel("SOX Index", color='#1f77b4', fontsize=9, fontweight='bold')
@@ -433,8 +471,8 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
 
         # Panel 5: 日経平均株価 (左軸) & ドル円 (右軸)
         ax5 = axes[4]
-        n225_c, _ = _prep_series('^N225')
-        usdjpy_c, usdjpy_h = _prep_series('USDJPY=X')
+        n225_c, _, _, _ = _prep_series('^N225')
+        usdjpy_c, usdjpy_h, _, _ = _prep_series('USDJPY=X')
         if not n225_c.empty:
             ax5.plot(n225_c.index, n225_c.values, color='#222222', lw=1.6, label=f"日経平均株価 ({int(round(n225_c.iloc[-1]))}円)")
         ax5.set_ylabel("Nikkei 225", color='#222222', fontsize=9, fontweight='bold')
