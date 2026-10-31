@@ -9,24 +9,23 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from data_fetcher import (
-    get_macro_data, get_edinet_documents, get_news,
+    get_macro_data_and_history, get_edinet_documents, get_news,
     get_japanese_name, get_us_stock_name, get_japanese_fundamentals,
     search_japanese_code_by_name, search_us_ticker_by_name,
     get_sbi_order_limit_dates
 )
-from chart_maker import add_indicators, generate_safe_chart_image
+from chart_maker import (
+    add_indicators, generate_safe_chart_image, generate_macro_chart_image
+)
 
-# --- ページ設定 ---
 st.set_page_config(page_title="AI株式分析データジェネレーター", layout="wide")
 
-# --- セッションステート ---
 if "generated_data" not in st.session_state:
     st.session_state.generated_data = None
 if "cache_cleared_time" not in st.session_state:
     st.session_state.cache_cleared_time = None
 
 
-# --- サイドバー表示用の軽量な銘柄名取得関数（キャッシュ付き） ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def resolve_stock_display_name(code, is_jp_flag):
     if not code:
@@ -42,13 +41,7 @@ def resolve_stock_display_name(code, is_jp_flag):
         return ""
 
 
-# --- yfinance 1.7.0 対応のデータ取得関数（現地タイムゾーン正規化・実勢四本値維持） ---
 def get_fresh_ticker_and_history(ticker_symbol, is_jp=True, use_repair=False):
-    """
-    yfinance 1.x系の内部curl_cffiセッション管理に任せ、
-    TradingView/SBI2と過去高安値を一致させるため auto_adjust=False を明示して取得する。
-    取得直後に現地タイムゾーン（JST / EST）へ変換してからtzを除去し日付ズレを防止する。
-    """
     stock = yf.Ticker(ticker_symbol)
     target_tz = 'Asia/Tokyo' if is_jp else 'America/New_York'
 
@@ -78,7 +71,23 @@ def get_fresh_ticker_and_history(ticker_symbol, is_jp=True, use_repair=False):
     return stock, df_w, df_d, df_h
 
 
-# --- 安全な数値フォーマット＆時系列テキスト生成関数 ---
+def _extract_yf_earnings_date(stock) -> str:
+    try:
+        cal = getattr(stock, 'calendar', None)
+        if isinstance(cal, dict):
+            ed = cal.get('Earnings Date')
+            if isinstance(ed, list) and len(ed) > 0:
+                first_d = ed[0]
+                if hasattr(first_d, 'strftime'):
+                    return f"{first_d.strftime('%Y-%m-%d')}頃(yfinance予定)"
+                return f"{first_d}頃(yfinance予定)"
+            elif hasattr(ed, 'strftime'):
+                return f"{ed.strftime('%Y-%m-%d')}頃(yfinance予定)"
+    except Exception:
+        pass
+    return ""
+
+
 def format_price(val, is_jp):
     if pd.isna(val):
         return "N/A"
@@ -86,10 +95,6 @@ def format_price(val, is_jp):
 
 
 def build_us_extra_fundamentals(stock, info, close_price_num):
-    """
-    米国株向けにyfinanceのstock.info、calendar、newsから予想PER、成長性、空売り需給、
-    機関投資家保有比率、アナリスト目標株価、次回決算日、英語一次ニュースを抽出する。
-    """
     def fmt_pct(key):
         val = info.get(key)
         return f"{round(val * 100, 2)}%" if isinstance(val, (int, float)) and pd.notna(val) else "N/A"
@@ -150,10 +155,6 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
 
 
 def build_technical_summary_text(df_d, is_jp):
-    """
-    日足データから移動平均線の状態（現在値・5日前比の傾き・乖離率）と
-    直近10営業日の時系列テーブルをエラーなく安全にテキスト化する。
-    """
     unit = "円" if is_jp else "ドル"
     close_series = df_d['Close']
     vol_avg20_series = df_d['Volume'].rolling(20).mean()
@@ -220,11 +221,8 @@ def build_technical_summary_text(df_d, is_jp):
 
 
 st.title("📈 AI株式分析データジェネレーター")
-st.markdown("このアプリは、Gemini（Web版）に読み込ませるための**最新データとチャート画像**を瞬時に生成・パッケージ化します。")
+st.markdown("このアプリは、Gemini（Web版）に読み込ませるための**最新データとチャート画像4枚（週足・日足・1時間足・マクロ統合）**を瞬時に生成・パッケージ化します。")
 
-# ==========================================
-# サイドバー（スクロール不要のコンパクト設計）
-# ==========================================
 with st.sidebar:
     st.subheader("🎯 銘柄選択・実行")
     market_filter = st.radio(
@@ -293,15 +291,13 @@ with st.sidebar:
         else:
             st.info(f"🎯 **[{stock_code}]** ({market_badge})")
 
-    # 最重要の実行ボタンを最上部に配置（スクロールゼロで即実行可能）
     generate_button = st.button(
         "🚀 データ収集＆画像生成スタート",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=not bool(stock_code)
     )
 
-    # 外部調査サイトへのリンクを1ブロックに圧縮
     if is_jp and stock_code:
         yahoo_url = f"https://finance.yahoo.co.jp/quote/{stock_code}.T"
         kabutan_disclose_url = f"https://kabutan.jp/stock/news?code={stock_code}&b=k"
@@ -320,14 +316,13 @@ with st.sidebar:
             f"[Finviz]({finviz_url}) ｜ [SBI証券](https://www.sbisec.co.jp/)"
         )
 
-    # 低頻度の設定は折りたたみメニューに収納
     with st.expander("⚙️ 取得補正・キャッシュ設定", expanded=False):
         use_repair = st.checkbox(
             "株式分割バグ・異常値を自動補正 (repair=True)",
             value=False,
             help="株式分割直後のスパイクノイズがある場合のみオンにしてください。通常時はオフの方が高速かつ安定します。"
         )
-        if st.button("🔄 キャッシュをクリアして初期化", use_container_width=True):
+        if st.button("🔄 キャッシュをクリアして初期化", width="stretch"):
             st.cache_data.clear()
             st.session_state.generated_data = None
             jst = timezone(timedelta(hours=9))
@@ -337,16 +332,13 @@ with st.sidebar:
     if st.session_state.cache_cleared_time:
         st.caption(f"✅ キャッシュクリア済 ({st.session_state.cache_cleared_time})")
 
-# ==========================================
-# データ収集＆画像生成処理
-# ==========================================
 if generate_button and stock_code:
     st.session_state.generated_data = None
     st.session_state.cache_cleared_time = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
 
-    with st.spinner('市場データの取得とチャート画像を生成中...'):
-        macro_text = get_macro_data()
+    with st.spinner('市場データ・マクロボラティリティの取得とチャート画像4枚を生成中...'):
+        macro_text, macro_histories = get_macro_data_and_history()
 
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, is_jp=is_jp, use_repair=use_repair)
 
@@ -364,7 +356,6 @@ if generate_button and stock_code:
         df_d = df_d.ffill().bfill()
         df_h = df_h.ffill().bfill()
 
-        # 東証クロージング・オークション等による日足と1時間足の最終終値ズレを同期補正
         if not df_h.empty and not df_d.empty:
             try:
                 if df_h.index[-1].date() == df_d.index[-1].date():
@@ -384,6 +375,7 @@ if generate_button and stock_code:
         img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, 'weekly', is_jp=is_jp)
         img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, 'daily', is_jp=is_jp)
         img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, 'hourly', is_jp=is_jp)
+        img_m = generate_macro_chart_image(macro_histories, "temp_macro.png", tail_days=60)
 
         latest_d = df_d.iloc[-1]
         unit_str = '円' if is_jp else 'ドル'
@@ -401,7 +393,6 @@ if generate_button and stock_code:
         recent_high_60d = format_price(df_d['High'].tail(60).max(), is_jp)
         recent_low_60d = format_price(df_d['Low'].tail(60).min(), is_jp)
 
-        # 52週（直近250営業日）高値・安値と現在値からの乖離率
         high_52w_val = df_d['High'].tail(250).max()
         low_52w_val = df_d['Low'].tail(250).min()
         high_52w_str = format_price(high_52w_val, is_jp)
@@ -412,7 +403,6 @@ if generate_button and stock_code:
         else:
             from_52w_str = ""
 
-        # 日足ATR(14)のフォーマット（値幅と対終値比率）
         atr_val = latest_d.get('ATR')
         if pd.notna(atr_val) and close_price_num > 0:
             atr_fmt = format_price(atr_val, is_jp)
@@ -434,6 +424,8 @@ if generate_button and stock_code:
         except Exception:
             info = {}
 
+        yf_earn_str = _extract_yf_earnings_date(stock)
+
         us_extra_section = ""
         if is_jp:
             fund_data = get_japanese_fundamentals(stock_code)
@@ -441,7 +433,7 @@ if generate_button and stock_code:
             if fund_data.get('per') and fund_data['per'] != 'N/A':
                 per_str = f"{fund_data['per']}倍" if fund_data['per'][0].isdigit() else fund_data['per']
             else:
-                yf_pe = info.get('trailingPE') or info.get('forwardPE')
+                yf_pe = info.get('forwardPE') or info.get('trailingPE')
                 per_str = f"{round(yf_pe, 2)}倍" if isinstance(yf_pe, (int, float)) and pd.notna(yf_pe) else "N/A"
 
             if fund_data.get('pbr') and fund_data['pbr'] != 'N/A':
@@ -464,11 +456,15 @@ if generate_button and stock_code:
                 market_cap_str = f"{fund_data['market_cap']}億円"
             else:
                 yf_mcap = info.get('marketCap')
-                market_cap_str = f"約{round(yf_mcap / 100000000, 1)}億円" if isinstance(yf_mcap, (int, float)) and yf_mcap > 0 else "N/A"
+                market_cap_str = f"{round(yf_mcap / 100000000, 1):,}億円" if isinstance(yf_mcap, (int, float)) and yf_mcap > 0 else "N/A"
 
             margin_ratio = fund_data.get('margin', 'N/A')
             margin_str = f" | 信用倍率: {margin_ratio}倍" if margin_ratio and margin_ratio != 'N/A' else ""
-            earnings_info_str = f" | 決算情報: {fund_data.get('earnings_date', '要検索確認')}"
+
+            ed_raw = fund_data.get('earnings_date', '要検索確認')
+            if ed_raw == '要検索確認' and yf_earn_str:
+                ed_raw = yf_earn_str
+            earnings_info_str = f" | 決算情報: {ed_raw}"
         else:
             yf_pe = info.get('trailingPE')
             per_str = f"{round(yf_pe, 2)}倍" if isinstance(yf_pe, (int, float)) and pd.notna(yf_pe) else "N/A"
@@ -477,9 +473,9 @@ if generate_button and stock_code:
             div_rate = info.get('dividendRate')
             div_str = f"{round((div_rate / close_price_num) * 100, 2)}%" if isinstance(div_rate, (int, float)) and div_rate > 0 and close_price_num > 0 else "N/A"
             yf_mcap = info.get('marketCap')
-            market_cap_str = f"約{round(yf_mcap / 1000000000, 2)} Billion USD" if isinstance(yf_mcap, (int, float)) and yf_mcap > 0 else "N/A"
+            market_cap_str = f"{round(yf_mcap / 1000000000, 2)} Billion USD" if isinstance(yf_mcap, (int, float)) and yf_mcap > 0 else "N/A"
             margin_str = ""
-            earnings_info_str = ""
+            earnings_info_str = f" | 次回決算日: {yf_earn_str}" if yf_earn_str else ""
             us_extra_section = build_us_extra_fundamentals(stock, info, close_price_num)
 
         edinet_str, edinet_reasons = ("", [])
@@ -497,7 +493,7 @@ if generate_button and stock_code:
 
         full_text_data = (
             f"【分析対象銘柄：{name}（{stock_code} / {ticker}）】\n\n"
-            f"【グローバルマクロ参考値】\n{macro_text}\n\n"
+            f"【グローバルマクロ＆ボラティリティ参考値】\n{macro_text}\n\n"
             f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分: {'日本株' if is_jp else '米国株'}】 ---\n"
             f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per_str} | PBR: {pbr_str} | 配当利回り: {div_str}{margin_str}{earnings_info_str}\n"
             f"{market_specific_section}"
@@ -508,33 +504,37 @@ if generate_button and stock_code:
             f"[日足 移動平均線（現在値・乖離率・5日前比の傾き）]\n{sma_summary_text}\n\n"
             f"[直近10営業日の時系列推移（日足ベース）]\n{recent_10d_table_text}\n"
         )
+
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
             zip_file.writestr(f"{stock_code}_market_data.txt", full_text_data.encode('utf-8'))
-            for img_path, img_name in [(img_w, f"{stock_code}_weekly.png"), (img_d, f"{stock_code}_daily.png"), (img_h, f"{stock_code}_hourly.png")]:
+            zip_images = [
+                (img_w, f"{stock_code}_1_weekly.png"),
+                (img_d, f"{stock_code}_2_daily.png"),
+                (img_h, f"{stock_code}_3_hourly.png"),
+                (img_m, f"{stock_code}_4_macro.png")
+            ]
+            for img_path, img_name in zip_images:
                 if img_path and os.path.exists(img_path):
                     zip_file.write(img_path, img_name)
 
         st.session_state.generated_data = {
             "name": name,
             "text": full_text_data,
-            "images": {"w": img_w, "d": img_d, "h": img_h},
+            "images": {"w": img_w, "d": img_d, "h": img_h, "m": img_m},
             "zip_data": zip_buffer.getvalue(),
             "stock_code": stock_code,
             "is_jp": is_jp
         }
-        st.success("✅ データの準備が完了しました！")
+        st.success("✅ データとチャート画像4枚の準備が完了しました！")
 
-# ==========================================
-# 画面描画（データ出力UI）
-# ==========================================
 if st.session_state.generated_data:
     data = st.session_state.generated_data
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.subheader("📦 まとめてダウンロード（PC向け）")
-        st.markdown("ZIPを展開し、中のテキストと画像3枚をGeminiにドラッグ＆ドロップしてください。")
+        st.subheader("📦 まとめてダウンロード（PC向け・画像4枚＋テキスト）")
+        st.markdown("ZIPを展開し、中のテキストと画像4枚（週足・日足・1時間足・マクロ統合）をGeminiにドラッグ＆ドロップしてください。")
     with col2:
         st.download_button(
             label="ZIPファイルをダウンロード",
@@ -542,7 +542,7 @@ if st.session_state.generated_data:
             file_name=f"{data['stock_code']}_analysis_data.zip",
             mime="application/zip",
             type="primary",
-            use_container_width=True
+            width="stretch"
         )
 
     st.markdown("---")
@@ -557,7 +557,7 @@ if st.session_state.generated_data:
 
     chat_prompt = (
         f"【株式スイング分析リクエスト：{data['name']}（{data['stock_code']}）】\n"
-        "@Google 添付したデータとチャート画像をもとに、スキルの【Step 0】〜【7】に従って分析をお願いします。\n"
+        "@Google 添付したデータとチャート画像4枚（週足・日足・1時間足・マクロボラティリティ統合チャート）をもとに、スキルの【Step 0】〜【7】に従って分析をお願いします。\n"
         f"{search_focus}\n"
         f"・出力厳守：回答の1行目には必ず `# 📊 【銘柄分析】{data['name']}（{data['stock_code']}）` を出力し、末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）で「銘柄名」「証券コード」「IFDOCO」を一切含めずに出力してください。"
     )
@@ -568,14 +568,18 @@ if st.session_state.generated_data:
     st.code(data["text"], language="text")
 
     charts = data["images"]
-    st.markdown(f"**📊 {data['name']} のチャート**")
+    st.markdown(f"**📊 {data['name']} の個別チャート（週足・日足・1時間足）**")
     img_col1, img_col2, img_col3 = st.columns(3)
-    if charts['w']:
+    if charts.get('w'):
         with img_col1:
-            st.image(charts['w'], use_container_width=True)
-    if charts['d']:
+            st.image(charts['w'], width="stretch")
+    if charts.get('d'):
         with img_col2:
-            st.image(charts['d'], use_container_width=True)
-    if charts['h']:
+            st.image(charts['d'], width="stretch")
+    if charts.get('h'):
         with img_col3:
-            st.image(charts['h'], use_container_width=True)
+            st.image(charts['h'], width="stretch")
+
+    if charts.get('m'):
+        st.markdown("**🌐 グローバルマクロ＆ボラティリティ統合チャート（直近60営業日・X軸完全同期）**")
+        st.image(charts['m'], width="stretch")

@@ -1,9 +1,11 @@
 import pandas as pd
+import numpy as np
 import ta
 import mplfinance as mpf
 import matplotlib.font_manager as fm
 import os
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.ticker import ScalarFormatter, MaxNLocator
 
 SYS_FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
@@ -11,8 +13,17 @@ if not os.path.exists(SYS_FONT_PATH):
     SYS_FONT_PATH = 'C:/Windows/Fonts/meiryo.ttc'
 
 
+def _get_font_prop():
+    try:
+        if os.path.exists(SYS_FONT_PATH):
+            return fm.FontProperties(fname=SYS_FONT_PATH)
+    except Exception:
+        pass
+    return None
+
+
 def add_indicators(df):
-    if df.empty:
+    if df is None or df.empty:
         return df
     df = df.copy()
     df['SMA25'] = ta.trend.sma_indicator(df['Close'], window=25)
@@ -43,7 +54,6 @@ def add_indicators(df):
 
 
 def _format_chart_price(val, is_jp):
-    """日本株（is_jp=True）は確実に整数丸め、米国株（is_jp=False）は小数第2位でフォーマットする"""
     if is_jp:
         return f"{int(round(val))}"
     return f"{val:.2f}"
@@ -53,7 +63,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if df_full is None or df_full.empty:
         return None
 
-    # 元のDataFrameのインデックスを破壊しないようコピーを作成し、現地時間でタイムゾーンを除去
     df_work = df_full.copy()
     df_work.index = pd.to_datetime(df_work.index)
     if df_work.index.tz is not None:
@@ -121,9 +130,12 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         df_plot['MACD_Zero'] = 0
         aps.append(mpf.make_addplot(df_plot['MACD_Zero'], color='gray', linestyle=':', width=0.8, panel=panels_count, secondary_y=False))
 
+    font_prop = _get_font_prop()
     try:
-        meiryo_prop = fm.FontProperties(fname=SYS_FONT_PATH)
-        my_style = mpf.make_mpf_style(base_mpf_style='yahoo', rc={'font.family': meiryo_prop.get_name()})
+        if font_prop:
+            my_style = mpf.make_mpf_style(base_mpf_style='yahoo', rc={'font.family': font_prop.get_name()})
+        else:
+            my_style = 'yahoo'
     except Exception:
         my_style = 'yahoo'
 
@@ -154,18 +166,10 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             ax.tick_params(axis='y', labelsize=8.5)
 
         for ax in axes:
-            ax.spines['top'].set_visible(True)
-            ax.spines['bottom'].set_visible(True)
-            ax.spines['left'].set_visible(True)
-            ax.spines['right'].set_visible(True)
-            ax.spines['top'].set_linewidth(1.2)
-            ax.spines['bottom'].set_linewidth(1.2)
-            ax.spines['left'].set_linewidth(1.0)
-            ax.spines['right'].set_linewidth(1.0)
-            ax.spines['top'].set_color('black')
-            ax.spines['bottom'].set_color('black')
-            ax.spines['left'].set_color('black')
-            ax.spines['right'].set_color('black')
+            for side in ['top', 'bottom', 'left', 'right']:
+                ax.spines[side].set_visible(True)
+                ax.spines[side].set_color('black')
+                ax.spines[side].set_linewidth(1.2 if side in ['top', 'bottom'] else 1.0)
 
         last_close = df_plot['Close'].iloc[-1]
         price_str = _format_chart_price(last_close, is_jp)
@@ -213,7 +217,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             )
             current_panel_idx += 2
 
-        # 極値ラベルの抽出（近接重複を防ぐため最小距離を全体の11%・最低10本分に拡大）
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
         min_dist = max(int(len(df_plot) * 0.11), 10)
         highs = []
@@ -310,6 +313,153 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         ax_main.set_xticklabels(tick_labels, rotation=45)
 
         fig.savefig(filename, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        return filename
+    except Exception:
+        return None
+
+
+def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_days=60):
+    """
+    ボラティリティ指数（VIX, VIX3M, VVIX, SKEW, MOVE）とマクロ指標（HYG, SOX, 米10年債, 日経平均, ドル円）を
+    同一時間軸（X軸完全同期・5段2軸オーバーレイ）で1枚の画像に統合描画する。
+    """
+    if not macro_df_dict:
+        return None
+
+    try:
+        font_prop = _get_font_prop()
+        if font_prop:
+            plt.rcParams['font.family'] = font_prop.get_name()
+
+        fig, axes = plt.subplots(5, 1, figsize=(13, 12), sharex=True)
+        fig.subplots_adjust(hspace=0.10)
+
+        def _prep_series(key):
+            df = macro_df_dict.get(key)
+            if df is None or df.empty:
+                return pd.Series(dtype=float), pd.Series(dtype=float)
+            s_close = df['Close'].dropna().tail(tail_days)
+            s_high = df['High'].dropna().tail(tail_days) if 'High' in df.columns else s_close
+            return s_close, s_high
+
+        # Panel 1: VIX & VIX3M (左軸) + VIX/VIX3M比 (右軸)
+        ax1 = axes[0]
+        vix_c, vix_h = _prep_series('^VIX')
+        vix3m_c, _ = _prep_series('^VIX3M')
+        if not vix_c.empty:
+            ax1.plot(vix_c.index, vix_c.values, color='#d62728', lw=1.6, label=f"VIX (終値: {vix_c.iloc[-1]:.2f})")
+            ax1.plot(vix_h.index, vix_h.values, color='#d62728', lw=0.8, ls=':', alpha=0.6, label=f"VIX (瞬間高値: {vix_h.max():.2f})")
+        if not vix3m_c.empty:
+            ax1.plot(vix3m_c.index, vix3m_c.values, color='#1f77b4', lw=1.2, ls='--', label=f"VIX3M ({vix3m_c.iloc[-1]:.2f})")
+        ax1.axhline(20, color='orange', ls='--', lw=0.8, alpha=0.7)
+        ax1.axhline(25, color='red', ls='--', lw=0.9, alpha=0.7)
+        ax1.set_ylabel("VIX / VIX3M", fontsize=9, fontweight='bold')
+        ax1.legend(loc='upper left', fontsize=8, framealpha=0.85)
+
+        if not vix_c.empty and not vix3m_c.empty:
+            common_idx = vix_c.index.intersection(vix3m_c.index)
+            if len(common_idx) > 0:
+                ratio_s = (vix_c.loc[common_idx] / vix3m_c.loc[common_idx]).dropna()
+                if not ratio_s.empty:
+                    ax1_r = ax1.twinx()
+                    ax1_r.plot(ratio_s.index, ratio_s.values, color='purple', lw=1.1, alpha=0.75, label=f"VIX/VIX3M比 ({ratio_s.iloc[-1]:.2f})")
+                    ax1_r.axhline(1.0, color='purple', ls=':', lw=1.0, alpha=0.8)
+                    ax1_r.set_ylabel("Term Ratio", color='purple', fontsize=8.5)
+                    ax1_r.tick_params(axis='y', labelcolor='purple', labelsize=8)
+                    ax1_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+        ax1.set_title(
+            "Global Macro & Volatility Time-Series Matrix (直近60営業日・X軸完全同期 / 点線はザラ場瞬間高値)",
+            fontsize=11, fontweight='bold', pad=8
+        )
+
+        # Panel 2: VVIX (左軸) & MOVE指数 (右軸)
+        ax2 = axes[1]
+        vvix_c, vvix_h = _prep_series('^VVIX')
+        move_c, move_h = _prep_series('^MOVE')
+        if not vvix_c.empty:
+            ax2.plot(vvix_c.index, vvix_c.values, color='#ff7f0e', lw=1.6, label=f"VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高: {vvix_h.max():.1f})")
+            ax2.plot(vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55)
+            ax2.axhline(110, color='#ff7f0e', ls='--', lw=0.8, alpha=0.6)
+        ax2.set_ylabel("VVIX", color='#d95f02', fontsize=9, fontweight='bold')
+        ax2.tick_params(axis='y', labelcolor='#d95f02', labelsize=8.5)
+        ax2.legend(loc='upper left', fontsize=8, framealpha=0.85)
+
+        if not move_c.empty:
+            ax2_r = ax2.twinx()
+            ax2_r.plot(move_c.index, move_c.values, color='#2ca02c', lw=1.5, label=f"MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f})")
+            ax2_r.plot(move_h.index, move_h.values, color='#2ca02c', lw=0.7, ls=':', alpha=0.55)
+            ax2_r.axhline(120, color='#2ca02c', ls='--', lw=0.8, alpha=0.6)
+            ax2_r.set_ylabel("MOVE Index", color='#2ca02c', fontsize=9, fontweight='bold')
+            ax2_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
+            ax2_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+        # Panel 3: SKEW指数 (左軸) & HYG (右軸)
+        ax3 = axes[2]
+        skew_c, _ = _prep_series('^SKEW')
+        hyg_c, _ = _prep_series('HYG')
+        if not skew_c.empty:
+            ax3.plot(skew_c.index, skew_c.values, color='#8c564b', lw=1.5, label=f"SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f})")
+            ax3.axhline(135, color='#8c564b', ls='--', lw=0.8, alpha=0.6)
+            ax3.axhline(150, color='red', ls=':', lw=0.8, alpha=0.6)
+        ax3.set_ylabel("CBOE SKEW", color='#8c564b', fontsize=9, fontweight='bold')
+        ax3.tick_params(axis='y', labelcolor='#8c564b', labelsize=8.5)
+        ax3.legend(loc='upper left', fontsize=8, framealpha=0.85)
+
+        if not hyg_c.empty:
+            ax3_r = ax3.twinx()
+            ax3_r.plot(hyg_c.index, hyg_c.values, color='#17becf', lw=1.5, label=f"HYG ハイイールド債ETF ({hyg_c.iloc[-1]:.2f})")
+            ax3_r.set_ylabel("HYG (Credit)", color='#0f7f8a', fontsize=9, fontweight='bold')
+            ax3_r.tick_params(axis='y', labelcolor='#0f7f8a', labelsize=8.5)
+            ax3_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+        # Panel 4: SOX指数 (左軸) & 米10年債利回り (右軸)
+        ax4 = axes[3]
+        sox_c, _ = _prep_series('^SOX')
+        tnx_c, tnx_h = _prep_series('^TNX')
+        if not sox_c.empty:
+            ax4.plot(sox_c.index, sox_c.values, color='#1f77b4', lw=1.6, label=f"SOX 半導体指数 ({sox_c.iloc[-1]:.1f})")
+        ax4.set_ylabel("SOX Index", color='#1f77b4', fontsize=9, fontweight='bold')
+        ax4.tick_params(axis='y', labelcolor='#1f77b4', labelsize=8.5)
+        ax4.legend(loc='upper left', fontsize=8, framealpha=0.85)
+
+        if not tnx_c.empty:
+            ax4_r = ax4.twinx()
+            ax4_r.plot(tnx_c.index, tnx_c.values, color='#e377c2', lw=1.5, label=f"米10年債利回り ({tnx_c.iloc[-1]:.2f}% / 最高: {tnx_h.max():.2f}%)")
+            ax4_r.set_ylabel("US 10Y (%)", color='#c51b8a', fontsize=9, fontweight='bold')
+            ax4_r.tick_params(axis='y', labelcolor='#c51b8a', labelsize=8.5)
+            ax4_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+        # Panel 5: 日経平均株価 (左軸) & ドル円 (右軸)
+        ax5 = axes[4]
+        n225_c, _ = _prep_series('^N225')
+        usdjpy_c, usdjpy_h = _prep_series('USDJPY=X')
+        if not n225_c.empty:
+            ax5.plot(n225_c.index, n225_c.values, color='#222222', lw=1.6, label=f"日経平均株価 ({int(round(n225_c.iloc[-1]))}円)")
+        ax5.set_ylabel("Nikkei 225", color='#222222', fontsize=9, fontweight='bold')
+        ax5.tick_params(axis='y', labelcolor='#222222', labelsize=8.5)
+        ax5.legend(loc='upper left', fontsize=8, framealpha=0.85)
+
+        if not usdjpy_c.empty:
+            ax5_r = ax5.twinx()
+            ax5_r.plot(usdjpy_c.index, usdjpy_c.values, color='#2ca02c', lw=1.5, label=f"ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / 最高: {usdjpy_h.max():.2f}円)")
+            ax5_r.set_ylabel("USD/JPY", color='#2ca02c', fontsize=9, fontweight='bold')
+            ax5_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
+            ax5_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+        for ax in axes:
+            ax.grid(True, which='major', axis='both', linestyle='--', linewidth=0.6, color='gray', alpha=0.45)
+            for side in ['top', 'bottom', 'left', 'right']:
+                ax.spines[side].set_visible(True)
+                ax.spines[side].set_color('black')
+                ax.spines[side].set_linewidth(0.9)
+
+        axes[-1].xaxis.set_major_locator(mdates.DayLocator(interval=5))
+        axes[-1].xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+        plt.setp(axes[-1].xaxis.get_majorticklabels(), rotation=30, fontsize=8.5)
+
+        fig.savefig(filename, dpi=180, bbox_inches='tight')
         plt.close(fig)
         return filename
     except Exception:
