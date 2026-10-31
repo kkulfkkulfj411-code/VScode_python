@@ -154,7 +154,6 @@ def _load_edinet_csv():
     return df_code
 
 
-# 長期高止まりによる麻痺（ゆでガエル化）を防ぐ絶対パニック上限（ハードキャップ）
 MACRO_HARD_CAPS = {
     "^VIX": 30.0,
     "^VIX3M": 28.0,
@@ -166,11 +165,6 @@ MACRO_HARD_CAPS = {
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_macro_data_and_history():
-    """
-    過去1年（約252営業日）のマクロ10指標を取得し、
-    過去252日パーセンタイル分位（80%注意基準・90%警戒基準）＋20日Zスコア＋絶対ハードキャップにより
-    SKEW等のベースライン推移ズレを自動補正したマトリクスと履歴辞書を返す。
-    """
     macro_specs = [
         ("^VIX", "VIX (S&P500恐怖指数)", 2, ""),
         ("^VIX3M", "VIX3M (3ヶ月中期VIX)", 2, ""),
@@ -382,12 +376,15 @@ def get_macro_data():
 
 @st.cache_data(ttl=3600)
 def get_edinet_documents(stock_code_4digit, days=60):
-    edinet_key = st.secrets.get("EDINET_API_KEY", "")
+    raw_key = st.secrets.get("EDINET_API_KEY", "")
+    edinet_key = str(raw_key).strip().strip('"').strip("'")
     if not edinet_key:
         return "EDINET APIキー未設定", []
+
+    code_str = str(stock_code_4digit).strip().upper()
+    edinet_code = ""
     try:
         df_code = _load_edinet_csv()
-        code_str = str(stock_code_4digit).strip().upper()
         if code_str.isdigit():
             target_sec_code = float(code_str) * 10
             match_row = df_code[df_code['証券コード_数値'] == target_sec_code]
@@ -395,64 +392,90 @@ def get_edinet_documents(stock_code_4digit, days=60):
             sec_str_series = df_code['証券コード'].astype(str).str.strip().str.upper()
             match_row = df_code[sec_str_series.str.startswith(code_str)]
 
-        if match_row.empty:
+        if not match_row.empty:
+            edinet_code = str(match_row['ＥＤＩＮＥＴコード'].values[0]).strip()
+        else:
             return "EDINETコードリストに該当銘柄がありません", []
-        edinet_code = match_row['ＥＤＩＮＥＴコード'].values[0]
     except Exception:
         return "EDINETコード変換用CSVの読み込みエラー", []
 
-    date_list = [(datetime.date.today() - datetime.timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days)]
+    jst = timezone(timedelta(hours=9))
+    today_jst = datetime.datetime.now(jst).date()
+    jp_holidays = get_dynamic_jp_holidays(today_jst.year) | get_dynamic_jp_holidays(today_jst.year - 1)
+
+    # 財務局稼働日（平日・祝日除外）のみを対象にしてAPIバースト制限（429）を回避
+    date_list = []
+    for i in range(days):
+        d = today_jst - datetime.timedelta(days=i)
+        if d.weekday() < 5 and d not in jp_holidays:
+            date_list.append(d.strftime('%Y-%m-%d'))
+
     all_found, all_reasons, error_statuses = [], [], []
 
-    def fetch_edinet_for_date(target_date, edinet_code, api_key):
+    def fetch_edinet_for_date(target_date, ed_code, sec_prefix, api_key):
         url = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
         params = {"date": target_date, "type": 2, "Subscription-Key": api_key}
+        headers = {"Ocp-Apim-Subscription-Key": api_key}
         found_docs, reasons = [], []
         err_msg = None
 
-        for attempt in range(2):
+        for attempt in range(3):
             try:
-                res = requests.get(url, params=params, timeout=10)
-                if res.status_code == 200:
+                res = requests.get(url, params=params, headers=headers, timeout=12)
+                data = None
+                try:
                     data = res.json()
-                    meta_status = str(data.get("metadata", {}).get("status", "200"))
-                    if meta_status != "200":
-                        err_msg = f"meta:{meta_status}"
-                        if attempt == 0:
-                            time.sleep(0.3)
-                            continue
-                    else:
+                except Exception:
+                    data = None
+
+                if isinstance(data, dict):
+                    meta = data.get("metadata")
+                    meta_status = str(meta.get("status", "")).strip() if isinstance(meta, dict) else ""
+                    top_code = data.get("StatusCode") or data.get("statusCode")
+
+                    if res.status_code == 200 and meta_status == "200" and "results" in data and isinstance(data["results"], list):
                         err_msg = None
-                        if "results" in data and isinstance(data["results"], list):
-                            for doc in data["results"]:
-                                if doc.get("edinetCode") == edinet_code:
-                                    title = doc.get("title", "タイトル不明")
-                                    desc = doc.get("docDescription")
-                                    reason = doc.get("currentReportReason")
-                                    content_details = []
-                                    if desc:
-                                        content_details.append(f"概要: {desc}")
-                                    if reason:
-                                        content_details.append(f"事由: {reason}")
-                                        if "臨時報告書" in title or "修正" in title or "配当" in title:
-                                            reasons.append(reason)
-                                    content_str = " | ".join(content_details) if content_details else "詳細記載なし"
-                                    found_docs.append(f"[{target_date}] {title} ({content_str})")
+                        for doc in data["results"]:
+                            if not isinstance(doc, dict):
+                                continue
+                            doc_ed = str(doc.get("edinetCode") or "").strip()
+                            doc_sec = str(doc.get("secCode") or "").strip().upper()
+                            if (ed_code and doc_ed == ed_code) or (sec_prefix and doc_sec.startswith(sec_prefix)):
+                                title = doc.get("title") or "タイトル不明"
+                                desc = doc.get("docDescription")
+                                reason = doc.get("currentReportReason")
+                                content_details = []
+                                if desc:
+                                    content_details.append(f"概要: {desc}")
+                                if reason:
+                                    content_details.append(f"事由: {reason}")
+                                    if "臨時報告書" in title or "修正" in title or "配当" in title:
+                                        reasons.append(reason)
+                                content_str = " | ".join(content_details) if content_details else "詳細記載なし"
+                                found_docs.append(f"[{target_date}] {title} ({content_str})")
                         break
+                    else:
+                        code_label = top_code or meta_status or res.status_code
+                        msg_label = data.get("message") or (meta.get("message") if isinstance(meta, dict) else "") or "InvalidResponse"
+                        err_msg = f"Status:{code_label}({str(msg_label)[:35]})"
+                        if str(code_label) in ["401", "403"]:
+                            break
+                        if attempt < 2:
+                            time.sleep(0.5 * (attempt + 1))
                 else:
                     err_msg = f"HTTP:{res.status_code}"
                     if res.status_code in [401, 403]:
                         break
-                    if attempt == 0:
-                        time.sleep(0.3)
+                    if attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
             except Exception:
                 err_msg = "Timeout/ConnError"
-                if attempt == 0:
-                    time.sleep(0.3)
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
         return found_docs, reasons, err_msg
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(fetch_edinet_for_date, d, edinet_code, edinet_key): d for d in date_list}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(fetch_edinet_for_date, d, edinet_code, code_str, edinet_key): d for d in date_list}
         for future in as_completed(futures):
             docs, reasons, err = future.result()
             if docs:
@@ -467,11 +490,14 @@ def get_edinet_documents(stock_code_4digit, days=60):
         res_str = "\n".join(all_found)
         if error_statuses:
             unique_errs = ", ".join(sorted(set(error_statuses)))
-            res_str += f"\n（※一部日程でEDINET API応答エラー {len(error_statuses)}件発生: {unique_errs}）"
+            res_str += f"\n（※一部日程でEDINET API応答エラー {len(error_statuses)}件: {unique_errs}）"
     else:
         if error_statuses:
             unique_errs = ", ".join(sorted(set(error_statuses)))
-            res_str = f"直近{days}日間のEDINET開示書類は検出されませんでした（※API応答エラー {len(error_statuses)}/{days}日分発生: {unique_errs} — APIキーまたは通信状態を確認してください）。"
+            res_str = (
+                f"直近{days}日間のEDINET開示書類は検出されませんでした"
+                f"（※APIエラー {len(error_statuses)}/{len(date_list)}営業日発生: {unique_errs}）。"
+            )
         else:
             res_str = f"直近{days}日間のEDINET公式開示書類はありません。"
     return res_str, list(set(all_reasons))
@@ -661,7 +687,7 @@ def get_japanese_fundamentals(stock_code):
     except Exception:
         pass
 
-    # 2. Yahoo!ファイナンス日本版からのフォールバック補完
+    # 2. Yahoo!ファイナンス日本版からのフォールバック補完（Streamlit Cloud環境でのメイン補完経路）
     if result['margin'] == 'N/A' or result['per'] == 'N/A' or result['earnings_date'] == '要検索確認':
         try:
             yh_html = _http_get_html(f"https://finance.yahoo.co.jp/quote/{stock_code}.T", timeout=8)
@@ -696,9 +722,42 @@ def get_japanese_fundamentals(stock_code):
                         result['market_cap'] = f"{round(val_million / 100, 1):,}"
 
                 if result['earnings_date'] == '要検索確認':
-                    m_fy = re.search(r'決算[^\d]*([0-9]{1,2})月', full_txt)
-                    if m_fy:
-                        result['earnings_date'] = f"本決算 {int(m_fy.group(1))}月期 (次回発表日は要検索確認)"
+                    # パターンA: 「まとめ 2026/10/7発表分 ローツェの2027年2月期中間期は...」形式
+                    m_yh_sum = re.search(
+                        r'([0-9]{4}/[0-9]{1,2}/[0-9]{1,2})\s*発表分.{0,40}?([0-9]{4}年[0-9]{1,2}月期\s*(?:第[1-4１-４]四半期|中間期|通期)?)',
+                        full_txt
+                    )
+                    if m_yh_sum:
+                        result['earnings_date'] = f"{m_yh_sum.group(2).strip()} (直近発表:{m_yh_sum.group(1)})"
+                    else:
+                        # パターンB: 「1株配当（会社予想） 28.00円 2027/02」または「EPS（会社予想） ... 2027/02」形式
+                        m_yh_fy = re.search(r'(?:1株配当|EPS)（会社予想）.{0,30}?(20[0-9]{2})/([0-9]{1,2})', full_txt)
+                        if m_yh_fy:
+                            result['earnings_date'] = f"本決算 {int(m_yh_fy.group(2))}月期 ({m_yh_fy.group(1)}/{m_yh_fy.group(2)}期)"
+                        else:
+                            m_yh_any = re.search(r'(20[0-9]{2}年[0-9]{1,2}月期\s*(?:第[1-4１-４]四半期|中間期|通期)?)', full_txt)
+                            if m_yh_any:
+                                result['earnings_date'] = f"{m_yh_any.group(1).strip()} (次回発表日は要検索確認)"
+        except Exception:
+            pass
+
+    # 3. ローカルの EdinetcodeDlInfo.csv（「決算日」カラム）からの確実な最終補完
+    if result['earnings_date'] == '要検索確認':
+        try:
+            df_code = _load_edinet_csv()
+            code_str = str(stock_code).strip().upper()
+            if code_str.isdigit():
+                match_row = df_code[df_code['証券コード_数値'] == float(code_str) * 10]
+            else:
+                sec_s = df_code['証券コード'].astype(str).str.strip().str.upper()
+                match_row = df_code[sec_s.str.startswith(code_str)]
+            if not match_row.empty and '決算日' in match_row.columns:
+                kessan_bi = str(match_row['決算日'].values[0]).strip()
+                m_kb = re.search(r'([0-9]{1,2})月', kessan_bi)
+                if m_kb:
+                    result['earnings_date'] = f"本決算 {int(m_kb.group(1))}月期 (EDINET基準:{kessan_bi})"
+                elif kessan_bi and kessan_bi.lower() != 'nan':
+                    result['earnings_date'] = f"決算日:{kessan_bi} (次回発表日は要検索確認)"
         except Exception:
             pass
 

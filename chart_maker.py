@@ -218,7 +218,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             )
             current_panel_idx += 2
 
-        # スイング高値・安値の抽出（右端付近のピボットおよび期間最高・最安値の欠落を防止）
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
         right_confirm = 2
         min_dist = max(int(len(df_plot) * 0.10), 6)
@@ -295,7 +294,6 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                 is_first_of_year = dt.year not in seen_years
 
                 if is_last or is_first_of_year:
-                    tick_labels.add_label = dt.strftime('%y/%m')
                     tick_labels.append(dt.strftime('%y/%m'))
                     seen_years.add(dt.year)
                 else:
@@ -358,7 +356,6 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
         thresholds_meta = macro_df_dict.get("_thresholds", {})
         hard_caps_default = {"^VIX": 30.0, "^VVIX": 130.0, "^SKEW": 162.0, "^MOVE": 135.0}
 
-        # 全指標共通の開始日（common_start_date）と最新日（common_end_date）を算出してX軸のズレを防止
         common_start_date = None
         common_end_date = None
         for ref_key in ["^VIX", "HYG", "^SOX", "^N225"]:
@@ -447,7 +444,7 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
             fontsize=11, fontweight='bold', pad=8
         )
 
-        # Panel 2: VVIX (左軸) & MOVE指数 (右軸) ※80%注意線・90%警戒線を双方描画
+        # Panel 2: VVIX (左軸) & MOVE指数 (右軸)
         ax2 = axes[1]
         vvix_c, vvix_h, vvix_warn, vvix_alert = _prep_series('^VVIX')
         move_c, move_h, move_warn, move_alert = _prep_series('^MOVE')
@@ -476,7 +473,7 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
             ax2_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
             ax2_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
 
-        # Panel 3: SKEW指数 (左軸・252日分位で自動補正) & HYG (右軸)
+        # Panel 3: SKEW指数 (左軸) & HYG (右軸)
         ax3 = axes[2]
         skew_c, _, skew_warn, skew_alert = _prep_series('^SKEW')
         hyg_c, _, _, _ = _prep_series('HYG')
