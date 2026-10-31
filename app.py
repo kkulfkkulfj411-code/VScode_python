@@ -41,12 +41,6 @@ def resolve_stock_display_name(code, is_jp_flag):
         return ""
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_cached_macro_data_and_history():
-    """マクロ10指標（252営業日分）を10分間キャッシュし、連続実行時のレスポンスを高速化"""
-    return get_macro_data_and_history()
-
-
 def get_fresh_ticker_and_history(ticker_symbol, is_jp=True, use_repair=False):
     stock = yf.Ticker(ticker_symbol)
     target_tz = 'Asia/Tokyo' if is_jp else 'America/New_York'
@@ -343,8 +337,8 @@ if generate_button and stock_code:
     st.session_state.cache_cleared_time = None
     ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
 
-    with st.spinner('市場データ・マクロボラティリティ(252日自動補正)の取得とチャート画像4枚を生成中...'):
-        macro_text, macro_histories = get_cached_macro_data_and_history()
+    with st.spinner('市場データ・マクロボラティリティの取得とチャート画像4枚を生成中...'):
+        macro_text, macro_histories = get_macro_data_and_history()
 
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, is_jp=is_jp, use_repair=use_repair)
 
