@@ -5,6 +5,7 @@ import numpy as np
 import datetime
 from datetime import date, timedelta, timezone, time as dt_time
 import calendar
+import time
 import fear_greed
 import feedparser
 import urllib.parse
@@ -186,7 +187,6 @@ def get_macro_data_and_history():
     def _fetch_one(sym):
         try:
             target_tz = 'Asia/Tokyo' if sym in ['^N225', 'USDJPY=X'] else 'America/New_York'
-            # 252営業日（1年）分を取得して中期レジーム分位による自動補正を可能にする
             df = yf.Ticker(sym).history(period="1y", interval="1d", auto_adjust=False)
             if not df.empty:
                 if "Repaired?" in df.columns:
@@ -223,10 +223,6 @@ def get_macro_data_and_history():
         return f"{int(round(val))}{unit}" if digits == 0 else f"{val:.{digits}f}{unit}"
 
     def _judge_dynamic_regime(sym, digits, curr, z_score, diff_1d, c_series):
-        """
-        過去252日（1年）の80%分位(warn_th)と90%分位/ハードキャップ(alert_th)、
-        および20日Zスコアを組み合わせて現在のレジームに合わせた動的判定を行う。
-        """
         if pd.isna(curr) or c_series.empty:
             return "N/A", None, None
 
@@ -236,10 +232,8 @@ def get_macro_data_and_history():
         q90 = float(win252.quantile(0.90))
         q20 = float(win252.quantile(0.20))
 
-        # ボラティリティ系指標の動的補正判定
         if sym in ["^VIX", "^VVIX", "^SKEW", "^MOVE"]:
             hard_cap = MACRO_HARD_CAPS.get(sym, float("inf"))
-            # 動的注意ライン＝1年80%分位、動的警戒ライン＝1年90%分位と絶対上限の小さい方
             warn_th = min(q80, hard_cap * 0.92)
             alert_th = min(max(q90, warn_th + 0.1), hard_cap)
             th_label = f"基準:{warn_th:.{digits}f}/{alert_th:.{digits}f}"
@@ -268,7 +262,6 @@ def get_macro_data_and_history():
 
             return status, warn_th, alert_th
 
-        # クレジット・株式・金利・為替の判定（Zスコア＋252日分位）
         if not pd.isna(z_score):
             if z_score >= 2.0:
                 return f"🔺急騰スパイク(+2σ超 | 1年{pct252}%分位)", q80, q90
@@ -297,7 +290,6 @@ def get_macro_data_and_history():
             rows.append(f"{label} | 取得失敗 | - | - | - | - | - | - | - | -")
             continue
 
-        # High / Low に欠損や0がある場合はCloseで安全に補完
         if 'High' in df.columns:
             h_series = df['High'].reindex(c_series.index).replace(0, np.nan).fillna(c_series)
             h_series = np.maximum(h_series, c_series)
@@ -355,7 +347,6 @@ def get_macro_data_and_history():
             f"{chg_20d_str} | {z_str} | {pos_str} | {regime_str}"
         )
 
-    # chart_maker.py 側で動的基準線を描画できるよう辞書に格納
     histories["_thresholds"] = dynamic_thresholds
 
     vix_df = histories.get("^VIX", pd.DataFrame())
@@ -411,46 +402,78 @@ def get_edinet_documents(stock_code_4digit, days=60):
         return "EDINETコード変換用CSVの読み込みエラー", []
 
     date_list = [(datetime.date.today() - datetime.timedelta(days=i)).strftime('%Y-%m-%d') for i in range(days)]
-    all_found, all_reasons = [], []
+    all_found, all_reasons, error_statuses = [], [], []
 
     def fetch_edinet_for_date(target_date, edinet_code, api_key):
         url = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
         params = {"date": target_date, "type": 2, "Subscription-Key": api_key}
         found_docs, reasons = [], []
-        try:
-            res = requests.get(url, params=params, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                if "results" in data and isinstance(data["results"], list):
-                    for doc in data["results"]:
-                        if doc.get("edinetCode") == edinet_code:
-                            title = doc.get("title", "タイトル不明")
-                            desc = doc.get("docDescription")
-                            reason = doc.get("currentReportReason")
-                            content_details = []
-                            if desc:
-                                content_details.append(f"概要: {desc}")
-                            if reason:
-                                content_details.append(f"事由: {reason}")
-                                if "臨時報告書" in title or "修正" in title or "配当" in title:
-                                    reasons.append(reason)
-                            content_str = " | ".join(content_details) if content_details else "詳細記載なし"
-                            found_docs.append(f"[{target_date}] {title} ({content_str})")
-        except Exception:
-            pass
-        return found_docs, reasons
+        err_msg = None
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+        for attempt in range(2):
+            try:
+                res = requests.get(url, params=params, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    meta_status = str(data.get("metadata", {}).get("status", "200"))
+                    if meta_status != "200":
+                        err_msg = f"meta:{meta_status}"
+                        if attempt == 0:
+                            time.sleep(0.3)
+                            continue
+                    else:
+                        err_msg = None
+                        if "results" in data and isinstance(data["results"], list):
+                            for doc in data["results"]:
+                                if doc.get("edinetCode") == edinet_code:
+                                    title = doc.get("title", "タイトル不明")
+                                    desc = doc.get("docDescription")
+                                    reason = doc.get("currentReportReason")
+                                    content_details = []
+                                    if desc:
+                                        content_details.append(f"概要: {desc}")
+                                    if reason:
+                                        content_details.append(f"事由: {reason}")
+                                        if "臨時報告書" in title or "修正" in title or "配当" in title:
+                                            reasons.append(reason)
+                                    content_str = " | ".join(content_details) if content_details else "詳細記載なし"
+                                    found_docs.append(f"[{target_date}] {title} ({content_str})")
+                        break
+                else:
+                    err_msg = f"HTTP:{res.status_code}"
+                    if res.status_code in [401, 403]:
+                        break
+                    if attempt == 0:
+                        time.sleep(0.3)
+            except Exception:
+                err_msg = "Timeout/ConnError"
+                if attempt == 0:
+                    time.sleep(0.3)
+        return found_docs, reasons, err_msg
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(fetch_edinet_for_date, d, edinet_code, edinet_key): d for d in date_list}
         for future in as_completed(futures):
-            docs, reasons = future.result()
+            docs, reasons, err = future.result()
             if docs:
                 all_found.extend(docs)
             if reasons:
                 all_reasons.extend(reasons)
+            if err:
+                error_statuses.append(err)
 
     all_found.sort(reverse=True)
-    res_str = "\n".join(all_found) if all_found else f"直近{days}日間のEDINET公式開示書類はありません。"
+    if all_found:
+        res_str = "\n".join(all_found)
+        if error_statuses:
+            unique_errs = ", ".join(sorted(set(error_statuses)))
+            res_str += f"\n（※一部日程でEDINET API応答エラー {len(error_statuses)}件発生: {unique_errs}）"
+    else:
+        if error_statuses:
+            unique_errs = ", ".join(sorted(set(error_statuses)))
+            res_str = f"直近{days}日間のEDINET開示書類は検出されませんでした（※API応答エラー {len(error_statuses)}/{days}日分発生: {unique_errs} — APIキーまたは通信状態を確認してください）。"
+        else:
+            res_str = f"直近{days}日間のEDINET公式開示書類はありません。"
     return res_str, list(set(all_reasons))
 
 
@@ -593,6 +616,7 @@ def get_japanese_fundamentals(stock_code):
         html_text = _http_get_html(f"https://kabutan.jp/stock/?code={stock_code}", timeout=8)
         if html_text:
             soup = BeautifulSoup(html_text, "html.parser")
+            page_txt = soup.get_text(" ", strip=True)
             info_div = soup.find("div", id="stockinfo_i3")
             if info_div:
                 tds = [td.get_text(strip=True) for td in info_div.find_all("td")]
@@ -622,19 +646,23 @@ def get_japanese_fundamentals(stock_code):
 
             earn_m = re.search(
                 r'決算発表予定日[^0-9]*?([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}/[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}月[0-9]{1,2}日)',
-                html_text, re.DOTALL
+                page_txt
             )
             if earn_m:
                 result['earnings_date'] = f"{earn_m.group(1)}頃(予定)"
             else:
-                fy_m = re.search(r'[連単]\s*([0-9]{2})\.([0-9]{2})\s*(?:予|実)', html_text)
+                fy_m = re.search(r'(?:[連単]\s*)?([0-9]{2,4})\.([0-9]{2})\s*(?:予|実|連|単)', page_txt)
+                if not fy_m:
+                    fy_m = re.search(r'([0-9]{2})\.([0-9]{2})\s*[0-9,－―]+', page_txt)
                 if fy_m:
-                    result['earnings_date'] = f"本決算 {int(fy_m.group(2))}月期 (発表日は要検索確認)"
+                    month_num = int(fy_m.group(2))
+                    if 1 <= month_num <= 12:
+                        result['earnings_date'] = f"本決算 {month_num}月期 (次回発表日は要検索確認)"
     except Exception:
         pass
 
     # 2. Yahoo!ファイナンス日本版からのフォールバック補完
-    if result['margin'] == 'N/A' or result['per'] == 'N/A':
+    if result['margin'] == 'N/A' or result['per'] == 'N/A' or result['earnings_date'] == '要検索確認':
         try:
             yh_html = _http_get_html(f"https://finance.yahoo.co.jp/quote/{stock_code}.T", timeout=8)
             if yh_html:
@@ -666,6 +694,11 @@ def get_japanese_fundamentals(stock_code):
                     if m_mc:
                         val_million = float(m_mc.group(1).replace(',', ''))
                         result['market_cap'] = f"{round(val_million / 100, 1):,}"
+
+                if result['earnings_date'] == '要検索確認':
+                    m_fy = re.search(r'決算[^\d]*([0-9]{1,2})月', full_txt)
+                    if m_fy:
+                        result['earnings_date'] = f"本決算 {int(m_fy.group(1))}月期 (次回発表日は要検索確認)"
         except Exception:
             pass
 
@@ -750,6 +783,7 @@ def search_us_ticker_by_name(query):
         return []
 
 
+# --- 以下、GASスプレッドシート連携用レガシー互換関数（app.py側ではUI非表示） ---
 def save_analysis_to_sheet(date_str, stock_code, name, judgement, target_price, time_limit, report_text):
     webapp_url = st.secrets.get("GAS_WEBAPP_URL", "")
     if not webapp_url:

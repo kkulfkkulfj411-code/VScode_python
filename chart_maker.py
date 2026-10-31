@@ -145,7 +145,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         volume=has_volume,
         figratio=(12, 10),
         title=title,
-        ylabel='Price',
+        ylabel='',
         returnfig=True
     )
     if aps:
@@ -157,6 +157,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
         ax_main = axes[0]
+        ax_main.set_ylabel('')
 
         for ax in fig.axes:
             formatter = ScalarFormatter(useOffset=False, useMathText=False)
@@ -175,9 +176,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         price_str = _format_chart_price(last_close, is_jp)
 
         ax_main.text(
-            1.0, last_close, f' {price_str} ', color='white',
+            1.002, last_close, f' {price_str} ', color='white',
             backgroundcolor='black', verticalalignment='center', horizontalalignment='left',
-            transform=ax_main.get_yaxis_transform(), fontsize=9, fontweight='bold', zorder=10
+            transform=ax_main.get_yaxis_transform(), fontsize=8.5, fontweight='bold', zorder=10
         )
 
         current_panel_idx = 2
@@ -217,25 +218,39 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             )
             current_panel_idx += 2
 
+        # スイング高値・安値の抽出（右端付近のピボットおよび期間最高・最安値の欠落を防止）
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
-        min_dist = max(int(len(df_plot) * 0.11), 10)
+        right_confirm = 2
+        min_dist = max(int(len(df_plot) * 0.10), 6)
         highs = []
         lows = []
-        for i in range(window_size, len(df_plot) - window_size):
+        n_bars = len(df_plot)
+        max_h_all = df_plot['High'].max()
+        min_l_all = df_plot['Low'].min()
+
+        for i in range(2, n_bars):
             val_h = df_plot['High'].iloc[i]
             val_l = df_plot['Low'].iloc[i]
-            is_high = all(val_h >= df_plot['High'].iloc[j] for j in range(i - window_size, i + window_size + 1) if i != j)
-            is_low = all(val_l <= df_plot['Low'].iloc[j] for j in range(i - window_size, i + window_size + 1) if i != j)
+            left_b = max(0, i - window_size)
+            right_b = min(n_bars, i + window_size + 1)
+
+            can_check_pivot = (i < n_bars - right_confirm)
+            is_high = (can_check_pivot or val_h >= max_h_all) and all(
+                val_h >= df_plot['High'].iloc[j] for j in range(left_b, right_b) if i != j
+            )
+            is_low = (can_check_pivot or val_l <= min_l_all) and all(
+                val_l <= df_plot['Low'].iloc[j] for j in range(left_b, right_b) if i != j
+            )
 
             if is_high:
                 if highs and (i - highs[-1][0]) < min_dist:
-                    if val_h > highs[-1][1]:
+                    if val_h >= highs[-1][1]:
                         highs[-1] = (i, val_h)
                 else:
                     highs.append((i, val_h))
             if is_low:
                 if lows and (i - lows[-1][0]) < min_dist:
-                    if val_l < lows[-1][1]:
+                    if val_l <= lows[-1][1]:
                         lows[-1] = (i, val_l)
                 else:
                     lows.append((i, val_l))
@@ -280,6 +295,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                 is_first_of_year = dt.year not in seen_years
 
                 if is_last or is_first_of_year:
+                    tick_labels.add_label = dt.strftime('%y/%m')
                     tick_labels.append(dt.strftime('%y/%m'))
                     seen_years.add(dt.year)
                 else:
@@ -322,7 +338,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_days=60):
     """
     ボラティリティ指数（VIX, VIX3M, VVIX, SKEW, MOVE）とマクロ指標（HYG, SOX, 米10年債, 日経平均, ドル円）を
-    同一時間軸（X軸完全同期・5段2軸オーバーレイ）で1枚の画像に統合描画する。
+    同一時間軸（共通開始日によるX軸完全同期・5段2軸オーバーレイ）で1枚の画像に統合描画する。
     ※過去252営業日の80%分位（注意線）および90%分位/上限（警戒線）を動的計算して水平補助線に反映する。
     """
     if not macro_df_dict:
@@ -342,6 +358,27 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
         thresholds_meta = macro_df_dict.get("_thresholds", {})
         hard_caps_default = {"^VIX": 30.0, "^VVIX": 130.0, "^SKEW": 162.0, "^MOVE": 135.0}
 
+        # 全指標共通の開始日（common_start_date）と最新日（common_end_date）を算出してX軸のズレを防止
+        common_start_date = None
+        common_end_date = None
+        for ref_key in ["^VIX", "HYG", "^SOX", "^N225"]:
+            ref_df = macro_df_dict.get(ref_key)
+            if isinstance(ref_df, pd.DataFrame) and not ref_df.empty and 'Close' in ref_df.columns:
+                ref_c = ref_df['Close'].dropna()
+                if len(ref_c) >= 5:
+                    common_start_date = ref_c.tail(tail_days).index[0]
+                    common_end_date = ref_c.index[-1]
+                    break
+
+        all_last_dates = []
+        for k, v in macro_df_dict.items():
+            if k != "_thresholds" and isinstance(v, pd.DataFrame) and not v.empty and 'Close' in v.columns:
+                c_tmp = v['Close'].dropna()
+                if not c_tmp.empty:
+                    all_last_dates.append(c_tmp.index[-1])
+        if all_last_dates:
+            common_end_date = max(all_last_dates)
+
         def _prep_series(key):
             df = macro_df_dict.get(key)
             if not isinstance(df, pd.DataFrame) or df.empty or 'Close' not in df.columns:
@@ -351,14 +388,19 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
             if c_all.empty:
                 return pd.Series(dtype=float), pd.Series(dtype=float), None, None
 
-            s_close = c_all.tail(tail_days)
+            if common_start_date is not None:
+                s_close = c_all.loc[c_all.index >= common_start_date]
+                if s_close.empty:
+                    s_close = c_all.tail(tail_days)
+            else:
+                s_close = c_all.tail(tail_days)
+
             if 'High' in df.columns:
                 h_raw = df['High'].reindex(s_close.index).replace(0, np.nan).fillna(s_close)
                 s_high = np.maximum(h_raw, s_close)
             else:
                 s_high = s_close
 
-            # 動的閾値の取得（data_fetcher側で計算済みの値があれば使用、なければ252日分位から算出）
             th_info = thresholds_meta.get(key, {})
             warn_th = th_info.get("warn")
             alert_th = th_info.get("alert")
@@ -405,27 +447,31 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
             fontsize=11, fontweight='bold', pad=8
         )
 
-        # Panel 2: VVIX (左軸) & MOVE指数 (右軸)
+        # Panel 2: VVIX (左軸) & MOVE指数 (右軸) ※80%注意線・90%警戒線を双方描画
         ax2 = axes[1]
-        vvix_c, vvix_h, vvix_warn, _ = _prep_series('^VVIX')
-        move_c, move_h, move_warn, _ = _prep_series('^MOVE')
+        vvix_c, vvix_h, vvix_warn, vvix_alert = _prep_series('^VVIX')
+        move_c, move_h, move_warn, move_alert = _prep_series('^MOVE')
         if not vvix_c.empty:
-            vv_th_str = f" | 80%基準:{vvix_warn:.1f}" if vvix_warn else ""
+            vv_th_str = f" | 動的基準:{vvix_warn:.1f}/{vvix_alert:.1f}" if (vvix_warn and vvix_alert) else (f" | 80%基準:{vvix_warn:.1f}" if vvix_warn else "")
             ax2.plot(vvix_c.index, vvix_c.values, color='#ff7f0e', lw=1.6, label=f"VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高: {vvix_h.max():.1f}{vv_th_str})")
             ax2.plot(vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55)
             if vvix_warn is not None:
                 ax2.axhline(vvix_warn, color='#ff7f0e', ls='--', lw=0.8, alpha=0.65)
+            if vvix_alert is not None:
+                ax2.axhline(vvix_alert, color='#d62728', ls=':', lw=0.9, alpha=0.7)
         ax2.set_ylabel("VVIX", color='#d95f02', fontsize=9, fontweight='bold')
         ax2.tick_params(axis='y', labelcolor='#d95f02', labelsize=8.5)
         ax2.legend(loc='upper left', fontsize=8, framealpha=0.85)
 
         if not move_c.empty:
             ax2_r = ax2.twinx()
-            mv_th_str = f" | 80%基準:{move_warn:.1f}" if move_warn else ""
+            mv_th_str = f" | 動的基準:{move_warn:.1f}/{move_alert:.1f}" if (move_warn and move_alert) else (f" | 80%基準:{move_warn:.1f}" if move_warn else "")
             ax2_r.plot(move_c.index, move_c.values, color='#2ca02c', lw=1.5, label=f"MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f}{mv_th_str})")
             ax2_r.plot(move_h.index, move_h.values, color='#2ca02c', lw=0.7, ls=':', alpha=0.55)
             if move_warn is not None:
                 ax2_r.axhline(move_warn, color='#2ca02c', ls='--', lw=0.8, alpha=0.65)
+            if move_alert is not None:
+                ax2_r.axhline(move_alert, color='#1b611b', ls=':', lw=1.0, alpha=0.8)
             ax2_r.set_ylabel("MOVE Index", color='#2ca02c', fontsize=9, fontweight='bold')
             ax2_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
             ax2_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
@@ -485,6 +531,12 @@ def generate_macro_chart_image(macro_df_dict, filename="temp_macro.png", tail_da
             ax5_r.set_ylabel("USD/JPY", color='#2ca02c', fontsize=9, fontweight='bold')
             ax5_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
             ax5_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+
+        if common_start_date is not None and common_end_date is not None:
+            x_pad_left = common_start_date - pd.Timedelta(days=1)
+            x_pad_right = common_end_date + pd.Timedelta(days=1)
+            for ax in axes:
+                ax.set_xlim(x_pad_left, x_pad_right)
 
         for ax in axes:
             ax.grid(True, which='major', axis='both', linestyle='--', linewidth=0.6, color='gray', alpha=0.45)

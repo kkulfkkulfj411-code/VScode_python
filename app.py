@@ -220,6 +220,15 @@ def build_technical_summary_text(df_d, is_jp):
     return sma_text, table_text
 
 
+def _clean_ohlcv_df(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    cleaned = df.dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
+    if 'Volume' in cleaned.columns:
+        cleaned['Volume'] = cleaned['Volume'].fillna(0)
+    return cleaned
+
+
 st.title("📈 AI株式分析データジェネレーター")
 st.markdown("このアプリは、Gemini（Web版）に読み込ませるための**最新データとチャート画像4枚（週足・日足・1時間足・マクロ統合）**を瞬時に生成・パッケージ化します。")
 
@@ -348,13 +357,13 @@ if generate_button and stock_code:
         else:
             name = get_us_stock_name(stock_code)
 
+        df_w = _clean_ohlcv_df(df_w)
+        df_d = _clean_ohlcv_df(df_d)
+        df_h = _clean_ohlcv_df(df_h)
+
         if df_d.empty:
             st.error("株価データが取得できませんでした。")
             st.stop()
-
-        df_w = df_w.ffill().bfill()
-        df_d = df_d.ffill().bfill()
-        df_h = df_h.ffill().bfill()
 
         if not df_h.empty and not df_d.empty:
             try:
