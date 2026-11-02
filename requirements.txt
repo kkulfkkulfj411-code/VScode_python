@@ -1,5 +1,5 @@
-streamlit
-yfinance
+yfinance==1.7.0
+streamlit==1.66.1
 pandas
 ta
 fear-greed
@@ -10,3 +10,4 @@ feedparser
 requests
 matplotlib
 tenacity
+six
