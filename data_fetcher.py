@@ -403,12 +403,14 @@ def get_edinet_documents(stock_code_4digit, days=60):
     today_jst = datetime.datetime.now(jst).date()
     jp_holidays = get_dynamic_jp_holidays(today_jst.year) | get_dynamic_jp_holidays(today_jst.year - 1)
 
-    # 財務局稼働日（平日・祝日除外）のみを対象にしてAPIバースト制限（429）を回避
     date_list = []
     for i in range(days):
         d = today_jst - datetime.timedelta(days=i)
         if d.weekday() < 5 and d not in jp_holidays:
             date_list.append(d.strftime('%Y-%m-%d'))
+
+    if not date_list:
+        return f"直近{days}日間のEDINET公式開示書類はありません。", []
 
     all_found, all_reasons, error_statuses = [], [], []
 
@@ -474,16 +476,34 @@ def get_edinet_documents(stock_code_4digit, days=60):
                     time.sleep(0.5 * (attempt + 1))
         return found_docs, reasons, err_msg
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_edinet_for_date, d, edinet_code, code_str, edinet_key): d for d in date_list}
-        for future in as_completed(futures):
-            docs, reasons, err = future.result()
-            if docs:
-                all_found.extend(docs)
-            if reasons:
-                all_reasons.extend(reasons)
-            if err:
-                error_statuses.append(err)
+    # ① 1日分プリフライト検証（401/403認証拒否時は残り営業日の並列リクエストを即座にキャンセルしてFail-Fast）
+    first_docs, first_reasons, first_err = fetch_edinet_for_date(date_list[0], edinet_code, code_str, edinet_key)
+    if first_err and any(auth_code in first_err for auth_code in ["Status:401", "Status:403", "HTTP:401", "HTTP:403"]):
+        return (
+            f"EDINET API認証エラーのため取得を中断しました（{first_err} — "
+            f"Streamlit SecretsのEDINET_API_KEY設定またはキー有効期限を確認してください）。",
+            []
+        )
+
+    if first_docs:
+        all_found.extend(first_docs)
+    if first_reasons:
+        all_reasons.extend(first_reasons)
+    if first_err:
+        error_statuses.append(first_err)
+
+    remaining_dates = date_list[1:]
+    if remaining_dates:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(fetch_edinet_for_date, d, edinet_code, code_str, edinet_key): d for d in remaining_dates}
+            for future in as_completed(futures):
+                docs, reasons, err = future.result()
+                if docs:
+                    all_found.extend(docs)
+                if reasons:
+                    all_reasons.extend(reasons)
+                if err:
+                    error_statuses.append(err)
 
     all_found.sort(reverse=True)
     if all_found:
@@ -621,6 +641,29 @@ def get_us_stock_name(stock_code):
     return code_up
 
 
+def _estimate_next_earnings_period(announce_date_str: str) -> str:
+    """
+    直近の決算発表日（YYYY/M/D）から約3ヶ月後の次回四半期決算発表目安時期（上旬・中旬・下旬）を推計する。
+    """
+    try:
+        parts = [int(x) for x in announce_date_str.strip().split('/')]
+        if len(parts) == 3:
+            y, m, d = parts
+            total_m = m + 3
+            next_y = y + (total_m - 1) // 12
+            next_m = (total_m - 1) % 12 + 1
+            if d <= 10:
+                jun = "上旬"
+            elif d <= 20:
+                jun = "中旬"
+            else:
+                jun = "下旬"
+            return f" / 次回目安:{next_y}年{next_m}月{jun}頃[+3ヶ月推計]"
+    except Exception:
+        pass
+    return ""
+
+
 @st.cache_data(ttl=3600)
 def get_japanese_fundamentals(stock_code):
     result = {
@@ -687,7 +730,7 @@ def get_japanese_fundamentals(stock_code):
     except Exception:
         pass
 
-    # 2. Yahoo!ファイナンス日本版からのフォールバック補完（Streamlit Cloud環境でのメイン補完経路）
+    # 2. Yahoo!ファイナンス日本版からのフォールバック補完（③ ラベル厳密抽出＆次回決算目安推計）
     if result['margin'] == 'N/A' or result['per'] == 'N/A' or result['earnings_date'] == '要検索確認':
         try:
             yh_html = _http_get_html(f"https://finance.yahoo.co.jp/quote/{stock_code}.T", timeout=8)
@@ -701,17 +744,27 @@ def get_japanese_fundamentals(stock_code):
                         result['margin'] = m_mrg.group(1).replace(',', '')
 
                 if result['per'] == 'N/A':
-                    m_per = re.search(r'PER[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍', full_txt)
-                    if m_per and m_per.group(1) not in ['－', '―']:
-                        result['per'] = m_per.group(1).replace(',', '')
+                    m_per = (
+                        re.search(r'PER\s*（会社予想）[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍', full_txt)
+                        or re.search(r'PER[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍', full_txt)
+                    )
+                    if m_per:
+                        val_p = m_per.group(1).replace(',', '')
+                        result['per'] = '測定不能(赤字・未定等)' if val_p in ['－', '―'] else val_p
 
                 if result['pbr'] == 'N/A':
-                    m_pbr = re.search(r'PBR[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍', full_txt)
+                    m_pbr = (
+                        re.search(r'PBR\s*（実績）[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍', full_txt)
+                        or re.search(r'PBR[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍', full_txt)
+                    )
                     if m_pbr and m_pbr.group(1) not in ['－', '―']:
                         result['pbr'] = m_pbr.group(1).replace(',', '')
 
                 if result['div'] == 'N/A':
-                    m_div = re.search(r'配当利回り[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*%', full_txt)
+                    m_div = (
+                        re.search(r'配当利回り\s*（会社予想）[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*%', full_txt)
+                        or re.search(r'配当利回り[^\d－―]*([0-9,]+(?:\.[0-9]+)?|－|―)\s*%', full_txt)
+                    )
                     if m_div and m_div.group(1) not in ['－', '―']:
                         result['div'] = m_div.group(1).replace(',', '')
 
@@ -722,15 +775,16 @@ def get_japanese_fundamentals(stock_code):
                         result['market_cap'] = f"{round(val_million / 100, 1):,}"
 
                 if result['earnings_date'] == '要検索確認':
-                    # パターンA: 「まとめ 2026/10/7発表分 ローツェの2027年2月期中間期は...」形式
                     m_yh_sum = re.search(
                         r'([0-9]{4}/[0-9]{1,2}/[0-9]{1,2})\s*発表分.{0,40}?([0-9]{4}年[0-9]{1,2}月期\s*(?:第[1-4１-４]四半期|中間期|通期)?)',
                         full_txt
                     )
                     if m_yh_sum:
-                        result['earnings_date'] = f"{m_yh_sum.group(2).strip()} (直近発表:{m_yh_sum.group(1)})"
+                        ann_dt = m_yh_sum.group(1).strip()
+                        fy_term = m_yh_sum.group(2).strip()
+                        next_est = _estimate_next_earnings_period(ann_dt)
+                        result['earnings_date'] = f"{fy_term} (直近発表:{ann_dt}{next_est})"
                     else:
-                        # パターンB: 「1株配当（会社予想） 28.00円 2027/02」または「EPS（会社予想） ... 2027/02」形式
                         m_yh_fy = re.search(r'(?:1株配当|EPS)（会社予想）.{0,30}?(20[0-9]{2})/([0-9]{1,2})', full_txt)
                         if m_yh_fy:
                             result['earnings_date'] = f"本決算 {int(m_yh_fy.group(2))}月期 ({m_yh_fy.group(1)}/{m_yh_fy.group(2)}期)"
