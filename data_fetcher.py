@@ -1,8 +1,8 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.3)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.4)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
-#            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応) /
+#            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status)
 # ==============================================================================
 import calendar
@@ -87,9 +87,7 @@ def get_dynamic_jp_holidays(year: int) -> set:
 
   def nth_monday(y, m, n):
     first_day = date(y, m, 1)
-    return date(
-        y, m, 1 + (7 - first_day.weekday()) % 7 + (n - 1) * 7
-    )
+    return date(y, m, 1 + (7 - first_day.weekday()) % 7 + (n - 1) * 7)
 
   for m, n in [(1, 2), (7, 3), (9, 3), (10, 2)]:
     holidays.add(nth_monday(year, m, n))
@@ -696,8 +694,9 @@ def _fetch_edinetdb_company_summary(
           rev = _fmt_oku(row.get("revenue") or row.get("net_sales"))
           op = _fmt_oku(row.get("operating_income"))
           ni = _fmt_oku(row.get("net_income"))
-          eps = _fmt_val(row.get("eps"), "円")
-          bps = _fmt_val(row.get("bps"), "円")
+          eps_raw, bps_raw = row.get("eps"), row.get("bps")
+          eps = _fmt_val(eps_raw, "円")
+          bps = _fmt_val(bps_raw, "円")
           dps = _fmt_val(row.get("dps") or row.get("dividend_per_share"), "円")
           roe_v = row.get("roe")
           if isinstance(roe_v, (int, float)) and pd.notna(roe_v):
@@ -706,6 +705,12 @@ def _fetch_edinetdb_company_summary(
                 if abs(roe_v) <= 1.5
                 else f"{round(roe_v, 1)}%"
             )
+          elif (
+              isinstance(eps_raw, (int, float))
+              and isinstance(bps_raw, (int, float))
+              and bps_raw > 0
+          ):
+            roe_s = f"{round((eps_raw / bps_raw) * 100, 1)}%(EPS/BPS算出)"
           else:
             roe_s = "N/A"
           lines.append(

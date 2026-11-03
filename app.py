@@ -1,7 +1,8 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.3)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.4)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
+#            日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 /
 #            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
@@ -218,6 +219,17 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
         else "N/A"
     )
 
+  peg_str = fmt_num("pegRatio")
+  if peg_str == "N/A":
+    peg_str = fmt_num("trailingPegRatio")
+
+  rec_key = str(info.get("recommendationKey") or "").strip()
+  if not rec_key or rec_key.lower() == "none":
+    n_analysts = info.get("numberOfAnalystOpinions")
+    rec_key = (
+        f"評価なし(目標株価算出:{n_analysts}名)" if n_analysts else "N/A"
+    )
+
   target_mean = info.get("targetMeanPrice")
   if (
       isinstance(target_mean, (int, float))
@@ -248,15 +260,17 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
             yf_news_lines.append(f"・{title}")
   except Exception:
     pass
-  yf_news_str = (
-      "\n".join(yf_news_lines)
+  yf_news_block = (
+      "[米国現地ニュースヘッドライン (yfinance)]\n"
+      + "\n".join(yf_news_lines)
+      + "\n"
       if yf_news_lines
-      else "（yfinance英語ニュース取得なし）"
+      else ""
   )
 
   return (
       "[米国株 詳細指標・成長性]\n"
-      f"予想PER(Forward): {fmt_num('forwardPE')} | PEGレシオ: {fmt_num('pegRatio')}"
+      f"予想PER(Forward): {fmt_num('forwardPE')} | PEGレシオ: {peg_str}"
       f" | ROE: {fmt_pct('returnOnEquity')} | 売上成長率: {fmt_pct('revenueGrowth')}"
       f" | 営業利益率: {fmt_pct('operatingMargins')} | Beta(感応度): {fmt_num('beta')}\n"
       "[米国株 需給・空売り動向・コンセンサス（※空売り残高は月2回公表のためタイムラグに注意）]\n"
@@ -264,9 +278,8 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
       f" 空売りカバー日数(Days to Cover): {fmt_num('shortRatio')}日\n"
       f"機関投資家保有比率: {fmt_pct('heldPercentInstitutions')} |"
       f" インサイダー保有比率: {fmt_pct('heldPercentInsiders')}\n"
-      f"アナリスト評価: {info.get('recommendationKey', 'N/A')} |"
-      f" 目標株価コンセンサス: {target_str}\n"
-      f"[米国現地ニュースヘッドライン (yfinance)]\n{yf_news_str}\n"
+      f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
+      f"{yf_news_block}"
   )
 
 
@@ -715,6 +728,8 @@ if generate_button and stock_code:
       ed_raw = fund_data.get("earnings_date", "要検索確認")
       if ed_raw == "要検索確認" and yf_earn_str:
         ed_raw = yf_earn_str
+      elif yf_earn_str and ("本決算" in ed_raw or "決算日:" in ed_raw):
+        ed_raw = f"{ed_raw} / {yf_earn_str}"
       earnings_info_str = f" | 決算情報: {ed_raw}"
     else:
       yf_pe = info.get("trailingPE")

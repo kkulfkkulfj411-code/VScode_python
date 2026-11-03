@@ -1,7 +1,8 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.3)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.4)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
-#            右Y軸Price表記除去 / マクロ5段チャート共通開始日X軸同期 /
+#            右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
+#            マクロ5段チャート共通開始日X軸同期・Y軸上部18%余白確保(凡例重なり防止) /
 #            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線描画 / 例外時Figure解放保護
 # ==============================================================================
 import os
@@ -415,6 +416,9 @@ def generate_safe_chart_image(
           tick_indices.append(i)
           tick_labels.append(dt.strftime('%y/%m'))
           last_month = dt.month
+      if len(tick_indices) >= 2 and (tick_indices[1] - tick_indices[0]) < 8:
+        tick_indices.pop(0)
+        tick_labels.pop(0)
     elif timeframe_type == 'hourly':
       last_date_printed, last_month_printed = None, -1
       for i, dt in enumerate(df_plot.index):
@@ -538,6 +542,9 @@ def generate_macro_chart_image(
       return f' | 80%基準:{warn_v:.1f}' if warn_v else ''
 
     def _style_macro_axis(ax, ylabel_txt, color_code, loc_str, is_bold=True):
+      y0, y1 = ax.get_ylim()
+      if y1 > y0:
+        ax.set_ylim(y0, y1 + (y1 - y0) * 0.18)
       ax.set_ylabel(
           ylabel_txt,
           color=color_code,
