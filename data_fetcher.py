@@ -1,8 +1,9 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11)
-# 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.2)
+# 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ多段フォールバック /
 #            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
-#            EDINET API接続テスト関数(verify_edinet_api_key)
+#            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応) /
+#            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status)
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -191,6 +192,47 @@ def _load_edinet_csv():
       df_code["証券コード"], errors="coerce"
   )
   return df_code
+
+
+def _resolve_edinet_code(stock_code_4digit: str, edb_api_key: str = "") -> str:
+  """ローカルCSVまたはEDINET DB検索からEDINETコード(E+5桁)を特定する。"""
+  code_str = str(stock_code_4digit).strip().upper()
+  try:
+    df_code = _load_edinet_csv()
+    if code_str.isdigit():
+      target_sec_code = float(code_str) * 10
+      match_row = df_code[df_code["証券コード_数値"] == target_sec_code]
+    else:
+      sec_str_series = (
+          df_code["証券コード"].astype(str).str.strip().str.upper()
+      )
+      match_row = df_code[sec_str_series.str.startswith(code_str)]
+
+    if not match_row.empty:
+      return str(match_row["ＥＤＩＮＥＴコード"].values[0]).strip()
+  except Exception:
+    pass
+
+  if edb_api_key:
+    try:
+      res = requests.get(
+          "https://edinetdb.jp/v1/search",
+          params={"q": code_str},
+          headers={"X-API-Key": edb_api_key},
+          timeout=8,
+      )
+      if res.status_code == 200:
+        data = res.json().get("data", [])
+        if isinstance(data, list) and len(data) > 0:
+          for item in data:
+            sec_c = str(item.get("sec_code") or "").strip().upper()
+            if sec_c.startswith(code_str) and item.get("edinet_code"):
+              return str(item["edinet_code"]).strip()
+          if data[0].get("edinet_code"):
+            return str(data[0]["edinet_code"]).strip()
+    except Exception:
+      pass
+  return ""
 
 
 MACRO_HARD_CAPS = {
@@ -433,61 +475,310 @@ def get_macro_data():
   return text
 
 
-def verify_edinet_api_key() -> tuple:
-  """サイドバーからのワンクリック診断用：EDINET APIキーの疎通と有効性を即座にテストする。"""
-  raw_key = st.secrets.get("EDINET_API_KEY", "")
-  edinet_key = str(raw_key).strip().strip('"').strip("'")
-  if not edinet_key:
-    return False, "Streamlit Secrets に EDINET_API_KEY が設定されていません。"
+# ==============================================================================
+# EDINET API キー種別自動判別 ＆ 起動時状態監視・接続診断
+# ==============================================================================
+def _get_edinet_key_and_type() -> tuple:
+  """Streamlit Secrets からAPIキーを取得し、キー種別を自動判定する。
 
+  Returns:
+    (api_key: str, key_type: str)
+    key_type:
+      - 'missing': 未設定
+      - 'edinetdb': 民間 EDINET DB (edinetdb.jp) キー ('edb_' 始まり)
+      - 'fsa': 金融庁公式 EDINET API v2 キー (32桁16進数 等)
+  """
+  raw_key = (
+      st.secrets.get("EDINET_API_KEY", "")
+      or st.secrets.get("EDINETDB_API_KEY", "")
+  )
+  clean_key = str(raw_key).strip().strip('"').strip("'")
+  if not clean_key:
+    return "", "missing"
+  if clean_key.lower().startswith("edb_"):
+    return clean_key, "edinetdb"
+  return clean_key, "fsa"
+
+
+def _run_edinet_connectivity_test(edinet_key: str, key_type: str) -> dict:
+  """指定されたキーと種別に応じて実エンドポイントへの疎通・認証テストを実行する。"""
+  if not edinet_key or key_type == "missing":
+    return {
+        "ok": False,
+        "key_type": "missing",
+        "service_name": "未設定",
+        "message": "Streamlit Secrets に EDINET_API_KEY が設定されていません。",
+        "guide": (
+            "Streamlit Secrets に `EDINET_API_KEY = \"...\"` を設定してください。"
+            "（金融庁公式EDINET API v2キー、または `edb_` で始まる EDINET DB APIキーの両方に自動対応しています）"
+        ),
+    }
+
+  # 1. 民間 EDINET DB (edinetdb.jp) キー ('edb_' 始まり) の検証
+  if key_type == "edinetdb":
+    url = "https://edinetdb.jp/v1/companies/E02144"  # トヨタ自動車で認証疎通確認
+    headers = {"X-API-Key": edinet_key}
+    try:
+      res = requests.get(url, headers=headers, timeout=10)
+      if res.status_code == 200:
+        return {
+            "ok": True,
+            "key_type": "edinetdb",
+            "service_name": "EDINET DB API (edinetdb.jp)",
+            "message": "🟢 EDINET DB API (edinetdb.jp) 正常接続確認済 (HTTP 200)",
+            "guide": (
+                "現在 `edb_` 始まりのEDINET DBキーで接続中です。有報XBRLベースの確定財務時系列・信用スコアを自動取得します。"
+                "（※日次の臨時報告書・大量保有報告書一覧も取得したい場合は、金融庁公式EDINET API v2の32桁キーに差し替えてください）"
+            ),
+        }
+      elif res.status_code in [401, 403]:
+        return {
+            "ok": False,
+            "key_type": "edinetdb",
+            "service_name": "EDINET DB API (edinetdb.jp)",
+            "message": f"🔴 EDINET DB API 認証エラー (HTTP {res.status_code})",
+            "guide": (
+                "設定されている `edb_...` キーが無効または失効しています。"
+                "edinetdb.jp/developers でキーの状態を確認してください。"
+            ),
+        }
+      elif res.status_code == 429:
+        return {
+            "ok": False,
+            "key_type": "edinetdb",
+            "service_name": "EDINET DB API (edinetdb.jp)",
+            "message": "🟠 EDINET DB API レートリミット到達 (HTTP 429)",
+            "guide": (
+                "EDINET DB (Freeプラン: 1日100リクエスト上限) の制限に達しています。"
+                "翌日以降に再試行するか、金融庁公式EDINET APIキーをご利用ください。"
+            ),
+        }
+      else:
+        return {
+            "ok": False,
+            "key_type": "edinetdb",
+            "service_name": "EDINET DB API (edinetdb.jp)",
+            "message": f"🟠 EDINET DB API 応答異常 (HTTP {res.status_code})",
+            "guide": "EDINET DBサーバー側の一時的な障害または仕様変更の可能性があります。",
+        }
+    except Exception as e:
+      return {
+          "ok": False,
+          "key_type": "edinetdb",
+          "service_name": "EDINET DB API (edinetdb.jp)",
+          "message": f"🔴 EDINET DB API 通信エラー: {e}",
+          "guide": "ネットワーク接続または edinetdb.jp の稼働状況を確認してください。",
+      }
+
+  # 2. 金融庁公式 EDINET API v2 (api.edinet-fsa.go.jp) キーの検証
   jst = timezone(timedelta(hours=9))
   today_str = datetime.datetime.now(jst).strftime("%Y-%m-%d")
   url = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
   params = {"date": today_str, "type": 1, "Subscription-Key": edinet_key}
   headers = {"Ocp-Apim-Subscription-Key": edinet_key}
+  is_hex32 = bool(re.match(r"^[0-9a-fA-F]{32}$", edinet_key))
+
   try:
     res = requests.get(url, params=params, headers=headers, timeout=10)
     data = res.json() if res.content else {}
     meta = data.get("metadata", {}) if isinstance(data, dict) else {}
     meta_status = str(meta.get("status", ""))
     if res.status_code == 200 and meta_status == "200":
-      return True, f"EDINET API 正常接続確認済 (HTTP 200 / {today_str})"
+      return {
+          "ok": True,
+          "key_type": "fsa",
+          "service_name": "金融庁公式 EDINET API v2",
+          "message": f"🟢 金融庁公式 EDINET API v2 正常接続確認済 (HTTP 200 / {today_str})",
+          "guide": "直近60日間の公式開示書類（有報・臨時報告書・大量保有報告書等）を自動取得します。",
+      }
     msg = (
         data.get("message")
         or meta.get("message")
         or f"HTTP {res.status_code}"
     )
-    return False, f"EDINET API 認証失敗: {msg}"
+    fmt_hint = (
+        ""
+        if is_hex32
+        else "（※設定値が32桁の16進数ではないため、別サービスのキーまたはコピー漏れの可能性があります）"
+    )
+    return {
+        "ok": False,
+        "key_type": "fsa",
+        "service_name": "金融庁公式 EDINET API v2",
+        "message": f"🔴 金融庁公式 EDINET API 認証失敗: {msg}",
+        "guide": (
+            f"金融庁EDINET API (`api.edinet-fsa.go.jp`) で認証が拒否されました{fmt_hint}。"
+            "Secretsの `EDINET_API_KEY` を確認してください。"
+        ),
+    }
   except Exception as e:
-    return False, f"EDINET API 通信エラー: {e}"
+    return {
+        "ok": False,
+        "key_type": "fsa",
+        "service_name": "金融庁公式 EDINET API v2",
+        "message": f"🔴 金融庁公式 EDINET API 通信エラー: {e}",
+        "guide": "ネットワーク接続または金融庁EDINET APIのメンテナンス状況を確認してください。",
+    }
+
+
+def check_edinet_api_status(force_refresh: bool = False) -> dict:
+  """起動時自動監視および手動テスト兼用のEDINET APIステータス確認関数（TTL 3600秒）。"""
+  cache_key = "_edinet_api_status_cache"
+  edinet_key, key_type = _get_edinet_key_and_type()
+
+  if not force_refresh and cache_key in st.session_state:
+    cached_res, cached_ts, cached_key_hash = st.session_state[cache_key]
+    if time.time() - cached_ts < 3600 and cached_key_hash == hash(edinet_key):
+      return cached_res
+
+  status_dict = _run_edinet_connectivity_test(edinet_key, key_type)
+  st.session_state[cache_key] = (status_dict, time.time(), hash(edinet_key))
+  return status_dict
+
+
+def verify_edinet_api_key() -> tuple:
+  """サイドバーからのワンクリック診断用：キャッシュを強制更新して即座に疎通結果を返す。"""
+  status = check_edinet_api_status(force_refresh=True)
+  msg = status["message"]
+  if status.get("guide") and not status["ok"]:
+    msg += f"\n💡 {status['guide']}"
+  return status["ok"], msg
+
+
+def _fetch_edinetdb_company_summary(
+    stock_code_4digit: str, edinet_code: str, api_key: str
+) -> tuple:
+  """民間 EDINET DB API (edinetdb.jp/v1) から有報ベースの企業情報・財務時系列を取得する（最大2リクエスト）。"""
+  headers = {"X-API-Key": api_key}
+  base_url = "https://edinetdb.jp/v1"
+
+  if not edinet_code:
+    edinet_code = _resolve_edinet_code(stock_code_4digit, edb_api_key=api_key)
+  if not edinet_code:
+    return (
+        "EDINETコードリストおよびEDINET DB検索に該当銘柄が見つかりませんでした。",
+        [],
+    )
+
+  lines = [
+      f"※接続ソース: EDINET DB API (`edinetdb.jp` / EDINETコード: {edinet_code})"
+  ]
+  try:
+    comp_res = requests.get(
+        f"{base_url}/companies/{edinet_code}", headers=headers, timeout=10
+    )
+    if comp_res.status_code in [401, 403]:
+      return (
+          f"EDINET DB API 認証エラー (HTTP {comp_res.status_code} — Secretsのキーを確認してください)",
+          [],
+      )
+    if comp_res.status_code == 429:
+      return (
+          "EDINET DB API レートリミット超過 (HTTP 429 — 1日100リクエスト上限に到達しました)",
+          [],
+      )
+    if comp_res.status_code == 200:
+      c_json = comp_res.json()
+      c_data = c_json.get("data", c_json) if isinstance(c_json, dict) else {}
+      if isinstance(c_data, dict):
+        acc_std = c_data.get("accounting_standard") or "不明"
+        c_score = c_data.get("credit_score")
+        c_rating = c_data.get("credit_rating") or ""
+        ind = c_data.get("industry") or ""
+        score_str = (
+            f"{c_score} ({c_rating})" if c_score is not None else "N/A"
+        )
+        lines.append(
+            f"・有報基本属性: 業種={ind} | 会計基準={acc_std} |"
+            f" EDINET DB財務健全性スコア={score_str}"
+        )
+  except Exception as e:
+    lines.append(f"・企業概要取得エラー: {e}")
+
+  try:
+    fin_res = requests.get(
+        f"{base_url}/companies/{edinet_code}/financials",
+        params={"years": 3},
+        headers=headers,
+        timeout=10,
+    )
+    if fin_res.status_code == 200:
+      f_json = fin_res.json()
+      f_list = f_json.get("data", []) if isinstance(f_json, dict) else []
+      if isinstance(f_list, list) and len(f_list) > 0:
+        lines.append("・有価証券報告書 確定財務推移（直近最大3期）:")
+        for row in f_list[-3:]:
+          if not isinstance(row, dict):
+            continue
+          fy = (
+              row.get("fiscal_year")
+              or row.get("period_end")
+              or row.get("year")
+              or "期不明"
+          )
+
+          def _fmt_oku(val):
+            if isinstance(val, (int, float)) and pd.notna(val):
+              return (
+                  f"{val / 1e8:,.1f}億円"
+                  if abs(val) >= 1e6
+                  else f"{val:,}"
+              )
+            return "N/A"
+
+          def _fmt_val(val, suffix=""):
+            if isinstance(val, (int, float)) and pd.notna(val):
+              return f"{round(val, 2)}{suffix}"
+            return "N/A"
+
+          rev = _fmt_oku(row.get("revenue") or row.get("net_sales"))
+          op = _fmt_oku(row.get("operating_income"))
+          ni = _fmt_oku(row.get("net_income"))
+          eps = _fmt_val(row.get("eps"), "円")
+          bps = _fmt_val(row.get("bps"), "円")
+          dps = _fmt_val(row.get("dps") or row.get("dividend_per_share"), "円")
+          roe_v = row.get("roe")
+          if isinstance(roe_v, (int, float)) and pd.notna(roe_v):
+            roe_s = (
+                f"{round(roe_v * 100, 1)}%"
+                if abs(roe_v) <= 1.5
+                else f"{round(roe_v, 1)}%"
+            )
+          else:
+            roe_s = "N/A"
+
+          lines.append(
+              f"  [{fy}] 売上:{rev} | 営業益:{op} | 純利益:{ni} |"
+              f" EPS:{eps} | BPS:{bps} | DPS:{dps} | ROE:{roe_s}"
+          )
+  except Exception as e:
+    lines.append(f"・財務時系列取得エラー: {e}")
+
+  lines.append(
+      "（※注記: 現在EDINET DBキー `edb_...` で接続中のため有報XBRL確定財務データを表示しています。"
+      "直近60日間の日次提出書類［臨時報告書・大量保有報告書等］は株探開示・Googleニュースから補完評価してください）"
+  )
+  return "\n".join(lines), []
 
 
 @st.cache_data(ttl=3600)
 def get_edinet_documents(stock_code_4digit, days=60):
-  raw_key = st.secrets.get("EDINET_API_KEY", "")
-  edinet_key = str(raw_key).strip().strip('"').strip("'")
-  if not edinet_key:
+  edinet_key, key_type = _get_edinet_key_and_type()
+  if key_type == "missing":
     return "EDINET APIキー未設定", []
 
   code_str = str(stock_code_4digit).strip().upper()
-  edinet_code = ""
-  try:
-    df_code = _load_edinet_csv()
-    if code_str.isdigit():
-      target_sec_code = float(code_str) * 10
-      match_row = df_code[df_code["証券コード_数値"] == target_sec_code]
-    else:
-      sec_str_series = (
-          df_code["証券コード"].astype(str).str.strip().str.upper()
-      )
-      match_row = df_code[sec_str_series.str.startswith(code_str)]
+  edinet_code = _resolve_edinet_code(
+      code_str, edb_api_key=edinet_key if key_type == "edinetdb" else ""
+  )
 
-    if not match_row.empty:
-      edinet_code = str(match_row["ＥＤＩＮＥＴコード"].values[0]).strip()
-    else:
-      return "EDINETコードリストに該当銘柄がありません", []
-  except Exception:
-    return "EDINETコード変換用CSVの読み込みエラー", []
+  # A. 民間 EDINET DB キー ('edb_' 始まり) の場合は専用エンドポイントへ振り分け（日次ループ禁止）
+  if key_type == "edinetdb":
+    return _fetch_edinetdb_company_summary(code_str, edinet_code, edinet_key)
+
+  # B. 金融庁公式 EDINET API v2 キーの場合は直近営業日の提出書類一覧を並列取得
+  if not edinet_code:
+    return "EDINETコードリストに該当銘柄がありません", []
 
   jst = timezone(timedelta(hours=9))
   today_jst = datetime.datetime.now(jst).date()
@@ -827,8 +1118,7 @@ def _estimate_next_earnings_period(announce_date_str: str) -> str:
 def get_japanese_fundamentals(stock_code):
   """日本株ファンダメンタルズを5段階フォールバック（株探 → Yahoo!日本版 → 日経電子版 → みんかぶ → EDINET CSV）で取得する。
 
-  ※一時的な通信遮断で全項目が N/A
-  になった場合はキャッシュせず、有効値が取れた場合のみ session_state に保持する。
+  ※一時的な通信遮断で全項目が N/A になった場合はキャッシュせず、有効値が取れた場合のみ session_state に保持する。
   """
   cache_key = f"fund_cache_{stock_code}"
   if cache_key in st.session_state:
@@ -849,7 +1139,7 @@ def get_japanese_fundamentals(stock_code):
     if not raw_str:
       return "N/A"
     s = re.sub(r"\s+", "", str(raw_str)).replace(",", "")
-    if any(x in s for x in ["－", "―", "---", "赤字"]):
+    if any(x in s for x in ["－", "―", "---", "赤字"]) or s == "-":
       return "－"
     m = re.search(r"[0-9]+(?:\.[0-9]+)?", s)
     return m.group(0) if m else "N/A"
@@ -925,36 +1215,38 @@ def get_japanese_fundamentals(stock_code):
 
         if result["margin"] == "N/A":
           m_mrg = re.search(
-              r"信用倍率.{0,20}?([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍", full_txt
+              r"信用倍率.{0,20}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍", full_txt
           )
-          if m_mrg and m_mrg.group(1) not in ["－", "―"]:
+          if m_mrg and m_mrg.group(1) not in ["---", "－", "―"]:
             result["margin"] = m_mrg.group(1).replace(",", "")
 
         if result["per"] == "N/A":
           m_per = re.search(
-              r"PER\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍",
+              r"PER\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍",
               full_txt,
           )
           if m_per:
             val_p = m_per.group(1).replace(",", "")
             result["per"] = (
-                "測定不能(赤字・未定等)" if val_p in ["－", "―"] else val_p
+                "測定不能(赤字・未定等)"
+                if val_p in ["---", "－", "―"]
+                else val_p
             )
 
         if result["pbr"] == "N/A":
           m_pbr = re.search(
-              r"PBR\s*（実績）.{0,25}?([0-9,]+(?:\.[0-9]+)?|－|―)\s*倍",
+              r"PBR\s*（実績）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍",
               full_txt,
           )
-          if m_pbr and m_pbr.group(1) not in ["－", "―"]:
+          if m_pbr and m_pbr.group(1) not in ["---", "－", "―"]:
             result["pbr"] = m_pbr.group(1).replace(",", "")
 
         if result["div"] == "N/A":
           m_div = re.search(
-              r"配当利回り\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|－|―)\s*%",
+              r"配当利回り\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*%",
               full_txt,
           )
-          if m_div and m_div.group(1) not in ["－", "―"]:
+          if m_div and m_div.group(1) not in ["---", "－", "―"]:
             result["div"] = m_div.group(1).replace(",", "")
 
         if result["market_cap"] == "N/A":

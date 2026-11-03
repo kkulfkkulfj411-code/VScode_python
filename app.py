@@ -1,8 +1,8 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11)
-# 実装済仕様：OHLC dropna / temp_*.png事前削除 / 期間別高安値の到達日付記 /
-#            ザラ場暫定出来高＆前日確定足比併記 / fast_info & Dividends最終補完 /
-#            EDINET APIワンクリック診断 / LSEGレポート併用プロンプト対応
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.2)
+# 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
+#            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
+#            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io
@@ -16,6 +16,7 @@ from chart_maker import (
     generate_safe_chart_image,
 )
 from data_fetcher import (
+    check_edinet_api_status,
     get_edinet_documents,
     get_japanese_fundamentals,
     get_japanese_name,
@@ -27,6 +28,7 @@ from data_fetcher import (
     search_us_ticker_by_name,
     verify_edinet_api_key,
 )
+import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -160,8 +162,11 @@ def _get_period_extreme_with_date(
   if sub.empty:
     return pd.NA, "N/A", "N/A"
   target_val = float(sub.max()) if is_high else float(sub.min())
-  matched = sub[sub == target_val]
-  dt_idx = matched.index[-1]
+  matched = sub[np.isclose(sub.astype(float), target_val, rtol=1e-9, atol=1e-9)]
+  if not matched.empty:
+    dt_idx = matched.index[-1]
+  else:
+    dt_idx = sub.idxmax() if is_high else sub.idxmin()
   if hasattr(dt_idx, "strftime"):
     dt_str = (
         dt_idx.strftime("%y/%m/%d") if include_year else dt_idx.strftime("%m/%d")
@@ -352,10 +357,20 @@ def _clean_ohlcv_df(df):
   return cleaned
 
 
+# 起動時EDINET API自動監視チェック
+edinet_status = check_edinet_api_status(force_refresh=False)
+
 st.title("📈 AI株式分析データジェネレーター")
 st.markdown(
     "このアプリは、Gemini（Web版）に読み込ませるための**最新データとチャート画像4枚（週足・日足・1時間足・マクロ統合）**を瞬時に生成・パッケージ化します。"
 )
+
+# EDINET API異常・未設定時の画面最上部案内バナー表示
+if not edinet_status.get("ok", False):
+  st.warning(
+      f"⚠️ **【EDINET API 状態監視アラート】** {edinet_status.get('message', '')}\n\n"
+      f"💡 **対処方法**: {edinet_status.get('guide', '')}"
+  )
 
 with st.sidebar:
   st.subheader("🎯 銘柄選択・実行")
@@ -460,6 +475,12 @@ with st.sidebar:
         f"[Finviz]({finviz_url}) ｜ [SBI証券](https://www.sbisec.co.jp/)"
     )
 
+  # サイドバーのEDINET接続状態常時表示バッジ
+  if edinet_status.get("ok", False):
+    st.caption(f"📡 **EDINET連携**: {edinet_status.get('message', '')}")
+  else:
+    st.caption(f"📡 **EDINET連携**: {edinet_status.get('message', '')}")
+
   with st.expander("⚙️ 取得補正・キャッシュ・API診断", expanded=False):
     use_repair = st.checkbox(
         "株式分割バグ・異常値を自動補正 (repair=True)",
@@ -471,7 +492,7 @@ with st.sidebar:
     if st.button("🔄 キャッシュをクリアして初期化", width="stretch"):
       st.cache_data.clear()
       for k in list(st.session_state.keys()):
-        if k.startswith("fund_cache_"):
+        if k.startswith("fund_cache_") or k == "_edinet_api_status_cache":
           del st.session_state[k]
       st.session_state.generated_data = None
       jst = timezone(timedelta(hours=9))
@@ -480,7 +501,7 @@ with st.sidebar:
       )
       st.rerun()
 
-    if st.button("🔑 EDINET APIキー接続テスト", width="stretch"):
+    if st.button("🔑 EDINET APIキー接続テスト（即時再検証）", width="stretch"):
       ok_flag, diag_msg = verify_edinet_api_key()
       if ok_flag:
         st.success(diag_msg)
@@ -816,7 +837,9 @@ if generate_button and stock_code:
     if is_jp:
       edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
       news_str = get_news(name, True, edinet_reasons)
-      edinet_section = f"[EDINET 公式開示情報（直近2ヶ月）]\n{edinet_str}\n"
+      edinet_section = (
+          f"[EDINET 公式開示情報 / 有報財務データ]\n{edinet_str}\n"
+      )
       order_calendar_section = get_sbi_order_limit_dates()
       market_specific_section = f"{order_calendar_section}"
     else:

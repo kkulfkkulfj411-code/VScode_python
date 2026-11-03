@@ -1,8 +1,8 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.2)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #            右Y軸Price表記除去 / マクロ5段チャート共通開始日X軸同期 /
-#            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線描画
+#            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線描画 / 例外時Figure解放保護
 # ==============================================================================
 import os
 import matplotlib.dates as mdates
@@ -523,6 +523,7 @@ def generate_safe_chart_image(
     plt.close(fig)
     return filename
   except Exception:
+    plt.close('all')
     return None
 
 
@@ -899,4 +900,5 @@ def generate_macro_chart_image(
     plt.close(fig)
     return filename
   except Exception:
+    plt.close('all')
     return None
