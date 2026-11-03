@@ -48,48 +48,61 @@ def _http_get_html(url: str, timeout: int = 8) -> str:
 
 
 def get_dynamic_jp_holidays(year: int) -> set:
-    holidays = set()
-    fixed_days = [
-        (1, 1), (1, 2), (1, 3),
-        (2, 11), (2, 23),
-        (4, 29),
-        (5, 3), (5, 4), (5, 5),
-        (8, 11),
-        (11, 3), (11, 23),
-        (12, 31)
-    ]
-    for m, d in fixed_days:
-        holidays.add(date(year, m, d))
+  holidays = set()
+  # 国民の祝日（固定日）※1/2, 1/3, 12/31は振替休日の対象外のため後段で追加
+  national_fixed_days = [
+      (1, 1),
+      (2, 11),
+      (2, 23),
+      (4, 29),
+      (5, 3),
+      (5, 4),
+      (5, 5),
+      (8, 11),
+      (11, 3),
+      (11, 23),
+  ]
+  for m, d in national_fixed_days:
+    holidays.add(date(year, m, d))
 
-    def nth_monday(y, m, n):
-        first_day = date(y, m, 1)
-        first_monday_day = 1 + (7 - first_day.weekday()) % 7
-        return date(y, m, first_monday_day + (n - 1) * 7)
+  def nth_monday(y, m, n):
+    first_day = date(y, m, 1)
+    first_monday_day = 1 + (7 - first_day.weekday()) % 7
+    return date(y, m, first_monday_day + (n - 1) * 7)
 
-    holidays.add(nth_monday(year, 1, 2))
-    holidays.add(nth_monday(year, 7, 3))
-    holidays.add(nth_monday(year, 9, 3))
-    holidays.add(nth_monday(year, 10, 2))
+  holidays.add(nth_monday(year, 1, 2))
+  holidays.add(nth_monday(year, 7, 3))
+  holidays.add(nth_monday(year, 9, 3))
+  holidays.add(nth_monday(year, 10, 2))
 
-    vernal_day = int(20.8431 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
-    autumnal_day = int(23.2488 + 0.242194 * (year - 1980) - int((year - 1980) / 4))
-    holidays.add(date(year, 3, vernal_day))
-    holidays.add(date(year, 9, autumnal_day))
+  vernal_day = int(
+      20.8431 + 0.242194 * (year - 1980) - int((year - 1980) / 4)
+  )
+  autumnal_day = int(
+      23.2488 + 0.242194 * (year - 1980) - int((year - 1980) / 4)
+  )
+  holidays.add(date(year, 3, vernal_day))
+  holidays.add(date(year, 9, autumnal_day))
 
-    keiro = nth_monday(year, 9, 3)
-    shubun = date(year, 9, autumnal_day)
-    if (shubun - keiro).days == 2:
-        holidays.add(keiro + timedelta(days=1))
+  keiro = nth_monday(year, 9, 3)
+  shubun = date(year, 9, autumnal_day)
+  if (shubun - keiro).days == 2:
+    holidays.add(keiro + timedelta(days=1))
 
-    base_holidays = sorted(list(holidays))
-    for h in base_holidays:
-        if h.weekday() == 6:
-            sub = h + timedelta(days=1)
-            while sub in holidays:
-                sub += timedelta(days=1)
-            holidays.add(sub)
+  # 国民の祝日が日曜日の場合の振替休日算出
+  base_holidays = sorted(list(holidays))
+  for h in base_holidays:
+    if h.weekday() == 6:
+      sub = h + timedelta(days=1)
+      while sub in holidays:
+        sub += timedelta(days=1)
+      holidays.add(sub)
 
-    return holidays
+  # 東証の年末年始休業日（振替休日の対象外）を最後に追加
+  for m, d in [(1, 2), (1, 3), (12, 31)]:
+    holidays.add(date(year, m, d))
+
+  return holidays
 
 
 def get_sbi_order_limit_dates() -> str:

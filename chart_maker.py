@@ -227,27 +227,31 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
         max_h_all = df_plot['High'].max()
         min_l_all = df_plot['Low'].min()
 
-        for i in range(2, n_bars):
+        for i in range(0, n_bars):
             val_h = df_plot['High'].iloc[i]
             val_l = df_plot['Low'].iloc[i]
             left_b = max(0, i - window_size)
             right_b = min(n_bars, i + window_size + 1)
 
-            can_check_pivot = (i < n_bars - right_confirm)
-            is_high = (can_check_pivot or val_h >= max_h_all) and all(
-                val_h >= df_plot['High'].iloc[j] for j in range(left_b, right_b) if i != j
+        can_check_pivot = (i >= 2) and (i < n_bars - right_confirm)
+        is_high = (can_check_pivot or val_h >= max_h_all) and all(
+              val_h >= df_plot['High'].iloc[j]
+              for j in range(left_b, right_b)
+              if i != j
             )
-            is_low = (can_check_pivot or val_l <= min_l_all) and all(
-                val_l <= df_plot['Low'].iloc[j] for j in range(left_b, right_b) if i != j
+        is_low = (can_check_pivot or val_l <= min_l_all) and all(
+              val_l <= df_plot['Low'].iloc[j]
+              for j in range(left_b, right_b)
+              if i != j
             )
 
-            if is_high:
+        if is_high:
                 if highs and (i - highs[-1][0]) < min_dist:
                     if val_h >= highs[-1][1]:
                         highs[-1] = (i, val_h)
                 else:
                     highs.append((i, val_h))
-            if is_low:
+        if is_low:
                 if lows and (i - lows[-1][0]) < min_dist:
                     if val_l <= lows[-1][1]:
                         lows[-1] = (i, val_l)
