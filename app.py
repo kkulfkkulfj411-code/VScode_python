@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.2)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.3)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応
@@ -46,12 +46,8 @@ def resolve_stock_display_name(code, is_jp_flag):
   if not code:
     return ""
   try:
-    if is_jp_flag:
-      name = get_japanese_name(code)
-      return name if name else ""
-    else:
-      name = get_us_stock_name(code)
-      return name if name else ""
+    name = get_japanese_name(code) if is_jp_flag else get_us_stock_name(code)
+    return name if name else ""
   except Exception:
     return ""
 
@@ -89,11 +85,12 @@ def get_fresh_ticker_and_history(ticker_symbol, is_jp=True, use_repair=False):
           df.index = df.index.tz_localize(None)
     return df
 
-  df_d = _safe_history("2y", "1d")
-  df_w = _safe_history("10y", "1wk")
-  df_h = _safe_history("1y", "1h")
-
-  return stock, df_w, df_d, df_h
+  return (
+      stock,
+      _safe_history("10y", "1wk"),
+      _safe_history("2y", "1d"),
+      _safe_history("1y", "1h"),
+  )
 
 
 def _extract_yf_earnings_date(stock) -> str:
@@ -101,13 +98,14 @@ def _extract_yf_earnings_date(stock) -> str:
     cal = getattr(stock, "calendar", None)
     if isinstance(cal, dict):
       ed = cal.get("Earnings Date")
-      if isinstance(ed, list) and len(ed) > 0:
-        first_d = ed[0]
-        if hasattr(first_d, "strftime"):
-          return f"{first_d.strftime('%Y-%m-%d')}頃(yfinance予定)"
-        return f"{first_d}頃(yfinance予定)"
-      elif hasattr(ed, "strftime"):
-        return f"{ed.strftime('%Y-%m-%d')}頃(yfinance予定)"
+      target = ed[0] if isinstance(ed, list) and ed else ed
+      if target is not None:
+        dt_s = (
+            target.strftime("%Y-%m-%d")
+            if hasattr(target, "strftime")
+            else str(target)
+        )
+        return f"{dt_s}頃(yfinance予定)"
   except Exception:
     pass
   return ""
@@ -126,28 +124,23 @@ def _is_intraday_unconfirmed(df_d, is_jp: bool) -> bool:
   try:
     last_bar_date = df_d.index[-1].date()
     if is_jp:
-      jst = timezone(timedelta(hours=9))
-      now_local = datetime.now(jst)
-      if (
+      now_local = datetime.now(timezone(timedelta(hours=9)))
+      return (
           last_bar_date == now_local.date()
           and dt_time(9, 0) <= now_local.time() < dt_time(15, 30)
-      ):
-        return True
-    else:
-      try:
-        from zoneinfo import ZoneInfo
+      )
+    try:
+      from zoneinfo import ZoneInfo
 
-        now_ny = datetime.now(ZoneInfo("America/New_York"))
-      except Exception:
-        now_ny = datetime.now(timezone(timedelta(hours=-5)))
-      if (
-          last_bar_date == now_ny.date()
-          and dt_time(9, 30) <= now_ny.time() < dt_time(16, 0)
-      ):
-        return True
+      now_ny = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+      now_ny = datetime.now(timezone(timedelta(hours=-5)))
+    return (
+        last_bar_date == now_ny.date()
+        and dt_time(9, 30) <= now_ny.time() < dt_time(16, 0)
+    )
   except Exception:
-    pass
-  return False
+    return False
 
 
 def _get_period_extreme_with_date(
@@ -163,18 +156,49 @@ def _get_period_extreme_with_date(
     return pd.NA, "N/A", "N/A"
   target_val = float(sub.max()) if is_high else float(sub.min())
   matched = sub[np.isclose(sub.astype(float), target_val, rtol=1e-9, atol=1e-9)]
-  if not matched.empty:
-    dt_idx = matched.index[-1]
-  else:
-    dt_idx = sub.idxmax() if is_high else sub.idxmin()
-  if hasattr(dt_idx, "strftime"):
-    dt_str = (
-        dt_idx.strftime("%y/%m/%d") if include_year else dt_idx.strftime("%m/%d")
-    )
-  else:
-    dt_str = str(dt_idx)[:10]
+  dt_idx = (
+      matched.index[-1]
+      if not matched.empty
+      else (sub.idxmax() if is_high else sub.idxmin())
+  )
+  dt_str = (
+      dt_idx.strftime("%y/%m/%d" if include_year else "%m/%d")
+      if hasattr(dt_idx, "strftime")
+      else str(dt_idx)[:10]
+  )
   price_str = format_price(target_val, is_jp)
   return target_val, price_str, f"{price_str}({dt_str})"
+
+
+def _fallback_dividend_yield(df_d: pd.DataFrame, close_price_num: float) -> str:
+  """df_d['Dividends'] の過去365日実績合計から配当利回りを算出する。"""
+  if "Dividends" in df_d.columns and close_price_num > 0:
+    try:
+      one_yr_ago = df_d.index[-1] - pd.Timedelta(days=365)
+      recent_divs = df_d.loc[df_d.index >= one_yr_ago, "Dividends"]
+      div_sum = float(recent_divs[recent_divs > 0].sum())
+      if div_sum > 0:
+        return f"{round((div_sum / close_price_num) * 100, 2)}%(実績)"
+    except Exception:
+      pass
+  return "N/A"
+
+
+def _fallback_fast_mcap(stock, is_jp: bool) -> str:
+  """stock.fast_info から時価総額を補完取得する。"""
+  try:
+    f_mcap = stock.fast_info.get("market_cap") or getattr(
+        stock.fast_info, "market_cap", None
+    )
+    if isinstance(f_mcap, (int, float)) and f_mcap > 0:
+      return (
+          f"{round(f_mcap / 1e8, 1):,}億円"
+          if is_jp
+          else f"{round(f_mcap / 1e9, 2)} Billion USD"
+      )
+  except Exception:
+    pass
+  return "N/A"
 
 
 def build_us_extra_fundamentals(stock, info, close_price_num):
@@ -194,33 +218,16 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
         else "N/A"
     )
 
-  fwd_pe = fmt_num("forwardPE")
-  peg = fmt_num("pegRatio")
-  roe = fmt_pct("returnOnEquity")
-  rev_growth = fmt_pct("revenueGrowth")
-  op_margin = fmt_pct("operatingMargins")
-  beta = fmt_num("beta")
-
-  short_pct = fmt_pct("shortPercentOfFloat")
-  short_ratio = fmt_num("shortRatio")
-  inst_held = fmt_pct("heldPercentInstitutions")
-  insider_held = fmt_pct("heldPercentInsiders")
-
-  rec_key = info.get("recommendationKey", "N/A")
   target_mean = info.get("targetMeanPrice")
-  target_high = info.get("targetHighPrice")
-  target_low = info.get("targetLowPrice")
-
   if (
       isinstance(target_mean, (int, float))
       and pd.notna(target_mean)
       and close_price_num > 0
   ):
     upside = round(((target_mean - close_price_num) / close_price_num) * 100, 2)
-    upside_str = f"{'+' if upside > 0 else ''}{upside}%"
     target_str = (
-        f"平均 {target_mean}ドル (現在値比 {upside_str} | 上限 {target_high} /"
-        f" 下限 {target_low})"
+        f"平均 {target_mean}ドル (現在値比 {'+' if upside > 0 else ''}{upside}%"
+        f" | 上限 {info.get('targetHighPrice')} / 下限 {info.get('targetLowPrice')})"
     )
   else:
     target_str = "N/A"
@@ -228,15 +235,17 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
   yf_news_lines = []
   try:
     raw_news = getattr(stock, "news", None)
-    if raw_news and isinstance(raw_news, list):
+    if isinstance(raw_news, list):
       for item in raw_news[:5]:
-        if not isinstance(item, dict):
-          continue
-        raw_content = item.get("content")
-        content = raw_content if isinstance(raw_content, dict) else {}
-        title = content.get("title") or item.get("title")
-        if title:
-          yf_news_lines.append(f"・{title}")
+        if isinstance(item, dict):
+          content = (
+              item.get("content")
+              if isinstance(item.get("content"), dict)
+              else {}
+          )
+          title = content.get("title") or item.get("title")
+          if title:
+            yf_news_lines.append(f"・{title}")
   except Exception:
     pass
   yf_news_str = (
@@ -247,16 +256,16 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
 
   return (
       "[米国株 詳細指標・成長性]\n"
-      f"予想PER(Forward): {fwd_pe} | PEGレシオ: {peg} | ROE: {roe} |"
-      f" 売上成長率: {rev_growth} | 営業利益率: {op_margin} | Beta(感応度):"
-      f" {beta}\n"
-      "[米国株"
-      " 需給・空売り動向・コンセンサス（※空売り残高は月2回公表のためタイムラグに注意）]\n"
-      f"浮動株空売り比率(Short % of Float): {short_pct} |"
-      f" 空売りカバー日数(Days to Cover): {short_ratio}日\n"
-      f"機関投資家保有比率: {inst_held} | インサイダー保有比率:"
-      f" {insider_held}\n"
-      f"アナリスト評価: {rec_key} | 目標株価コンセンサス: {target_str}\n"
+      f"予想PER(Forward): {fmt_num('forwardPE')} | PEGレシオ: {fmt_num('pegRatio')}"
+      f" | ROE: {fmt_pct('returnOnEquity')} | 売上成長率: {fmt_pct('revenueGrowth')}"
+      f" | 営業利益率: {fmt_pct('operatingMargins')} | Beta(感応度): {fmt_num('beta')}\n"
+      "[米国株 需給・空売り動向・コンセンサス（※空売り残高は月2回公表のためタイムラグに注意）]\n"
+      f"浮動株空売り比率(Short % of Float): {fmt_pct('shortPercentOfFloat')} |"
+      f" 空売りカバー日数(Days to Cover): {fmt_num('shortRatio')}日\n"
+      f"機関投資家保有比率: {fmt_pct('heldPercentInstitutions')} |"
+      f" インサイダー保有比率: {fmt_pct('heldPercentInsiders')}\n"
+      f"アナリスト評価: {info.get('recommendationKey', 'N/A')} |"
+      f" 目標株価コンセンサス: {target_str}\n"
       f"[米国現地ニュースヘッドライン (yfinance)]\n{yf_news_str}\n"
   )
 
@@ -274,24 +283,24 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
       prev_sma = (
           sma_series.iloc[-6] if len(sma_series) >= window + 5 else pd.NA
       )
-
       if pd.notna(curr_sma):
         curr_close = close_series.iloc[-1]
         dev_pct = round(((curr_close - curr_sma) / curr_sma) * 100, 2)
         dev_str = f"{'+' if dev_pct > 0 else ''}{dev_pct}%"
-
         if pd.notna(prev_sma):
           diff = curr_sma - prev_sma
           diff_fmt = int(round(diff)) if is_jp else round(diff, 2)
-          if diff > 0:
-            slope_str = f"上昇中(5日前比 +{diff_fmt}{unit})"
-          elif diff < 0:
-            slope_str = f"下降中(5日前比 {diff_fmt}{unit})"
-          else:
-            slope_str = "横ばい(5日前比 ±0)"
+          slope_str = (
+              f"上昇中(5日前比 +{diff_fmt}{unit})"
+              if diff > 0
+              else (
+                  f"下降中(5日前比 {diff_fmt}{unit})"
+                  if diff < 0
+                  else "横ばい(5日前比 ±0)"
+              )
+          )
         else:
           slope_str = "傾き算出不可"
-
         sma_lines.append(
             f"SMA{window}: {format_price(curr_sma, is_jp)}{unit} [現在値乖離:"
             f" {dev_str} | 傾き: {slope_str}]"
@@ -300,8 +309,6 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
         sma_lines.append(f"SMA{window}: N/A")
     else:
       sma_lines.append(f"SMA{window}: N/A (データ期間不足)")
-
-  sma_text = "\n".join(sma_lines)
 
   recent_df = df_d.tail(10)
   recent_vol_avg = vol_avg20_series.tail(10)
@@ -315,16 +322,11 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
     date_str = (
         idx.strftime("%m/%d") if hasattr(idx, "strftime") else str(idx)[:10]
     )
-    o_str = format_price(row.get("Open"), is_jp)
-    h_str = format_price(row.get("High"), is_jp)
-    l_str = format_price(row.get("Low"), is_jp)
-    c_str = format_price(row.get("Close"), is_jp)
-
     v_avg = recent_vol_avg.loc[idx] if idx in recent_vol_avg.index else pd.NA
     if pd.notna(v_avg) and v_avg > 0:
-      v_ratio = f"{round(row['Volume'] / v_avg, 2)}倍"
-      if is_intraday and idx == last_idx:
-        v_ratio += "(ザラ場暫定)"
+      v_ratio = f"{round(row['Volume'] / v_avg, 2)}倍" + (
+          "(ザラ場暫定)" if is_intraday and idx == last_idx else ""
+      )
     else:
       v_ratio = "N/A"
 
@@ -338,14 +340,15 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
         if "MACD" in row and pd.notna(row["MACD"])
         else "N/A"
     )
-
     table_rows.append(
-        f"{date_str} | {o_str} | {h_str} | {l_str} | {c_str} | {v_ratio} |"
-        f" {rsi_val} | {macd_val}"
+        f"{date_str} | {format_price(row.get('Open'), is_jp)} |"
+        f" {format_price(row.get('High'), is_jp)} |"
+        f" {format_price(row.get('Low'), is_jp)} |"
+        f" {format_price(row.get('Close'), is_jp)} | {v_ratio} | {rsi_val} |"
+        f" {macd_val}"
     )
 
-  table_text = "\n".join(table_rows)
-  return sma_text, table_text
+  return "\n".join(sma_lines), "\n".join(table_rows)
 
 
 def _clean_ohlcv_df(df):
@@ -365,7 +368,6 @@ st.markdown(
     "このアプリは、Gemini（Web版）に読み込ませるための**最新データとチャート画像4枚（週足・日足・1時間足・マクロ統合）**を瞬時に生成・パッケージ化します。"
 )
 
-# EDINET API異常・未設定時の画面最上部案内バナー表示
 if not edinet_status.get("ok", False):
   st.warning(
       f"⚠️ **【EDINET API 状態監視アラート】** {edinet_status.get('message', '')}\n\n"
@@ -386,20 +388,12 @@ with st.sidebar:
   ).strip()
 
   jp_code_pattern = r"^[0-9]{3}[0-9A-Za-z]$"
+  stock_code, is_jp, selected_label_name = "", False, ""
 
-  stock_code = ""
-  is_jp = False
-  selected_label_name = ""
-
-  if not raw_input:
-    stock_code = ""
-  elif re.match(jp_code_pattern, raw_input):
-    stock_code = raw_input.upper()
-    is_jp = True
-  else:
-    jp_matches = []
-    us_matches = []
-
+  if re.match(jp_code_pattern, raw_input):
+    stock_code, is_jp = raw_input.upper(), True
+  elif raw_input:
+    jp_matches, us_matches = [], []
     if market_filter in ["日本株のみ", "すべて（日米）"]:
       half_upper = unicodedata.normalize("NFKC", raw_input).upper()
       full_upper = half_upper.translate(
@@ -409,11 +403,9 @@ with st.sidebar:
           )
       )
       for q in dict.fromkeys([raw_input, half_upper, full_upper]):
-        res = search_japanese_code_by_name(q)
-        if res:
-          for item in res:
-            if item not in jp_matches:
-              jp_matches.append(item)
+        for item in search_japanese_code_by_name(q):
+          if item not in jp_matches:
+            jp_matches.append(item)
 
     if market_filter in ["すべて（日米）", "米国株のみ"] and re.search(
         r"[A-Za-z]", raw_input
@@ -421,22 +413,18 @@ with st.sidebar:
       us_matches = search_us_ticker_by_name(raw_input)
 
     all_matches = jp_matches + us_matches
-
     if all_matches:
       selected = st.selectbox("候補を選択:", all_matches)
       parts = selected.split(" - ", 1)
       stock_code = parts[0].strip().upper()
       selected_label_name = parts[1].strip() if len(parts) > 1 else ""
       is_jp = bool(re.match(jp_code_pattern, stock_code))
+    elif market_filter != "日本株のみ" and re.match(
+        r"^[A-Za-z.\-]+$", raw_input
+    ):
+      stock_code, is_jp = raw_input.upper(), False
     else:
-      if market_filter != "日本株のみ" and re.match(
-          r"^[A-Za-z.\-]+$", raw_input
-      ):
-        stock_code = raw_input.upper()
-        is_jp = False
-      else:
-        st.warning("該当する銘柄が見つかりませんでした。")
-        stock_code = ""
+      st.warning("該当する銘柄が見つかりませんでした。")
 
   if stock_code:
     display_name = selected_label_name or resolve_stock_display_name(
@@ -456,38 +444,28 @@ with st.sidebar:
   )
 
   if is_jp and stock_code:
-    yahoo_url = f"https://finance.yahoo.co.jp/quote/{stock_code}.T"
-    kabutan_disclose_url = f"https://kabutan.jp/stock/news?code={stock_code}&b=k"
-    kabutan_finance_url = f"https://kabutan.jp/stock/finance?code={stock_code}"
-    tv_url = f"https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}"
     st.caption(
-        f"🔗 **外部調査**: [Yahoo]({yahoo_url}) ｜"
-        f" [株探(開示)]({kabutan_disclose_url}) ｜"
-        f" [株探(財務)]({kabutan_finance_url}) ｜ [TradingView]({tv_url}) ｜"
+        f"🔗 **外部調査**: [Yahoo](https://finance.yahoo.co.jp/quote/{stock_code}.T) ｜"
+        f" [株探(開示)](https://kabutan.jp/stock/news?code={stock_code}&b=k) ｜"
+        f" [株探(財務)](https://kabutan.jp/stock/finance?code={stock_code}) ｜"
+        f" [TradingView](https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}) ｜"
         " [SBI証券](https://www.sbisec.co.jp/)"
     )
   elif not is_jp and stock_code:
-    tv_url = f"https://jp.tradingview.com/chart/?symbol={stock_code.upper()}"
-    yh_url = f"https://finance.yahoo.com/quote/{stock_code.upper()}"
-    finviz_url = f"https://finviz.com/quote.ashx?t={stock_code.upper()}"
     st.caption(
-        f"🔗 **外部調査**: [TradingView]({tv_url}) ｜ [Yahoo(US)]({yh_url}) ｜ "
-        f"[Finviz]({finviz_url}) ｜ [SBI証券](https://www.sbisec.co.jp/)"
+        f"🔗 **外部調査**: [TradingView](https://jp.tradingview.com/chart/?symbol={stock_code.upper()}) ｜"
+        f" [Yahoo(US)](https://finance.yahoo.com/quote/{stock_code.upper()}) ｜"
+        f" [Finviz](https://finviz.com/quote.ashx?t={stock_code.upper()}) ｜"
+        " [SBI証券](https://www.sbisec.co.jp/)"
     )
 
-  # サイドバーのEDINET接続状態常時表示バッジ
-  if edinet_status.get("ok", False):
-    st.caption(f"📡 **EDINET連携**: {edinet_status.get('message', '')}")
-  else:
-    st.caption(f"📡 **EDINET連携**: {edinet_status.get('message', '')}")
+  st.caption(f"📡 **EDINET連携**: {edinet_status.get('message', '')}")
 
   with st.expander("⚙️ 取得補正・キャッシュ・API診断", expanded=False):
     use_repair = st.checkbox(
         "株式分割バグ・異常値を自動補正 (repair=True)",
         value=False,
-        help=(
-            "株式分割直後のスパイクノイズがある場合のみオンにしてください。通常時はオフの方が高速かつ安定します。"
-        ),
+        help="株式分割直後のスパイクノイズがある場合のみオンにしてください。通常時はオフの方が高速かつ安定します。",
     )
     if st.button("🔄 キャッシュをクリアして初期化", width="stretch"):
       st.cache_data.clear()
@@ -495,10 +473,9 @@ with st.sidebar:
         if k.startswith("fund_cache_") or k == "_edinet_api_status_cache":
           del st.session_state[k]
       st.session_state.generated_data = None
-      jst = timezone(timedelta(hours=9))
-      st.session_state.cache_cleared_time = datetime.now(jst).strftime(
-          "%H:%M:%S"
-      )
+      st.session_state.cache_cleared_time = datetime.now(
+          timezone(timedelta(hours=9))
+      ).strftime("%H:%M:%S")
       st.rerun()
 
     if st.button("🔑 EDINET APIキー接続テスト（即時再検証）", width="stretch"):
@@ -520,21 +497,20 @@ if generate_button and stock_code:
       "市場データ・マクロボラティリティ(252日自動補正)の取得とチャート画像4枚を生成中..."
   ):
     macro_text, macro_histories = get_macro_data_and_history()
-
     stock, df_w, df_d, df_h = get_fresh_ticker_and_history(
         ticker, is_jp=is_jp, use_repair=use_repair
     )
+    name = (
+        (get_japanese_name(stock_code) or stock_code)
+        if is_jp
+        else get_us_stock_name(stock_code)
+    )
 
-    if is_jp:
-      jp_name = get_japanese_name(stock_code)
-      name = jp_name if jp_name else stock_code
-    else:
-      name = get_us_stock_name(stock_code)
-
-    df_w = _clean_ohlcv_df(df_w)
-    df_d = _clean_ohlcv_df(df_d)
-    df_h = _clean_ohlcv_df(df_h)
-
+    df_w, df_d, df_h = (
+        _clean_ohlcv_df(df_w),
+        _clean_ohlcv_df(df_d),
+        _clean_ohlcv_df(df_h),
+    )
     if df_d.empty:
       st.error("株価データが取得できませんでした。")
       st.stop()
@@ -551,11 +527,12 @@ if generate_button and stock_code:
       except Exception:
         pass
 
-    df_w = add_indicators(df_w)
-    df_d = add_indicators(df_d)
-    df_h = add_indicators(df_h)
+    df_w, df_d, df_h = (
+        add_indicators(df_w),
+        add_indicators(df_d),
+        add_indicators(df_h),
+    )
 
-    # 古い一時画像ファイルを事前削除
     for temp_file in [
         "temp_weekly.png",
         "temp_daily.png",
@@ -588,13 +565,12 @@ if generate_button and stock_code:
     high_price = format_price(latest_d.get("High"), is_jp)
     low_price = format_price(latest_d.get("Low"), is_jp)
     close_price_num = (
-        round(float(latest_d["Close"]), 2)
-        if not is_jp
-        else int(round(float(latest_d["Close"])))
+        int(round(float(latest_d["Close"])))
+        if is_jp
+        else round(float(latest_d["Close"]), 2)
     )
     close_price = format_price(latest_d.get("Close"), is_jp)
 
-    # 期間別・52週高安値と直近到達日の算出
     _, _, recent_high_5d_lbl = _get_period_extreme_with_date(
         df_d["High"], 5, True, is_jp, False
     )
@@ -613,7 +589,6 @@ if generate_button and stock_code:
     _, _, recent_low_60d_lbl = _get_period_extreme_with_date(
         df_d["Low"], 60, False, is_jp, False
     )
-
     high_52w_val, _, high_52w_lbl = _get_period_extreme_with_date(
         df_d["High"], 250, True, is_jp, True
     )
@@ -621,23 +596,19 @@ if generate_button and stock_code:
         df_d["Low"], 250, False, is_jp, True
     )
 
-    if pd.notna(high_52w_val) and high_52w_val > 0:
-      from_52w_high_pct = round(
-          ((close_price_num - high_52w_val) / high_52w_val) * 100, 2
-      )
-      from_52w_str = f" (52週高値比 {from_52w_high_pct}%)"
-    else:
-      from_52w_str = ""
+    from_52w_str = (
+        f" (52週高値比 {round(((close_price_num - high_52w_val) / high_52w_val) * 100, 2)}%)"
+        if pd.notna(high_52w_val) and high_52w_val > 0
+        else ""
+    )
 
     atr_val = latest_d.get("ATR")
-    if pd.notna(atr_val) and close_price_num > 0:
-      atr_fmt = format_price(atr_val, is_jp)
-      atr_pct = round((float(atr_val) / close_price_num) * 100, 2)
-      atr_str = f"{atr_fmt}{unit_str} ({atr_pct}%)"
-    else:
-      atr_str = "N/A"
+    atr_str = (
+        f"{format_price(atr_val, is_jp)}{unit_str} ({round((float(atr_val) / close_price_num) * 100, 2)}%)"
+        if pd.notna(atr_val) and close_price_num > 0
+        else "N/A"
+    )
 
-    # ザラ場実行判定と出来高倍率補正
     is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
     vol_avg20 = df_d["Volume"].tail(20).mean()
     vol_ratio = (
@@ -668,20 +639,17 @@ if generate_button and stock_code:
         df_d, is_jp, is_intraday=is_intraday
     )
 
-    info = {}
     try:
       raw_info = stock.info
-      if isinstance(raw_info, dict):
-        info = raw_info
+      info = raw_info if isinstance(raw_info, dict) else {}
     except Exception:
       info = {}
 
     yf_earn_str = _extract_yf_earnings_date(stock)
-
     us_extra_section = ""
+
     if is_jp:
       fund_data = get_japanese_fundamentals(stock_code)
-
       if fund_data.get("per") and fund_data["per"] != "N/A":
         per_str = (
             f"{fund_data['per']}倍"
@@ -728,41 +696,15 @@ if generate_button and stock_code:
               else "N/A"
           )
 
-      # 配当利回りの最終補完：取得済みの df_d['Dividends']（過去365日実績合計）から算出
-      if (
-          div_str == "N/A"
-          and "Dividends" in df_d.columns
-          and close_price_num > 0
-      ):
-        try:
-          one_yr_ago = df_d.index[-1] - pd.Timedelta(days=365)
-          recent_divs = df_d.loc[df_d.index >= one_yr_ago, "Dividends"]
-          div_sum = float(recent_divs[recent_divs > 0].sum())
-          if div_sum > 0:
-            div_str = f"{round((div_sum / close_price_num) * 100, 2)}%(実績)"
-        except Exception:
-          pass
-
       if fund_data.get("market_cap") and fund_data["market_cap"] != "N/A":
         market_cap_str = f"{fund_data['market_cap']}億円"
       else:
         yf_mcap = info.get("marketCap")
         market_cap_str = (
-            f"{round(yf_mcap / 100000000, 1):,}億円"
+            f"{round(yf_mcap / 1e8, 1):,}億円"
             if isinstance(yf_mcap, (int, float)) and yf_mcap > 0
             else "N/A"
         )
-
-      # 時価総額の最終補完：stock.fast_info から取得
-      if market_cap_str == "N/A":
-        try:
-          f_mcap = stock.fast_info.get("market_cap") or getattr(
-              stock.fast_info, "market_cap", None
-          )
-          if isinstance(f_mcap, (int, float)) and f_mcap > 0:
-            market_cap_str = f"{round(f_mcap / 100000000, 1):,}億円"
-        except Exception:
-          pass
 
       margin_ratio = fund_data.get("margin", "N/A")
       margin_str = (
@@ -770,7 +712,6 @@ if generate_button and stock_code:
           if margin_ratio and margin_ratio != "N/A"
           else ""
       )
-
       ed_raw = fund_data.get("earnings_date", "要検索確認")
       if ed_raw == "要検索確認" and yf_earn_str:
         ed_raw = yf_earn_str
@@ -796,52 +737,29 @@ if generate_button and stock_code:
           and close_price_num > 0
           else "N/A"
       )
-      if (
-          div_str == "N/A"
-          and "Dividends" in df_d.columns
-          and close_price_num > 0
-      ):
-        try:
-          one_yr_ago = df_d.index[-1] - pd.Timedelta(days=365)
-          recent_divs = df_d.loc[df_d.index >= one_yr_ago, "Dividends"]
-          div_sum = float(recent_divs[recent_divs > 0].sum())
-          if div_sum > 0:
-            div_str = f"{round((div_sum / close_price_num) * 100, 2)}%(実績)"
-        except Exception:
-          pass
-
       yf_mcap = info.get("marketCap")
       market_cap_str = (
-          f"{round(yf_mcap / 1000000000, 2)} Billion USD"
+          f"{round(yf_mcap / 1e9, 2)} Billion USD"
           if isinstance(yf_mcap, (int, float)) and yf_mcap > 0
           else "N/A"
       )
-      if market_cap_str == "N/A":
-        try:
-          f_mcap = stock.fast_info.get("market_cap") or getattr(
-              stock.fast_info, "market_cap", None
-          )
-          if isinstance(f_mcap, (int, float)) and f_mcap > 0:
-            market_cap_str = f"{round(f_mcap / 1000000000, 2)} Billion USD"
-        except Exception:
-          pass
-
       margin_str = ""
       earnings_info_str = f" | 次回決算日: {yf_earn_str}" if yf_earn_str else ""
       us_extra_section = build_us_extra_fundamentals(
           stock, info, close_price_num
       )
 
-    edinet_str, edinet_reasons = ("", [])
-    news_str = ""
+    # 日米共通の最終フォールバック補完（Dividends実績利回り ＆ fast_info時価総額）
+    if div_str == "N/A":
+      div_str = _fallback_dividend_yield(df_d, close_price_num)
+    if market_cap_str == "N/A":
+      market_cap_str = _fallback_fast_mcap(stock, is_jp)
+
     if is_jp:
       edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
       news_str = get_news(name, True, edinet_reasons)
-      edinet_section = (
-          f"[EDINET 公式開示情報 / 有報財務データ]\n{edinet_str}\n"
-      )
-      order_calendar_section = get_sbi_order_limit_dates()
-      market_specific_section = f"{order_calendar_section}"
+      edinet_section = f"[EDINET 公式開示情報 / 有報財務データ]\n{edinet_str}\n"
+      market_specific_section = get_sbi_order_limit_dates()
     else:
       news_str = get_news(name, False)
       edinet_section = ""
@@ -880,13 +798,12 @@ if generate_button and stock_code:
       zip_file.writestr(
           f"{stock_code}_market_data.txt", full_text_data.encode("utf-8")
       )
-      zip_images = [
+      for img_path, img_name in [
           (img_w, f"{stock_code}_1_weekly.png"),
           (img_d, f"{stock_code}_2_daily.png"),
           (img_h, f"{stock_code}_3_hourly.png"),
           (img_m, f"{stock_code}_4_macro.png"),
-      ]
-      for img_path, img_name in zip_images:
+      ]:
         if img_path and os.path.exists(img_path):
           zip_file.write(img_path, img_name)
 
@@ -920,7 +837,6 @@ if st.session_state.generated_data:
     )
 
   st.markdown("---")
-
   st.subheader(
       "📱 ① Geminiチャット送信用の命令文（スキル自動発動＆タイトル反映用）"
   )
@@ -977,7 +893,6 @@ if st.session_state.generated_data:
 
   if charts.get("m"):
     st.markdown(
-        "**🌐"
-        " グローバルマクロ＆ボラティリティ統合チャート（直近60営業日・X軸完全同期）**"
+        "**🌐 グローバルマクロ＆ボラティリティ統合チャート（直近60営業日・X軸完全同期）**"
     )
     st.image(charts["m"], width="stretch")

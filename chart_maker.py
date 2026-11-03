@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.2)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.3)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #            右Y軸Price表記除去 / マクロ5段チャート共通開始日X軸同期 /
 #            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線描画 / 例外時Figure解放保護
@@ -32,9 +32,8 @@ def add_indicators(df):
   if df is None or df.empty:
     return df
   df = df.copy()
-  df['SMA25'] = ta.trend.sma_indicator(df['Close'], window=25)
-  df['SMA75'] = ta.trend.sma_indicator(df['Close'], window=75)
-  df['SMA200'] = ta.trend.sma_indicator(df['Close'], window=200)
+  for w in [25, 75, 200]:
+    df[f'SMA{w}'] = ta.trend.sma_indicator(df['Close'], window=w)
 
   bb = ta.volatility.BollingerBands(close=df['Close'], window=20, window_dev=2)
   df['BB_UP'] = bb.bollinger_hband()
@@ -50,21 +49,34 @@ def add_indicators(df):
   df['MACD_Signal'] = ta.trend.macd_signal(df['Close'])
   df['MACD_Hist'] = ta.trend.macd_diff(df['Close'])
   df['MACD'] = df['MACD_Hist']
-
-  if len(df) >= 14:
-    df['ATR'] = ta.volatility.average_true_range(
-        high=df['High'], low=df['Low'], close=df['Close'], window=14
-    )
-  else:
-    df['ATR'] = pd.NA
-
+  df['ATR'] = (
+      ta.volatility.average_true_range(
+          high=df['High'], low=df['Low'], close=df['Close'], window=14
+      )
+      if len(df) >= 14
+      else pd.NA
+  )
   return df
 
 
 def _format_chart_price(val, is_jp):
-  if is_jp:
-    return f'{int(round(float(val)))}'
-  return f'{float(val):.2f}'
+  return f'{int(round(float(val)))}' if is_jp else f'{float(val):.2f}'
+
+
+def _add_panel_tag(ax, label_text):
+  ax.set_ylabel('')
+  ax.text(
+      0.01,
+      0.90,
+      label_text,
+      transform=ax.transAxes,
+      va='top',
+      ha='left',
+      fontsize=8.5,
+      fontweight='bold',
+      color='black',
+      alpha=0.75,
+  )
 
 
 def generate_safe_chart_image(
@@ -82,69 +94,48 @@ def generate_safe_chart_image(
     except Exception:
       df_work.index = df_work.index.tz_localize(None)
 
-  df_plot = df_work.tail(tail_count).copy()
-  df_plot = df_plot.dropna(subset=['Open', 'High', 'Low', 'Close'])
+  df_plot = (
+      df_work.tail(tail_count)
+      .dropna(subset=['Open', 'High', 'Low', 'Close'])
+      .copy()
+  )
   if df_plot.empty:
     return None
 
-  aps = []
-  legend_texts = []
-  if 'SMA25' in df_plot.columns and df_plot['SMA25'].notna().any():
-    aps.append(
-        mpf.make_addplot(
-            df_plot['SMA25'], color='blue', width=1.2, secondary_y=False
-        )
-    )
-    legend_texts.append('SMA25(青)')
-  if 'SMA75' in df_plot.columns and df_plot['SMA75'].notna().any():
-    aps.append(
-        mpf.make_addplot(
-            df_plot['SMA75'], color='orange', width=1.2, secondary_y=False
-        )
-    )
-    legend_texts.append('SMA75(橙)')
-  if 'SMA200' in df_plot.columns and df_plot['SMA200'].notna().any():
-    aps.append(
-        mpf.make_addplot(
-            df_plot['SMA200'], color='red', width=1.2, secondary_y=False
-        )
-    )
-    legend_texts.append('SMA200(赤)')
+  aps, legend_texts = [], []
+  for col, color, lbl in [
+      ('SMA25', 'blue', 'SMA25(青)'),
+      ('SMA75', 'orange', 'SMA75(橙)'),
+      ('SMA200', 'red', 'SMA200(赤)'),
+  ]:
+    if col in df_plot.columns and df_plot[col].notna().any():
+      aps.append(
+          mpf.make_addplot(
+              df_plot[col], color=color, width=1.2, secondary_y=False
+          )
+      )
+      legend_texts.append(lbl)
 
   if legend_texts:
     title = f"{title}   [{' / '.join(legend_texts)}]"
 
   if 'BB_UP' in df_plot.columns and df_plot['BB_UP'].notna().any():
-    aps.append(
-        mpf.make_addplot(
-            df_plot['BB_UP'],
-            color='gray',
-            width=0.8,
-            alpha=0.6,
-            secondary_y=False,
-        )
-    )
-    aps.append(
-        mpf.make_addplot(
-            df_plot['BB_MID'],
-            color='purple',
-            width=0.8,
-            alpha=0.6,
-            secondary_y=False,
-        )
-    )
-    aps.append(
-        mpf.make_addplot(
-            df_plot['BB_LOW'],
-            color='gray',
-            width=0.8,
-            alpha=0.6,
-            secondary_y=False,
-        )
-    )
+    for col, color in [
+        ('BB_UP', 'gray'),
+        ('BB_MID', 'purple'),
+        ('BB_LOW', 'gray'),
+    ]:
+      aps.append(
+          mpf.make_addplot(
+              df_plot[col],
+              color=color,
+              width=0.8,
+              alpha=0.6,
+              secondary_y=False,
+          )
+      )
 
-  panel_ratios = [8]
-  panels_count = 0
+  panel_ratios, panels_count = [8], 0
 
   has_volume = bool(
       'Volume' in df_plot.columns and df_plot['Volume'].notna().any()
@@ -176,40 +167,23 @@ def generate_safe_chart_image(
             secondary_y=False,
         )
     )
-    df_plot['RSI_70'] = 70
-    df_plot['RSI_50'] = 50
-    df_plot['RSI_30'] = 30
-    aps.append(
-        mpf.make_addplot(
-            df_plot['RSI_70'],
-            color='gray',
-            linestyle='--',
-            width=0.8,
-            panel=panels_count,
-            secondary_y=False,
-        )
-    )
-    aps.append(
-        mpf.make_addplot(
-            df_plot['RSI_50'],
-            color='gray',
-            linestyle=':',
-            width=0.7,
-            alpha=0.6,
-            panel=panels_count,
-            secondary_y=False,
-        )
-    )
-    aps.append(
-        mpf.make_addplot(
-            df_plot['RSI_30'],
-            color='gray',
-            linestyle='--',
-            width=0.8,
-            panel=panels_count,
-            secondary_y=False,
-        )
-    )
+    for lvl, ls, w, al in [
+        (70, '--', 0.8, 1.0),
+        (50, ':', 0.7, 0.6),
+        (30, '--', 0.8, 1.0),
+    ]:
+      df_plot[f'RSI_{lvl}'] = lvl
+      aps.append(
+          mpf.make_addplot(
+              df_plot[f'RSI_{lvl}'],
+              color='gray',
+              linestyle=ls,
+              width=w,
+              alpha=al,
+              panel=panels_count,
+              secondary_y=False,
+          )
+      )
 
   has_macd = bool(
       'MACD_Line' in df_plot.columns and df_plot['MACD_Line'].notna().any()
@@ -260,12 +234,13 @@ def generate_safe_chart_image(
 
   font_prop = _get_font_prop()
   try:
-    if font_prop:
-      my_style = mpf.make_mpf_style(
-          base_mpf_style='yahoo', rc={'font.family': font_prop.get_name()}
-      )
-    else:
-      my_style = 'yahoo'
+    my_style = (
+        mpf.make_mpf_style(
+            base_mpf_style='yahoo', rc={'font.family': font_prop.get_name()}
+        )
+        if font_prop
+        else 'yahoo'
+    )
   except Exception:
     my_style = 'yahoo'
 
@@ -280,11 +255,10 @@ def generate_safe_chart_image(
   )
   if aps:
     plot_kwargs['addplot'] = aps
+  if len(panel_ratios) > 1:
+    plot_kwargs['panel_ratios'] = tuple(panel_ratios)
 
   try:
-    if len(panel_ratios) > 1:
-      plot_kwargs['panel_ratios'] = tuple(panel_ratios)
-
     fig, axes = mpf.plot(df_plot, **plot_kwargs)
     ax_main = axes[0]
     ax_main.set_ylabel('')
@@ -303,12 +277,10 @@ def generate_safe_chart_image(
         ax.spines[side].set_linewidth(1.2 if side in ['top', 'bottom'] else 1.0)
 
     last_close = float(df_plot['Close'].iloc[-1])
-    price_str = _format_chart_price(last_close, is_jp)
-
     ax_main.text(
         1.002,
         last_close,
-        f' {price_str} ',
+        f' {_format_chart_price(last_close, is_jp)} ',
         color='white',
         backgroundcolor='black',
         verticalalignment='center',
@@ -322,44 +294,19 @@ def generate_safe_chart_image(
     current_panel_idx = 2
     if has_volume and current_panel_idx < len(axes):
       ax_vol = axes[current_panel_idx]
-      ax_vol.set_ylabel('')
       ax_vol.yaxis.set_major_locator(MaxNLocator(nbins=3, prune='both'))
-      ax_vol.text(
-          0.01,
-          0.90,
-          'Volume',
-          transform=ax_vol.transAxes,
-          va='top',
-          ha='left',
-          fontsize=8.5,
-          fontweight='bold',
-          color='black',
-          alpha=0.75,
-      )
+      _add_panel_tag(ax_vol, 'Volume')
       current_panel_idx += 2
 
     if has_rsi and current_panel_idx < len(axes):
       ax_rsi = axes[current_panel_idx]
-      ax_rsi.set_ylabel('')
       ax_rsi.set_ylim(10, 90)
       ax_rsi.set_yticks([30, 70])
-      ax_rsi.text(
-          0.01,
-          0.90,
-          'RSI',
-          transform=ax_rsi.transAxes,
-          va='top',
-          ha='left',
-          fontsize=8.5,
-          fontweight='bold',
-          color='black',
-          alpha=0.75,
-      )
+      _add_panel_tag(ax_rsi, 'RSI')
       current_panel_idx += 2
 
     if has_macd and current_panel_idx < len(axes):
       ax_macd = axes[current_panel_idx]
-      ax_macd.set_ylabel('')
       macd_vals = pd.concat(
           [df_plot['MACD_Line'], df_plot['MACD_Signal'], df_plot['MACD_Hist']]
       ).dropna()
@@ -368,18 +315,7 @@ def generate_safe_chart_image(
         m_span = max(m_max - m_min, 1e-5)
         ax_macd.set_ylim(m_min - m_span * 0.15, m_max + m_span * 0.15)
       ax_macd.yaxis.set_major_locator(MaxNLocator(nbins=3, prune='both'))
-      ax_macd.text(
-          0.01,
-          0.90,
-          'MACD',
-          transform=ax_macd.transAxes,
-          va='top',
-          ha='left',
-          fontsize=8.5,
-          fontweight='bold',
-          color='black',
-          alpha=0.75,
-      )
+      _add_panel_tag(ax_macd, 'MACD')
       current_panel_idx += 2
 
     # ピボット高安値ラベルの算出と描画（左右端の期間最高値・最安値も保護）
@@ -390,21 +326,19 @@ def generate_safe_chart_image(
     )
     right_confirm = 2
     min_dist = max(int(len(df_plot) * 0.10), 6)
-    highs = []
-    lows = []
+    highs, lows = [], []
     n_bars = len(df_plot)
     high_arr = df_plot['High'].astype(float).values
     low_arr = df_plot['Low'].astype(float).values
-    max_h_all = float(np.nanmax(high_arr))
-    min_l_all = float(np.nanmin(low_arr))
+    max_h_all, min_l_all = float(np.nanmax(high_arr)), float(np.nanmin(low_arr))
 
-    for i in range(0, n_bars):
-      val_h = float(high_arr[i])
-      val_l = float(low_arr[i])
-      left_b = max(0, i - window_size)
-      right_b = min(n_bars, i + window_size + 1)
-
+    for i in range(n_bars):
+      val_h, val_l = float(high_arr[i]), float(low_arr[i])
+      left_b, right_b = max(0, i - window_size), min(
+          n_bars, i + window_size + 1
+      )
       can_check_pivot = (i >= 2) and (i < n_bars - right_confirm)
+
       is_high = (can_check_pivot or val_h >= max_h_all) and all(
           val_h >= float(high_arr[j]) for j in range(left_b, right_b) if i != j
       )
@@ -426,19 +360,16 @@ def generate_safe_chart_image(
           lows.append((i, val_l))
 
     current_ylim = ax_main.get_ylim()
-    y_range = current_ylim[1] - current_ylim[0]
-    offset = y_range * 0.025
-
+    offset = (current_ylim[1] - current_ylim[0]) * 0.025
     ax_main.set_ylim(
         current_ylim[0] - offset * 1.5, current_ylim[1] + offset * 1.5
     )
 
     for idx, val in highs:
-      val_str = _format_chart_price(val, is_jp)
       ax_main.text(
           idx,
           val + offset,
-          val_str,
+          _format_chart_price(val, is_jp),
           ha='center',
           va='bottom',
           color='green',
@@ -447,11 +378,10 @@ def generate_safe_chart_image(
           zorder=9,
       )
     for idx, val in lows:
-      val_str = _format_chart_price(val, is_jp)
       ax_main.text(
           idx,
           val - offset,
-          val_str,
+          _format_chart_price(val, is_jp),
           ha='center',
           va='top',
           color='red',
@@ -460,39 +390,24 @@ def generate_safe_chart_image(
           zorder=9,
       )
 
-    tick_indices = []
-    tick_labels = []
-
+    tick_indices, tick_labels = [], []
     if timeframe_type == 'weekly':
-      last_month = None
-      temp_indices = []
-      temp_labels = []
+      last_month, temp_indices, temp_labels = None, [], []
       for i, dt in enumerate(df_plot.index):
         if dt.month != last_month:
           temp_indices.append(i)
           temp_labels.append(dt)
           last_month = dt.month
-
-      filtered_indices = []
-      filtered_labels = []
-      for j in range(len(temp_indices)):
-        if j % 3 == 0:
-          filtered_indices.append(temp_indices[j])
-          filtered_labels.append(temp_labels[j])
-
+      filtered_indices = [temp_indices[j] for j in range(0, len(temp_indices), 3)]
+      filtered_labels = [temp_labels[j] for j in range(0, len(temp_labels), 3)]
       seen_years = set()
-      for k in range(len(filtered_labels)):
-        dt = filtered_labels[k]
-        is_last = k == len(filtered_labels) - 1
-        is_first_of_year = dt.year not in seen_years
-
-        if is_last or is_first_of_year:
+      for k, dt in enumerate(filtered_labels):
+        if k == len(filtered_labels) - 1 or dt.year not in seen_years:
           tick_labels.append(dt.strftime('%y/%m'))
           seen_years.add(dt.year)
         else:
           tick_labels.append(dt.strftime('%m'))
       tick_indices = filtered_indices
-
     elif timeframe_type == 'daily':
       last_month = None
       for i, dt in enumerate(df_plot.index):
@@ -500,21 +415,17 @@ def generate_safe_chart_image(
           tick_indices.append(i)
           tick_labels.append(dt.strftime('%y/%m'))
           last_month = dt.month
-
     elif timeframe_type == 'hourly':
-      last_date_printed = None
-      last_month_printed = -1
+      last_date_printed, last_month_printed = None, -1
       for i, dt in enumerate(df_plot.index):
-        current_date = dt.date()
-        if current_date != last_date_printed:
+        if dt.date() != last_date_printed:
           if not tick_indices or (i - tick_indices[-1]) >= 7:
             tick_indices.append(i)
-            if dt.month != last_month_printed:
-              tick_labels.append(dt.strftime('%m/%d'))
-              last_month_printed = dt.month
-            else:
-              tick_labels.append(dt.strftime('%d'))
-            last_date_printed = current_date
+            tick_labels.append(
+                dt.strftime('%m/%d' if dt.month != last_month_printed else '%d')
+            )
+            last_month_printed = dt.month
+            last_date_printed = dt.date()
 
     ax_main.set_xticks(tick_indices)
     ax_main.set_xticklabels(tick_labels, rotation=45)
@@ -530,10 +441,7 @@ def generate_safe_chart_image(
 def generate_macro_chart_image(
     macro_df_dict, filename='temp_macro.png', tail_days=60
 ):
-  """ボラティリティ指数（VIX, VIX3M, VVIX, SKEW, MOVE）とマクロ指標（HYG, SOX, 米10年債, 日経平均, ドル円）を
-
-  同一時間軸（共通開始日によるX軸完全同期・5段2軸オーバーレイ）で1枚の画像に統合描画する。
-  """
+  """ボラティリティ指数とマクロ指標を同一時間軸（5段2軸オーバーレイ）で1枚の画像に統合描画する。"""
   if not macro_df_dict:
     return None
 
@@ -556,8 +464,7 @@ def generate_macro_chart_image(
         '^MOVE': 135.0,
     }
 
-    common_start_date = None
-    common_end_date = None
+    common_start_date, common_end_date = None, None
     for ref_key in ['^VIX', 'HYG', '^SOX', '^N225']:
       ref_df = macro_df_dict.get(ref_key)
       if (
@@ -567,76 +474,93 @@ def generate_macro_chart_image(
       ):
         ref_c = ref_df['Close'].dropna()
         if len(ref_c) >= 5:
-          common_start_date = ref_c.tail(tail_days).index[0]
-          common_end_date = ref_c.index[-1]
+          common_start_date, common_end_date = (
+              ref_c.tail(tail_days).index[0],
+              ref_c.index[-1],
+          )
           break
 
-    all_last_dates = []
-    for k, v in macro_df_dict.items():
-      if (
-          k != '_thresholds'
-          and isinstance(v, pd.DataFrame)
-          and not v.empty
-          and 'Close' in v.columns
-      ):
-        c_tmp = v['Close'].dropna()
-        if not c_tmp.empty:
-          all_last_dates.append(c_tmp.index[-1])
+    all_last_dates = [
+        v['Close'].dropna().index[-1]
+        for k, v in macro_df_dict.items()
+        if k != '_thresholds'
+        and isinstance(v, pd.DataFrame)
+        and not v.empty
+        and 'Close' in v.columns
+        and not v['Close'].dropna().empty
+    ]
     if all_last_dates:
       common_end_date = max(all_last_dates)
 
     def _prep_series(key):
       df = macro_df_dict.get(key)
-      if not isinstance(df, pd.DataFrame) or df.empty or 'Close' not in df.columns:
+      if (
+          not isinstance(df, pd.DataFrame)
+          or df.empty
+          or 'Close' not in df.columns
+          or df['Close'].dropna().empty
+      ):
         return pd.Series(dtype=float), pd.Series(dtype=float), None, None
 
       c_all = df['Close'].dropna()
-      if c_all.empty:
-        return pd.Series(dtype=float), pd.Series(dtype=float), None, None
-
-      if common_start_date is not None:
-        s_close = c_all.loc[c_all.index >= common_start_date]
-        if s_close.empty:
-          s_close = c_all.tail(tail_days)
-      else:
+      s_close = (
+          c_all.loc[c_all.index >= common_start_date]
+          if common_start_date is not None
+          else c_all.tail(tail_days)
+      )
+      if s_close.empty:
         s_close = c_all.tail(tail_days)
 
-      if 'High' in df.columns:
-        h_raw = (
-            df['High'].reindex(s_close.index).replace(0, np.nan).fillna(s_close)
-        )
-        s_high = np.maximum(h_raw, s_close)
-      else:
-        s_high = s_close
-
+      s_high = (
+          np.maximum(
+              df['High']
+              .reindex(s_close.index)
+              .replace(0, np.nan)
+              .fillna(s_close),
+              s_close,
+          )
+          if 'High' in df.columns
+          else s_close
+      )
       th_info = thresholds_meta.get(key, {})
-      warn_th = th_info.get('warn')
-      alert_th = th_info.get('alert')
+      warn_th, alert_th = th_info.get('warn'), th_info.get('alert')
 
       if warn_th is None and len(c_all) >= 20:
         win252 = c_all.tail(252)
         cap = hard_caps_default.get(key, float('inf'))
         warn_th = min(float(win252.quantile(0.80)), cap * 0.92)
         alert_th = min(max(float(win252.quantile(0.90)), warn_th + 0.1), cap)
-
       return s_close, s_high, warn_th, alert_th
+
+    def _fmt_th_label(warn_v, alert_v):
+      if warn_v and alert_v:
+        return f' | 動的基準:{warn_v:.1f}/{alert_v:.1f}'
+      return f' | 80%基準:{warn_v:.1f}' if warn_v else ''
+
+    def _style_macro_axis(ax, ylabel_txt, color_code, loc_str, is_bold=True):
+      ax.set_ylabel(
+          ylabel_txt,
+          color=color_code,
+          fontsize=9 if is_bold else 8.5,
+          fontweight='bold' if is_bold else 'normal',
+      )
+      if color_code != 'black':
+        ax.tick_params(
+            axis='y', labelcolor=color_code, labelsize=8.5 if is_bold else 8
+        )
+      ax.legend(loc=loc_str, fontsize=8, framealpha=0.85)
 
     # Panel 1: VIX & VIX3M (左軸) + VIX/VIX3M比 (右軸)
     ax1 = axes[0]
     vix_c, vix_h, vix_warn, vix_alert = _prep_series('^VIX')
     vix3m_c, _, _, _ = _prep_series('^VIX3M')
     if not vix_c.empty:
-      v_th_str = (
-          f' | 動的基準:{vix_warn:.1f}/{vix_alert:.1f}'
-          if vix_warn and vix_alert
-          else ''
-      )
       ax1.plot(
           vix_c.index,
           vix_c.values,
           color='#d62728',
           lw=1.6,
-          label=f'VIX (終値: {vix_c.iloc[-1]:.2f}{v_th_str})',
+          label=f'VIX (終値: {vix_c.iloc[-1]:.2f}{_fmt_th_label(vix_warn, vix_alert)})',
       )
       ax1.plot(
           vix_h.index,
@@ -660,8 +584,7 @@ def generate_macro_chart_image(
           ls='--',
           label=f'VIX3M ({vix3m_c.iloc[-1]:.2f})',
       )
-    ax1.set_ylabel('VIX / VIX3M', fontsize=9, fontweight='bold')
-    ax1.legend(loc='upper left', fontsize=8, framealpha=0.85)
+    _style_macro_axis(ax1, 'VIX / VIX3M', 'black', 'upper left')
 
     if not vix_c.empty and not vix3m_c.empty:
       common_idx = vix_c.index.intersection(vix3m_c.index)
@@ -678,9 +601,9 @@ def generate_macro_chart_image(
               label=f'VIX/VIX3M比 ({ratio_s.iloc[-1]:.2f})',
           )
           ax1_r.axhline(1.0, color='purple', ls=':', lw=1.0, alpha=0.8)
-          ax1_r.set_ylabel('Term Ratio', color='purple', fontsize=8.5)
-          ax1_r.tick_params(axis='y', labelcolor='purple', labelsize=8)
-          ax1_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+          _style_macro_axis(
+              ax1_r, 'Term Ratio', 'purple', 'upper right', is_bold=False
+          )
 
     ax1.set_title(
         'Global Macro & Volatility Time-Series Matrix'
@@ -695,98 +618,57 @@ def generate_macro_chart_image(
     vvix_c, vvix_h, vvix_warn, vvix_alert = _prep_series('^VVIX')
     move_c, move_h, move_warn, move_alert = _prep_series('^MOVE')
     if not vvix_c.empty:
-      vv_th_str = (
-          f' | 動的基準:{vvix_warn:.1f}/{vvix_alert:.1f}'
-          if (vvix_warn and vvix_alert)
-          else (f' | 80%基準:{vvix_warn:.1f}' if vvix_warn else '')
-      )
       ax2.plot(
           vvix_c.index,
           vvix_c.values,
           color='#ff7f0e',
           lw=1.6,
-          label=(
-              f'VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高:'
-              f' {vvix_h.max():.1f}{vv_th_str})'
-          ),
+          label=f'VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高: {vvix_h.max():.1f}{_fmt_th_label(vvix_warn, vvix_alert)})',
       )
       ax2.plot(
-          vvix_h.index,
-          vvix_h.values,
-          color='#ff7f0e',
-          lw=0.7,
-          ls=':',
-          alpha=0.55,
+          vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55
       )
       if vvix_warn is not None:
         ax2.axhline(vvix_warn, color='#ff7f0e', ls='--', lw=0.8, alpha=0.65)
       if vvix_alert is not None:
         ax2.axhline(vvix_alert, color='#d62728', ls=':', lw=0.9, alpha=0.7)
-    ax2.set_ylabel('VVIX', color='#d95f02', fontsize=9, fontweight='bold')
-    ax2.tick_params(axis='y', labelcolor='#d95f02', labelsize=8.5)
-    ax2.legend(loc='upper left', fontsize=8, framealpha=0.85)
+    _style_macro_axis(ax2, 'VVIX', '#d95f02', 'upper left')
 
     if not move_c.empty:
       ax2_r = ax2.twinx()
-      mv_th_str = (
-          f' | 動的基準:{move_warn:.1f}/{move_alert:.1f}'
-          if (move_warn and move_alert)
-          else (f' | 80%基準:{move_warn:.1f}' if move_warn else '')
-      )
       ax2_r.plot(
           move_c.index,
           move_c.values,
           color='#2ca02c',
           lw=1.5,
-          label=(
-              f'MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高:'
-              f' {move_h.max():.1f}{mv_th_str})'
-          ),
+          label=f'MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f}{_fmt_th_label(move_warn, move_alert)})',
       )
       ax2_r.plot(
-          move_h.index,
-          move_h.values,
-          color='#2ca02c',
-          lw=0.7,
-          ls=':',
-          alpha=0.55,
+          move_h.index, move_h.values, color='#2ca02c', lw=0.7, ls=':', alpha=0.55
       )
       if move_warn is not None:
         ax2_r.axhline(move_warn, color='#2ca02c', ls='--', lw=0.8, alpha=0.65)
       if move_alert is not None:
         ax2_r.axhline(move_alert, color='#1b611b', ls=':', lw=1.0, alpha=0.8)
-      ax2_r.set_ylabel(
-          'MOVE Index', color='#2ca02c', fontsize=9, fontweight='bold'
-      )
-      ax2_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
-      ax2_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+      _style_macro_axis(ax2_r, 'MOVE Index', '#2ca02c', 'upper right')
 
     # Panel 3: SKEW指数 (左軸) & HYG (右軸)
     ax3 = axes[2]
     skew_c, _, skew_warn, skew_alert = _prep_series('^SKEW')
     hyg_c, _, _, _ = _prep_series('HYG')
     if not skew_c.empty:
-      sk_th_str = (
-          f' | 動的基準:{skew_warn:.1f}/{skew_alert:.1f}'
-          if skew_warn and skew_alert
-          else ''
-      )
       ax3.plot(
           skew_c.index,
           skew_c.values,
           color='#8c564b',
           lw=1.5,
-          label=(
-              f'SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{sk_th_str})'
-          ),
+          label=f'SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{_fmt_th_label(skew_warn, skew_alert)})',
       )
       if skew_warn is not None:
         ax3.axhline(skew_warn, color='#8c564b', ls='--', lw=0.8, alpha=0.65)
       if skew_alert is not None:
         ax3.axhline(skew_alert, color='red', ls=':', lw=0.9, alpha=0.7)
-    ax3.set_ylabel('CBOE SKEW', color='#8c564b', fontsize=9, fontweight='bold')
-    ax3.tick_params(axis='y', labelcolor='#8c564b', labelsize=8.5)
-    ax3.legend(loc='upper left', fontsize=8, framealpha=0.85)
+    _style_macro_axis(ax3, 'CBOE SKEW', '#8c564b', 'upper left')
 
     if not hyg_c.empty:
       ax3_r = ax3.twinx()
@@ -797,11 +679,7 @@ def generate_macro_chart_image(
           lw=1.5,
           label=f'HYG ハイイールド債ETF ({hyg_c.iloc[-1]:.2f})',
       )
-      ax3_r.set_ylabel(
-          'HYG (Credit)', color='#0f7f8a', fontsize=9, fontweight='bold'
-      )
-      ax3_r.tick_params(axis='y', labelcolor='#0f7f8a', labelsize=8.5)
-      ax3_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+      _style_macro_axis(ax3_r, 'HYG (Credit)', '#0f7f8a', 'upper right')
 
     # Panel 4: SOX指数 (左軸) & 米10年債利回り (右軸)
     ax4 = axes[3]
@@ -815,9 +693,7 @@ def generate_macro_chart_image(
           lw=1.6,
           label=f'SOX 半導体指数 ({sox_c.iloc[-1]:.1f})',
       )
-    ax4.set_ylabel('SOX Index', color='#1f77b4', fontsize=9, fontweight='bold')
-    ax4.tick_params(axis='y', labelcolor='#1f77b4', labelsize=8.5)
-    ax4.legend(loc='upper left', fontsize=8, framealpha=0.85)
+    _style_macro_axis(ax4, 'SOX Index', '#1f77b4', 'upper left')
 
     if not tnx_c.empty:
       ax4_r = ax4.twinx()
@@ -826,16 +702,9 @@ def generate_macro_chart_image(
           tnx_c.values,
           color='#e377c2',
           lw=1.5,
-          label=(
-              f'米10年債利回り ({tnx_c.iloc[-1]:.2f}% / 最高:'
-              f' {tnx_h.max():.2f}%)'
-          ),
+          label=f'米10年債利回り ({tnx_c.iloc[-1]:.2f}% / 最高: {tnx_h.max():.2f}%)',
       )
-      ax4_r.set_ylabel(
-          'US 10Y (%)', color='#c51b8a', fontsize=9, fontweight='bold'
-      )
-      ax4_r.tick_params(axis='y', labelcolor='#c51b8a', labelsize=8.5)
-      ax4_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+      _style_macro_axis(ax4_r, 'US 10Y (%)', '#c51b8a', 'upper right')
 
     # Panel 5: 日経平均株価 (左軸) & ドル円 (右軸)
     ax5 = axes[4]
@@ -849,9 +718,7 @@ def generate_macro_chart_image(
           lw=1.6,
           label=f'日経平均株価 ({int(round(n225_c.iloc[-1]))}円)',
       )
-    ax5.set_ylabel('Nikkei 225', color='#222222', fontsize=9, fontweight='bold')
-    ax5.tick_params(axis='y', labelcolor='#222222', labelsize=8.5)
-    ax5.legend(loc='upper left', fontsize=8, framealpha=0.85)
+    _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left')
 
     if not usdjpy_c.empty:
       ax5_r = ax5.twinx()
@@ -860,16 +727,9 @@ def generate_macro_chart_image(
           usdjpy_c.values,
           color='#2ca02c',
           lw=1.5,
-          label=(
-              f'ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / 最高:'
-              f' {usdjpy_h.max():.2f}円)'
-          ),
+          label=f'ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / 最高: {usdjpy_h.max():.2f}円)',
       )
-      ax5_r.set_ylabel(
-          'USD/JPY', color='#2ca02c', fontsize=9, fontweight='bold'
-      )
-      ax5_r.tick_params(axis='y', labelcolor='#2ca02c', labelsize=8.5)
-      ax5_r.legend(loc='upper right', fontsize=8, framealpha=0.85)
+      _style_macro_axis(ax5_r, 'USD/JPY', '#2ca02c', 'upper right')
 
     if common_start_date is not None and common_end_date is not None:
       x_pad_left = common_start_date - pd.Timedelta(days=1)
