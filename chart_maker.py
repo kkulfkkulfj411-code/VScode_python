@@ -1,9 +1,11 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.4)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.5)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #            右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
 #            マクロ5段チャート共通開始日X軸同期・Y軸上部18%余白確保(凡例重なり防止) /
-#            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線描画 / 例外時Figure解放保護
+#            改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
+#            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・線種分離＋極薄帯） /
+#            例外時Figure解放保護
 # ==============================================================================
 import os
 import matplotlib.dates as mdates
@@ -579,9 +581,11 @@ def generate_macro_chart_image(
           label=f'VIX (瞬間高値: {vix_h.max():.2f})',
       )
       if vix_warn is not None:
-        ax1.axhline(vix_warn, color='orange', ls='--', lw=0.8, alpha=0.7)
+        ax1.axhline(vix_warn, color='#ff7f0e', ls='--', lw=0.85, alpha=0.75)
       if vix_alert is not None:
-        ax1.axhline(vix_alert, color='red', ls='--', lw=0.9, alpha=0.7)
+        ax1.axhline(vix_alert, color='#d62728', ls='--', lw=0.95, alpha=0.8)
+      if vix_warn is not None and vix_alert is not None and vix_alert > vix_warn:
+        ax1.axhspan(vix_warn, vix_alert, color='#d62728', alpha=0.05)
     if not vix3m_c.empty:
       ax1.plot(
           vix3m_c.index,
@@ -614,16 +618,16 @@ def generate_macro_chart_image(
 
     ax1.set_title(
         'Global Macro & Volatility Time-Series Matrix'
-        ' (直近60営業日・X軸完全同期 / 破線は252日動的補正基準線)',
+        ' (直近60営業日・X軸完全同期 / 破線・薄帯は252日動的補正80%・90%基準)',
         fontsize=11,
         fontweight='bold',
         pad=8,
     )
 
-    # Panel 2: VVIX (左軸) & MOVE指数 (右軸)
+    # Panel 2: VVIX (左軸・暖色系) & SKEW指数 (右軸・寒色系) 【株式オプション内部構造】
     ax2 = axes[1]
     vvix_c, vvix_h, vvix_warn, vvix_alert = _prep_series('^VVIX')
-    move_c, move_h, move_warn, move_alert = _prep_series('^MOVE')
+    skew_c, _, skew_warn, skew_alert = _prep_series('^SKEW')
     if not vvix_c.empty:
       ax2.plot(
           vvix_c.index,
@@ -636,46 +640,53 @@ def generate_macro_chart_image(
           vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55
       )
       if vvix_warn is not None:
-        ax2.axhline(vvix_warn, color='#ff7f0e', ls='--', lw=0.8, alpha=0.65)
+        ax2.axhline(vvix_warn, color='#ff7f0e', ls='--', lw=0.85, alpha=0.75)
       if vvix_alert is not None:
-        ax2.axhline(vvix_alert, color='#d62728', ls=':', lw=0.9, alpha=0.7)
+        ax2.axhline(vvix_alert, color='#d62728', ls=':', lw=1.0, alpha=0.85)
+      if vvix_warn is not None and vvix_alert is not None and vvix_alert > vvix_warn:
+        ax2.axhspan(vvix_warn, vvix_alert, color='#ff7f0e', alpha=0.06)
     _style_macro_axis(ax2, 'VVIX', '#d95f02', 'upper left')
 
-    if not move_c.empty:
+    if not skew_c.empty:
       ax2_r = ax2.twinx()
       ax2_r.plot(
+          skew_c.index,
+          skew_c.values,
+          color='#1f77b4',
+          lw=1.5,
+          label=f'SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{_fmt_th_label(skew_warn, skew_alert)})',
+      )
+      # 左軸VVIXの基準線（-- / :）と重なっても識別できるよう、寒色系＋異なる線種（-. / --）で描画
+      if skew_warn is not None:
+        ax2_r.axhline(skew_warn, color='#1f77b4', ls='-.', lw=0.85, alpha=0.75)
+      if skew_alert is not None:
+        ax2_r.axhline(skew_alert, color='#08306b', ls='--', lw=1.0, alpha=0.85)
+      if skew_warn is not None and skew_alert is not None and skew_alert > skew_warn:
+        ax2_r.axhspan(skew_warn, skew_alert, color='#1f77b4', alpha=0.06)
+      _style_macro_axis(ax2_r, 'CBOE SKEW', '#08519c', 'upper right')
+
+    # Panel 3: MOVE指数 (左軸・グリーン系) & HYG (右軸・ブラウン/ブロンズ系) 【債券・クレジット市場】
+    ax3 = axes[2]
+    move_c, move_h, move_warn, move_alert = _prep_series('^MOVE')
+    hyg_c, _, _, _ = _prep_series('HYG')
+    if not move_c.empty:
+      ax3.plot(
           move_c.index,
           move_c.values,
           color='#2ca02c',
           lw=1.5,
           label=f'MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f}{_fmt_th_label(move_warn, move_alert)})',
       )
-      ax2_r.plot(
+      ax3.plot(
           move_h.index, move_h.values, color='#2ca02c', lw=0.7, ls=':', alpha=0.55
       )
       if move_warn is not None:
-        ax2_r.axhline(move_warn, color='#2ca02c', ls='--', lw=0.8, alpha=0.65)
+        ax3.axhline(move_warn, color='#2ca02c', ls='--', lw=0.85, alpha=0.7)
       if move_alert is not None:
-        ax2_r.axhline(move_alert, color='#1b611b', ls=':', lw=1.0, alpha=0.8)
-      _style_macro_axis(ax2_r, 'MOVE Index', '#2ca02c', 'upper right')
-
-    # Panel 3: SKEW指数 (左軸) & HYG (右軸)
-    ax3 = axes[2]
-    skew_c, _, skew_warn, skew_alert = _prep_series('^SKEW')
-    hyg_c, _, _, _ = _prep_series('HYG')
-    if not skew_c.empty:
-      ax3.plot(
-          skew_c.index,
-          skew_c.values,
-          color='#8c564b',
-          lw=1.5,
-          label=f'SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{_fmt_th_label(skew_warn, skew_alert)})',
-      )
-      if skew_warn is not None:
-        ax3.axhline(skew_warn, color='#8c564b', ls='--', lw=0.8, alpha=0.65)
-      if skew_alert is not None:
-        ax3.axhline(skew_alert, color='red', ls=':', lw=0.9, alpha=0.7)
-    _style_macro_axis(ax3, 'CBOE SKEW', '#8c564b', 'upper left')
+        ax3.axhline(move_alert, color='#1b611b', ls=':', lw=1.0, alpha=0.85)
+      if move_warn is not None and move_alert is not None and move_alert > move_warn:
+        ax3.axhspan(move_warn, move_alert, color='#2ca02c', alpha=0.06)
+    _style_macro_axis(ax3, 'MOVE Index', '#2ca02c', 'upper left')
 
     if not hyg_c.empty:
       ax3_r = ax3.twinx()
