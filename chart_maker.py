@@ -1,10 +1,10 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.5)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #            右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
-#            マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部24%余白確保(凡例重なり防止) /
+#            マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部36%余白確保(凡例重なり完全防止) /
 #            改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
-#            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・線種分離＋極薄帯） /
+#            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・4種カスタム線種分離＋極薄帯） /
 #            Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 /
 #            例外時Figure解放保護
 # ==============================================================================
@@ -545,7 +545,7 @@ def generate_macro_chart_image(
       return f' | 80%基準:{warn_v:.1f}' if warn_v else ''
 
     def _style_macro_axis(
-        ax, ylabel_txt, color_code, loc_str, is_bold=True, top_margin=0.18
+        ax, ylabel_txt, color_code, loc_str, is_bold=True, top_margin=0.20
     ):
       y0, y1 = ax.get_ylim()
       if y1 > y0:
@@ -560,7 +560,16 @@ def generate_macro_chart_image(
         ax.tick_params(
             axis='y', labelcolor=color_code, labelsize=8.5 if is_bold else 8
         )
-      ax.legend(loc=loc_str, fontsize=8, framealpha=0.85)
+      leg = ax.legend(
+          loc=loc_str,
+          fontsize=7.8,
+          framealpha=0.88,
+          labelspacing=0.25,
+          borderpad=0.3,
+          handlelength=1.8,
+      )
+      if leg:
+        leg.set_zorder(20)
 
     # Panel 1: VIX & VIX3M (左軸) + VIX/VIX3M比 (右軸)
     ax1 = axes[0]
@@ -598,7 +607,7 @@ def generate_macro_chart_image(
           ls='--',
           label=f'VIX3M ({vix3m_c.iloc[-1]:.2f})',
       )
-    _style_macro_axis(ax1, 'VIX / VIX3M', 'black', 'upper left', top_margin=0.24)
+    _style_macro_axis(ax1, 'VIX / VIX3M', 'black', 'upper left', top_margin=0.36)
 
     if not vix_c.empty and not vix3m_c.empty:
       common_idx = vix_c.index.intersection(vix3m_c.index)
@@ -621,7 +630,7 @@ def generate_macro_chart_image(
               'purple',
               'upper right',
               is_bold=False,
-              top_margin=0.24,
+              top_margin=0.36,
           )
 
     ax1.set_title(
@@ -647,13 +656,18 @@ def generate_macro_chart_image(
       ax2.plot(
           vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55
       )
+      # 4本の基準線が同一Y座標で重なっても判別できるよう4種の異なるカスタム破線パターンを適用
       if vvix_warn is not None:
-        ax2.axhline(vvix_warn, color='#ff7f0e', ls='--', lw=0.85, alpha=0.75)
+        ax2.axhline(
+            vvix_warn, color='#ff7f0e', ls=(0, (6, 3)), lw=0.9, alpha=0.8
+        )
       if vvix_alert is not None:
-        ax2.axhline(vvix_alert, color='#d62728', ls=':', lw=1.0, alpha=0.85)
+        ax2.axhline(
+            vvix_alert, color='#d62728', ls=(0, (1.5, 1.5)), lw=1.05, alpha=0.85
+        )
       if vvix_warn is not None and vvix_alert is not None and vvix_alert > vvix_warn:
         ax2.axhspan(vvix_warn, vvix_alert, color='#ff7f0e', alpha=0.06)
-    _style_macro_axis(ax2, 'VVIX', '#d95f02', 'upper left')
+    _style_macro_axis(ax2, 'VVIX', '#d95f02', 'upper left', top_margin=0.22)
 
     if not skew_c.empty:
       ax2_r = ax2.twinx()
@@ -665,12 +679,18 @@ def generate_macro_chart_image(
           label=f'SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{_fmt_th_label(skew_warn, skew_alert)})',
       )
       if skew_warn is not None:
-        ax2_r.axhline(skew_warn, color='#1f77b4', ls='-.', lw=0.85, alpha=0.75)
+        ax2_r.axhline(
+            skew_warn, color='#1f77b4', ls=(0, (4, 2, 1, 2)), lw=0.9, alpha=0.8
+        )
       if skew_alert is not None:
-        ax2_r.axhline(skew_alert, color='#08306b', ls='--', lw=1.0, alpha=0.85)
+        ax2_r.axhline(
+            skew_alert, color='#08306b', ls=(3, (3, 3)), lw=1.05, alpha=0.85
+        )
       if skew_warn is not None and skew_alert is not None and skew_alert > skew_warn:
         ax2_r.axhspan(skew_warn, skew_alert, color='#1f77b4', alpha=0.06)
-      _style_macro_axis(ax2_r, 'CBOE SKEW', '#08519c', 'upper right')
+      _style_macro_axis(
+          ax2_r, 'CBOE SKEW', '#08519c', 'upper right', top_margin=0.22
+      )
 
     # Panel 3: MOVE指数 (左軸・グリーン系) & HYG (右軸・ティール系) 【債券・クレジット市場】
     ax3 = axes[2]
@@ -693,7 +713,7 @@ def generate_macro_chart_image(
         ax3.axhline(move_alert, color='#1b611b', ls=':', lw=1.0, alpha=0.85)
       if move_warn is not None and move_alert is not None and move_alert > move_warn:
         ax3.axhspan(move_warn, move_alert, color='#2ca02c', alpha=0.06)
-    _style_macro_axis(ax3, 'MOVE Index', '#2ca02c', 'upper left')
+    _style_macro_axis(ax3, 'MOVE Index', '#2ca02c', 'upper left', top_margin=0.22)
 
     if not hyg_c.empty:
       ax3_r = ax3.twinx()
@@ -704,7 +724,9 @@ def generate_macro_chart_image(
           lw=1.5,
           label=f'HYG ハイイールド債ETF ({hyg_c.iloc[-1]:.2f})',
       )
-      _style_macro_axis(ax3_r, 'HYG (Credit)', '#0f7f8a', 'upper right')
+      _style_macro_axis(
+          ax3_r, 'HYG (Credit)', '#0f7f8a', 'upper right', top_margin=0.22
+      )
 
     # Panel 4: SOX指数 (左軸) & 米10年債利回り (右軸)
     ax4 = axes[3]
@@ -718,7 +740,7 @@ def generate_macro_chart_image(
           lw=1.6,
           label=f'SOX 半導体指数 ({sox_c.iloc[-1]:.1f})',
       )
-    _style_macro_axis(ax4, 'SOX Index', '#1f77b4', 'upper left')
+    _style_macro_axis(ax4, 'SOX Index', '#1f77b4', 'upper left', top_margin=0.22)
 
     if not tnx_c.empty:
       ax4_r = ax4.twinx()
@@ -729,7 +751,9 @@ def generate_macro_chart_image(
           lw=1.5,
           label=f'米10年債利回り ({tnx_c.iloc[-1]:.2f}% / 最高: {tnx_h.max():.2f}%)',
       )
-      _style_macro_axis(ax4_r, 'US 10Y (%)', '#c51b8a', 'upper right')
+      _style_macro_axis(
+          ax4_r, 'US 10Y (%)', '#c51b8a', 'upper right', top_margin=0.22
+      )
 
     # Panel 5: 日経平均株価 & SMA25・TOPIX相対軌道 (左軸) + ドル円 (右軸)
     ax5 = axes[4]
@@ -790,7 +814,8 @@ def generate_macro_chart_image(
                 alpha=0.85,
                 label=f'TOPIX相対軌道 (対日経60日差:{rel_diff_pct:+.1f}%)',
             )
-    _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left', top_margin=0.24)
+    # 3行凡例ボックスと期間前半の高値プロット線が重ならないようtop_margin=0.36を確保
+    _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left', top_margin=0.36)
 
     if not usdjpy_c.empty:
       ax5_r = ax5.twinx()
@@ -801,7 +826,9 @@ def generate_macro_chart_image(
           lw=1.5,
           label=f'ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / 最高: {usdjpy_h.max():.2f}円)',
       )
-      _style_macro_axis(ax5_r, 'USD/JPY', '#2ca02c', 'upper right', top_margin=0.24)
+      _style_macro_axis(
+          ax5_r, 'USD/JPY', '#2ca02c', 'upper right', top_margin=0.36
+      )
 
     if common_start_date is not None and common_end_date is not None:
       x_pad_left = common_start_date - pd.Timedelta(days=1)
