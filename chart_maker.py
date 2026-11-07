@@ -5,6 +5,7 @@
 #            マクロ5段チャート共通開始日X軸同期・Y軸上部18%余白確保(凡例重なり防止) /
 #            改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
 #            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・線種分離＋極薄帯） /
+#            Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 /
 #            例外時Figure解放保護
 # ==============================================================================
 import os
@@ -656,7 +657,6 @@ def generate_macro_chart_image(
           lw=1.5,
           label=f'SKEW ブラックスワン指数 (終値: {skew_c.iloc[-1]:.1f}{_fmt_th_label(skew_warn, skew_alert)})',
       )
-      # 左軸VVIXの基準線（-- / :）と重なっても識別できるよう、寒色系＋異なる線種（-. / --）で描画
       if skew_warn is not None:
         ax2_r.axhline(skew_warn, color='#1f77b4', ls='-.', lw=0.85, alpha=0.75)
       if skew_alert is not None:
@@ -665,7 +665,7 @@ def generate_macro_chart_image(
         ax2_r.axhspan(skew_warn, skew_alert, color='#1f77b4', alpha=0.06)
       _style_macro_axis(ax2_r, 'CBOE SKEW', '#08519c', 'upper right')
 
-    # Panel 3: MOVE指数 (左軸・グリーン系) & HYG (右軸・ブラウン/ブロンズ系) 【債券・クレジット市場】
+    # Panel 3: MOVE指数 (左軸・グリーン系) & HYG (右軸・ティール系) 【債券・クレジット市場】
     ax3 = axes[2]
     move_c, move_h, move_warn, move_alert = _prep_series('^MOVE')
     hyg_c, _, _, _ = _prep_series('HYG')
@@ -724,7 +724,7 @@ def generate_macro_chart_image(
       )
       _style_macro_axis(ax4_r, 'US 10Y (%)', '#c51b8a', 'upper right')
 
-    # Panel 5: 日経平均株価 (左軸) & ドル円 (右軸)
+    # Panel 5: 日経平均株価 & SMA25・TOPIX相対軌道 (左軸) + ドル円 (右軸)
     ax5 = axes[4]
     n225_c, _, _, _ = _prep_series('^N225')
     usdjpy_c, usdjpy_h, _, _ = _prep_series('USDJPY=X')
@@ -736,6 +736,53 @@ def generate_macro_chart_image(
           lw=1.6,
           label=f'日経平均株価 ({int(round(n225_c.iloc[-1]))}円)',
       )
+      # 切り出し前の全期間データから25日移動平均線を算出し、左端24日分の欠損を防止
+      n225_df_raw = macro_df_dict.get('^N225')
+      if (
+          isinstance(n225_df_raw, pd.DataFrame)
+          and 'Close' in n225_df_raw.columns
+      ):
+        n225_all_c = n225_df_raw['Close'].dropna()
+        if len(n225_all_c) >= 25:
+          n225_sma25 = n225_all_c.rolling(25).mean().reindex(n225_c.index).dropna()
+          if not n225_sma25.empty:
+            last_sma25 = float(n225_sma25.iloc[-1])
+            dev_pct = (
+                (float(n225_c.iloc[-1]) - last_sma25) / last_sma25
+            ) * 100.0
+            ax5.plot(
+                n225_sma25.index,
+                n225_sma25.values,
+                color='#6a3d9a',
+                lw=1.15,
+                ls='--',
+                alpha=0.85,
+                label=f'日経SMA25 ({int(round(last_sma25))}円 | 乖離:{dev_pct:+.1f}%)',
+            )
+      # オプション：macro_df_dictに1306.T(TOPIX)が存在する場合は60日起点で左軸スケールへ正規化描画
+      topix_c, _, _, _ = _prep_series('1306.T')
+      if topix_c.empty:
+        topix_c, _, _, _ = _prep_series('^TOPX')
+      if not topix_c.empty:
+        common_t_idx = n225_c.index.intersection(topix_c.index)
+        if len(common_t_idx) >= 5:
+          base_n225 = float(n225_c.loc[common_t_idx[0]])
+          base_topix = float(topix_c.loc[common_t_idx[0]])
+          if base_topix > 0:
+            topix_norm = topix_c.loc[common_t_idx] * (base_n225 / base_topix)
+            rel_diff_pct = (
+                float(topix_norm.iloc[-1]) / float(n225_c.loc[common_t_idx[-1]])
+                - 1.0
+            ) * 100.0
+            ax5.plot(
+                topix_norm.index,
+                topix_norm.values,
+                color='#0072b2',
+                lw=1.0,
+                ls=':',
+                alpha=0.8,
+                label=f'TOPIX相対軌道 (対日経60日差:{rel_diff_pct:+.1f}%)',
+            )
     _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left')
 
     if not usdjpy_c.empty:
