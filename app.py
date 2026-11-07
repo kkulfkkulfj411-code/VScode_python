@@ -1,9 +1,10 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.4)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.6)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #            日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 /
-#            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応
+#            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応 /
+#            マクロ11指標(改定案A・日経SMA25・TOPIX相対軌道)連動プロンプト＆個別株対指数RS算出
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io
@@ -200,6 +201,70 @@ def _fallback_fast_mcap(stock, is_jp: bool) -> str:
   except Exception:
     pass
   return "N/A"
+
+
+def _build_relative_performance_line(
+    df_d: pd.DataFrame, macro_histories: dict, is_jp: bool
+) -> str:
+  """対象銘柄の5D/20D/60D騰落率と、主要ベンチマーク（日本株はN225・TOPIX、米国株はSOX）に対する超過リターンを算出する。"""
+  if df_d is None or df_d.empty or "Close" not in df_d.columns:
+    return ""
+  s_c = df_d["Close"].dropna()
+  if len(s_c) < 6:
+    return ""
+
+  def _calc_ret(series, days):
+    if series is not None and len(series) > days:
+      prev = float(series.iloc[-(days + 1)])
+      curr = float(series.iloc[-1])
+      if prev > 0:
+        return ((curr - prev) / prev) * 100.0
+    return None
+
+  r5 = _calc_ret(s_c, 5)
+  r20 = _calc_ret(s_c, 20)
+  r60 = _calc_ret(s_c, min(59, len(s_c) - 1))
+
+  def _fmt_r(v):
+    return f"{v:+.2f}%" if v is not None else "N/A"
+
+  base_str = f"銘柄騰落率: 5D={_fmt_r(r5)} / 20D={_fmt_r(r20)} / 60D={_fmt_r(r60)}"
+  if not isinstance(macro_histories, dict):
+    return base_str + "\n"
+
+  if is_jp:
+    n_df = macro_histories.get("^N225", pd.DataFrame())
+    t_df = macro_histories.get("1306.T", pd.DataFrame())
+    n_c = (
+        n_df["Close"].dropna()
+        if isinstance(n_df, pd.DataFrame) and "Close" in n_df.columns
+        else pd.Series(dtype=float)
+    )
+    t_c = (
+        t_df["Close"].dropna()
+        if isinstance(t_df, pd.DataFrame) and "Close" in t_df.columns
+        else pd.Series(dtype=float)
+    )
+    n20, t20 = _calc_ret(n_c, 20), _calc_ret(t_c, 20)
+    vs_parts = []
+    if r20 is not None and n20 is not None:
+      vs_parts.append(f"対日経225差(20D): {r20 - n20:+.2f}%")
+    if r20 is not None and t20 is not None:
+      vs_parts.append(f"対TOPIX[1306.T]差(20D): {r20 - t20:+.2f}%")
+    if vs_parts:
+      return f"{base_str} | {' / '.join(vs_parts)}\n"
+  else:
+    sox_df = macro_histories.get("^SOX", pd.DataFrame())
+    sox_c = (
+        sox_df["Close"].dropna()
+        if isinstance(sox_df, pd.DataFrame) and "Close" in sox_df.columns
+        else pd.Series(dtype=float)
+    )
+    sox20 = _calc_ret(sox_c, 20)
+    if r20 is not None and sox20 is not None:
+      return f"{base_str} | 対SOX指数差(20D): {r20 - sox20:+.2f}%\n"
+
+  return base_str + "\n"
 
 
 def build_us_extra_fundamentals(stock, info, close_price_num):
@@ -507,7 +572,7 @@ if generate_button and stock_code:
   ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
 
   with st.spinner(
-      "市場データ・マクロボラティリティ(252日自動補正)の取得とチャート画像4枚を生成中..."
+      "市場データ・マクロボラティリティ(11指標・252日自動補正)の取得とチャート画像4枚を生成中..."
   ):
     macro_text, macro_histories = get_macro_data_and_history()
     stock, df_w, df_d, df_h = get_fresh_ticker_and_history(
@@ -531,11 +596,24 @@ if generate_button and stock_code:
     if not df_h.empty and not df_d.empty:
       try:
         if df_h.index[-1].date() == df_d.index[-1].date():
-          d_close = df_d["Close"].iloc[-1]
+          d_close = float(df_d["Close"].iloc[-1])
           df_h.iloc[-1, df_h.columns.get_loc("Close")] = d_close
-          if d_close > df_h["High"].iloc[-1]:
+          today_h_bars = df_h[df_h.index.date == df_d.index[-1].date()]
+          max_intraday_h = max(
+              float(df_d["High"].iloc[-1]),
+              float(today_h_bars["High"].max()),
+              d_close,
+          )
+          min_intraday_l = min(
+              float(df_d["Low"].iloc[-1]),
+              float(today_h_bars["Low"].min()),
+              d_close,
+          )
+          df_d.iloc[-1, df_d.columns.get_loc("High")] = max_intraday_h
+          df_d.iloc[-1, df_d.columns.get_loc("Low")] = min_intraday_l
+          if d_close > float(df_h["High"].iloc[-1]):
             df_h.iloc[-1, df_h.columns.get_loc("High")] = d_close
-          if d_close < df_h["Low"].iloc[-1]:
+          if d_close < float(df_h["Low"].iloc[-1]):
             df_h.iloc[-1, df_h.columns.get_loc("Low")] = d_close
       except Exception:
         pass
@@ -572,6 +650,11 @@ if generate_button and stock_code:
     )
 
     latest_d = df_d.iloc[-1]
+    latest_date_str = (
+        df_d.index[-1].strftime("%Y-%m-%d")
+        if hasattr(df_d.index[-1], "strftime")
+        else str(df_d.index[-1])[:10]
+    )
     unit_str = "円" if is_jp else "ドル"
 
     open_price = format_price(latest_d.get("Open"), is_jp)
@@ -623,6 +706,7 @@ if generate_button and stock_code:
     )
 
     is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+    bar_status_tag = " [※ザラ場立会中・未確定足]" if is_intraday else ""
     vol_avg20 = df_d["Volume"].tail(20).mean()
     vol_ratio = (
         round(float(latest_d["Volume"]) / float(vol_avg20), 2)
@@ -648,6 +732,9 @@ if generate_button and stock_code:
     else:
       vol_ratio_str = f"{vol_ratio}倍"
 
+    rel_perf_line = _build_relative_performance_line(
+        df_d, macro_histories, is_jp
+    )
     sma_summary_text, recent_10d_table_text = build_technical_summary_text(
         df_d, is_jp, is_intraday=is_intraday
     )
@@ -790,8 +877,10 @@ if generate_button and stock_code:
         f" {div_str}{margin_str}{earnings_info_str}\n"
         f"{market_specific_section}"
         f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
-        f"[テクニカル基本値]\n最新営業日の四本値: 始値 {open_price} | 高値"
-        f" {high_price} | 安値 {low_price} | 終値 {close_price} {unit_str}\n"
+        f"[テクニカル基本値]\n最新営業日({latest_date_str})の四本値{bar_status_tag}:"
+        f" 始値 {open_price} | 高値 {high_price} | 安値 {low_price} |"
+        f" 終値 {close_price} {unit_str}\n"
+        f"{rel_perf_line}"
         f"期間別高安値: [直近5日] 高値 {recent_high_5d_lbl} / 安値"
         f" {recent_low_5d_lbl} | [直近20日] 高値 {recent_high_20d_lbl} / 安値"
         f" {recent_low_20d_lbl} | [直近60日] 高値 {recent_high_60d_lbl} / 安値"
@@ -864,6 +953,8 @@ if st.session_state.generated_data:
     search_focus = (
         f"・重点検索：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、"
         "次回決算日、配当権利月、日次信用残・機関空売り残高、TOPIX定期入替区分（不明時は『区分不明』と記載）\n"
+        "・マクロ5段チャート（改定案A：11指標）＆対指数RS統合評価：Panel2(VVIX×SKEW)のオプション警戒感、Panel3(MOVE×HYG)のクレジット歪み、"
+        "およびPanel5(日経平均＆日経SMA25＆TOPIX相対軌道[1306.T]×ドル円)から『値がさハイテク主導か内需・東証全体への資金流入か』を判定し、本銘柄の対日経・対TOPIX相対強弱と照合すること。\n"
         "・LSEGレポートPDF追加添付時：Q1/Q2単体の表面的な業績スコアと通期EPS予想修正トレンドの乖離（計上時期偏重の有無）、"
         "コンセンサス目標株価レンジ（最高・平均・最低）、対日経225ベータ・相関、過去10年月次リターン季節性を統合評価すること。"
     )
@@ -871,7 +962,8 @@ if st.session_state.generated_data:
     search_focus = (
         f"・重点検索：「{data['name']}（{data['stock_code']}）」の最新四半期決算"
         f"（英語クエリ `{data['stock_code']} earnings release guidance` 必須）、"
-        "次回Earnings Date、Form 13F/Form 4、Short Interest推移"
+        "次回Earnings Date、Form 13F/Form 4、Short Interest推移\n"
+        "・マクロ5段チャート（改定案A：11指標）統合評価：Panel1(VIX期間構造)、Panel2(VVIX×SKEW)、Panel3(MOVE×HYG)、Panel4(SOX×US10Y)の連動性と本銘柄の対指数相対強弱を照合すること。"
     )
 
   chat_prompt = (
@@ -908,6 +1000,6 @@ if st.session_state.generated_data:
 
   if charts.get("m"):
     st.markdown(
-        "**🌐 グローバルマクロ＆ボラティリティ統合チャート（直近60営業日・X軸完全同期）**"
+        "**🌐 グローバルマクロ＆ボラティリティ統合チャート（11指標・直近60営業日・X軸完全同期）**"
     )
     st.image(charts["m"], width="stretch")
