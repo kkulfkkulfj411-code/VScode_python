@@ -2,7 +2,7 @@
 # AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.5)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #            右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
-#            マクロ5段チャート共通開始日X軸同期・Y軸上部18%余白確保(凡例重なり防止) /
+#            マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部24%余白確保(凡例重なり防止) /
 #            改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
 #            VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・線種分離＋極薄帯） /
 #            Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 /
@@ -544,10 +544,12 @@ def generate_macro_chart_image(
         return f' | 動的基準:{warn_v:.1f}/{alert_v:.1f}'
       return f' | 80%基準:{warn_v:.1f}' if warn_v else ''
 
-    def _style_macro_axis(ax, ylabel_txt, color_code, loc_str, is_bold=True):
+    def _style_macro_axis(
+        ax, ylabel_txt, color_code, loc_str, is_bold=True, top_margin=0.18
+    ):
       y0, y1 = ax.get_ylim()
       if y1 > y0:
-        ax.set_ylim(y0, y1 + (y1 - y0) * 0.18)
+        ax.set_ylim(y0, y1 + (y1 - y0) * top_margin)
       ax.set_ylabel(
           ylabel_txt,
           color=color_code,
@@ -596,7 +598,7 @@ def generate_macro_chart_image(
           ls='--',
           label=f'VIX3M ({vix3m_c.iloc[-1]:.2f})',
       )
-    _style_macro_axis(ax1, 'VIX / VIX3M', 'black', 'upper left')
+    _style_macro_axis(ax1, 'VIX / VIX3M', 'black', 'upper left', top_margin=0.24)
 
     if not vix_c.empty and not vix3m_c.empty:
       common_idx = vix_c.index.intersection(vix3m_c.index)
@@ -614,7 +616,12 @@ def generate_macro_chart_image(
           )
           ax1_r.axhline(1.0, color='purple', ls=':', lw=1.0, alpha=0.8)
           _style_macro_axis(
-              ax1_r, 'Term Ratio', 'purple', 'upper right', is_bold=False
+              ax1_r,
+              'Term Ratio',
+              'purple',
+              'upper right',
+              is_bold=False,
+              top_margin=0.24,
           )
 
     ax1.set_title(
@@ -759,7 +766,7 @@ def generate_macro_chart_image(
                 alpha=0.85,
                 label=f'日経SMA25 ({int(round(last_sma25))}円 | 乖離:{dev_pct:+.1f}%)',
             )
-      # オプション：macro_df_dictに1306.T(TOPIX)が存在する場合は60日起点で左軸スケールへ正規化描画
+      # macro_df_dictの1306.T(TOPIX連動ETF)を60日起点で左軸スケールへ正規化描画
       topix_c, _, _, _ = _prep_series('1306.T')
       if topix_c.empty:
         topix_c, _, _, _ = _prep_series('^TOPX')
@@ -778,12 +785,12 @@ def generate_macro_chart_image(
                 topix_norm.index,
                 topix_norm.values,
                 color='#0072b2',
-                lw=1.0,
-                ls=':',
-                alpha=0.8,
+                lw=1.2,
+                ls='-.',
+                alpha=0.85,
                 label=f'TOPIX相対軌道 (対日経60日差:{rel_diff_pct:+.1f}%)',
             )
-    _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left')
+    _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left', top_margin=0.24)
 
     if not usdjpy_c.empty:
       ax5_r = ax5.twinx()
@@ -794,7 +801,7 @@ def generate_macro_chart_image(
           lw=1.5,
           label=f'ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / 最高: {usdjpy_h.max():.2f}円)',
       )
-      _style_macro_axis(ax5_r, 'USD/JPY', '#2ca02c', 'upper right')
+      _style_macro_axis(ax5_r, 'USD/JPY', '#2ca02c', 'upper right', top_margin=0.24)
 
     if common_start_date is not None and common_end_date is not None:
       x_pad_left = common_start_date - pd.Timedelta(days=1)

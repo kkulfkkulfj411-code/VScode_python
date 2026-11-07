@@ -1,9 +1,10 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.4)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.5)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
-#            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status)
+#            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
+#            マクロ11指標化(1306.T TOPIX追加・JST日付ズレ防止・対日経相対強弱サマリー算出)
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -252,12 +253,15 @@ def get_macro_data_and_history():
       ("^TNX", "US10Y (米10年債利回り)", 2, "%"),
       ("USDJPY=X", "USD/JPY (ドル円)", 2, "円"),
       ("^N225", "Nikkei225 (日経平均)", 0, "円"),
+      ("1306.T", "TOPIX連動ETF (1306.T)", 1, "円"),
   ]
 
   def _fetch_one(sym):
     try:
       target_tz = (
-          "Asia/Tokyo" if sym in ["^N225", "USDJPY=X"] else "America/New_York"
+          "Asia/Tokyo"
+          if (sym in ["^N225", "USDJPY=X", "1306.T"] or sym.endswith(".T"))
+          else "America/New_York"
       )
       df = yf.Ticker(sym).history(period="1y", interval="1d", auto_adjust=False)
       if not df.empty:
@@ -277,7 +281,7 @@ def get_macro_data_and_history():
       return sym, pd.DataFrame()
 
   histories = {}
-  with ThreadPoolExecutor(max_workers=10) as executor:
+  with ThreadPoolExecutor(max_workers=len(macro_specs)) as executor:
     for f in as_completed(
         [executor.submit(_fetch_one, s[0]) for s in macro_specs]
     ):
@@ -444,8 +448,39 @@ def get_macro_data_and_history():
         term_state = "🟢コンタンゴ(正常・平穏)"
       term_line = f"・VIX期間構造レシオ (VIX/VIX3M): {ratio} → {term_state}"
 
+  n225_df = histories.get("^N225", pd.DataFrame())
+  topix_df = histories.get("1306.T", pd.DataFrame())
+  jp_rel_line = ""
+  if not n225_df.empty and not topix_df.empty:
+    n_c = n225_df["Close"].dropna()
+    t_c = topix_df["Close"].dropna()
+    common_jp = n_c.index.intersection(t_c.index)
+    if len(common_jp) >= 21:
+      n_c, t_c = n_c.loc[common_jp], t_c.loc[common_jp]
+
+      def _rel_spread(days):
+        if len(common_jp) > days:
+          n_ret = (n_c.iloc[-1] / n_c.iloc[-(days + 1)] - 1.0) * 100.0
+          t_ret = (t_c.iloc[-1] / t_c.iloc[-(days + 1)] - 1.0) * 100.0
+          return t_ret - n_ret
+        return 0.0
+
+      sp5 = _rel_spread(5)
+      sp20 = _rel_spread(20)
+      sp60 = _rel_spread(min(59, len(common_jp) - 1))
+      if sp20 >= 1.0:
+        jp_rot = "🔵TOPIX優位(内需・バリュー・東証全体への広範な資金流入)"
+      elif sp20 <= -1.0:
+        jp_rot = "🟣日経平均優位(半導体・値がさハイテク主導の指数牽引)"
+      else:
+        jp_rot = "⚪日経・TOPIX拮抗(セクター偏重なし)"
+      jp_rel_line = (
+          "\n・日本株インデックス相対強弱 (TOPIX[1306.T] - Nikkei225 騰落率差): "
+          f"5D={sp5:+.2f}% / 20D={sp20:+.2f}% / 60D={sp60:+.2f}% → {jp_rot}"
+      )
+
   macro_text = (
-      f"・CNN Fear & Greed Index: {fg_str}\n{term_line}\n\n"
+      f"・CNN Fear & Greed Index: {fg_str}\n{term_line}{jp_rel_line}\n\n"
       "[グローバルマクロ＆ボラティリティ時系列マトリクス（瞬間高安値・Zスコア・252日動的基準補正付）]\n"
       + "\n".join(rows)
   )
