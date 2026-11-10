@@ -1,11 +1,12 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.7)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.8)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
-#            マクロ13指標化(1306.T TOPIX・WTI原油[CL=F]・金先物[GC=F]追加・JST日付ズレ防止) /
-#            リアルタイム世界情勢・日米金融政策・日本の国策RSS独立取得(get_macro_policy_news)
+#            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
+#            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ除外 /
+#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定(区分不明の根絶)
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,6 +14,7 @@ import datetime
 from datetime import date, time as dt_time, timedelta, timezone
 import difflib
 import html
+import io
 import re
 import time
 import urllib.parse
@@ -48,7 +50,7 @@ def _http_get_html(url: str, timeout: int = 8) -> str:
           impersonate="chrome",
           timeout=timeout,
       )
-      if res.status_code == 200 and len(res.content) > 500:
+      if res.status_code == 200 and len(res.content) > 200:
         return res.content.decode("utf-8", errors="ignore")
     except Exception:
       pass
@@ -63,7 +65,7 @@ def _http_get_html(url: str, timeout: int = 8) -> str:
   }
   try:
     res = requests.get(url, headers=headers, timeout=timeout)
-    if res.status_code == 200 and len(res.content) > 500:
+    if res.status_code == 200 and len(res.content) > 200:
       return res.content.decode("utf-8", errors="ignore")
   except Exception:
     pass
@@ -240,6 +242,65 @@ MACRO_HARD_CAPS = {
     "^MOVE": 135.0,
 }
 
+CBOE_CSV_URLS = {
+    "^VIX": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+    "^VIX3M": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv",
+    "^VVIX": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv",
+    "^SKEW": "https://cdn.cboe.com/api/global/us_indices/daily_prices/SKEW_History.csv",
+}
+
+
+def _fetch_cboe_csv_fallback(sym: str) -> pd.DataFrame:
+  """yfinanceでCBOE指数(^VIX3M, ^VIX, ^VVIX, ^SKEW)が取得失敗・欠損した際、CBOE公式CDNの一次ソースCSVから直近約1年分(265営業日)を直接取得する。"""
+  url = CBOE_CSV_URLS.get(sym)
+  if not url:
+    return pd.DataFrame()
+  try:
+    csv_text = _http_get_html(url, timeout=8)
+    if not csv_text or "DATE" not in csv_text.upper():
+      return pd.DataFrame()
+    raw_df = pd.read_csv(io.StringIO(csv_text))
+    if raw_df.empty:
+      return pd.DataFrame()
+
+    col_map = {str(c).strip().upper(): c for c in raw_df.columns}
+    date_col = col_map.get("DATE")
+    if not date_col:
+      return pd.DataFrame()
+
+    raw_df["Date"] = pd.to_datetime(raw_df[date_col], errors="coerce")
+    raw_df = raw_df.dropna(subset=["Date"]).set_index("Date").sort_index()
+    raw_df.index = raw_df.index.normalize()
+    raw_df = raw_df[~raw_df.index.duplicated(keep="last")]
+
+    clean_sym = sym.lstrip("^").upper()
+    close_col = (
+        col_map.get("CLOSE")
+        or col_map.get(clean_sym)
+        or (raw_df.columns[-1] if len(raw_df.columns) >= 1 else None)
+    )
+    if not close_col:
+      return pd.DataFrame()
+
+    out = pd.DataFrame(index=raw_df.index)
+    out["Close"] = pd.to_numeric(raw_df[close_col], errors="coerce")
+    for target_c, cand_k in [
+        ("Open", "OPEN"),
+        ("High", "HIGH"),
+        ("Low", "LOW"),
+    ]:
+      if cand_k in col_map:
+        out[target_c] = pd.to_numeric(
+            raw_df[col_map[cand_k]], errors="coerce"
+        ).fillna(out["Close"])
+      else:
+        out[target_c] = out["Close"]
+
+    out = out.dropna(subset=["Close"]).tail(265)
+    return out
+  except Exception:
+    return pd.DataFrame()
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_macro_data_and_history():
@@ -259,32 +320,70 @@ def get_macro_data_and_history():
       ("1306.T", "TOPIX連動ETF (1306.T)", 1, "円"),
   ]
 
+  def _normalize_yf_df(df: pd.DataFrame, target_tz: str) -> pd.DataFrame:
+    if df is None or df.empty:
+      return pd.DataFrame()
+    if "Repaired?" in df.columns:
+      df = df.drop(columns=["Repaired?"])
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+      try:
+        df.index = df.index.tz_convert(target_tz).tz_localize(None)
+      except Exception:
+        df.index = df.index.tz_localize(None)
+    df.index = df.index.normalize()
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df.dropna(subset=["Close"])
+
   def _fetch_one(sym):
-    try:
-      target_tz = (
-          "Asia/Tokyo"
-          if (sym in ["^N225", "USDJPY=X", "1306.T"] or sym.endswith(".T"))
-          else "America/New_York"
-      )
-      df = yf.Ticker(sym).history(period="1y", interval="1d", auto_adjust=False)
-      if not df.empty:
-        if "Repaired?" in df.columns:
-          df = df.drop(columns=["Repaired?"])
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
-          try:
-            df.index = df.index.tz_convert(target_tz).tz_localize(None)
-          except Exception:
-            df.index = df.index.tz_localize(None)
-        df.index = df.index.normalize()
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        df = df.dropna(subset=["Close"])
-      return sym, df
-    except Exception:
-      return sym, pd.DataFrame()
+    target_tz = (
+        "Asia/Tokyo"
+        if (sym in ["^N225", "USDJPY=X", "1306.T"] or sym.endswith(".T"))
+        else "America/New_York"
+    )
+    df = pd.DataFrame()
+
+    # 1. yfinance 標準取得 + リトライ / 代替シンボル試行
+    alt_tickers = [sym]
+    if sym == "^VIX3M":
+      alt_tickers.append("^VXV")
+
+    for t_sym in alt_tickers:
+      for period_try in ["1y", "6mo"]:
+        try:
+          raw = yf.Ticker(t_sym).history(
+              period=period_try, interval="1d", auto_adjust=False
+          )
+          df = _normalize_yf_df(raw, target_tz)
+          if not df.empty and len(df) >= 30:
+            break
+        except Exception:
+          pass
+        time.sleep(0.25)
+      if not df.empty and len(df) >= 30:
+        break
+
+    # 2. CBOE指数(^VIX3M, ^VIX, ^VVIX, ^SKEW)のCBOE公式CDN CSV直接補完
+    if sym in CBOE_CSV_URLS:
+      need_cboe = df.empty or len(df) < 60
+      if not need_cboe:
+        # 直近営業日が7日以上古い場合もCBOE公式CSVで補完・マージする
+        days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days
+        if days_lag > 7:
+          need_cboe = True
+      if need_cboe:
+        cboe_df = _fetch_cboe_csv_fallback(sym)
+        if not cboe_df.empty:
+          if df.empty:
+            df = cboe_df
+          else:
+            combined = pd.concat([cboe_df, df])
+            df = combined[~combined.index.duplicated(keep="last")].sort_index()
+
+    return sym, df
 
   histories = {}
-  with ThreadPoolExecutor(max_workers=len(macro_specs)) as executor:
+  with ThreadPoolExecutor(max_workers=6) as executor:
     for f in as_completed(
         [executor.submit(_fetch_one, s[0]) for s in macro_specs]
     ):
@@ -312,7 +411,7 @@ def get_macro_data_and_history():
     q90 = float(win252.quantile(0.90))
     q20 = float(win252.quantile(0.20))
 
-    if sym in ["^VIX", "^VVIX", "^SKEW", "^MOVE"]:
+    if sym in ["^VIX", "^VIX3M", "^VVIX", "^SKEW", "^MOVE"]:
       hard_cap = MACRO_HARD_CAPS.get(sym, float("inf"))
       warn_th = min(q80, hard_cap * 0.92)
       alert_th = min(max(q90, warn_th + 0.1), hard_cap)
@@ -322,7 +421,7 @@ def get_macro_data_and_history():
       if curr >= hard_cap:
         status = f"🔴絶対警戒圏(上限{hard_cap:g}突破)"
       elif curr >= alert_th and z_v >= 1.0:
-        if sym == "^VIX":
+        if sym in ["^VIX", "^VIX3M"]:
           status = (
               f"🔴パニック圏({th_label})"
               if diff_1d > 0
@@ -449,7 +548,7 @@ def get_macro_data_and_history():
         term_state = "🟠フラット化進行(0.92超：短期ヘッジ需要増加)"
       else:
         term_state = "🟢コンタンゴ(正常・平穏)"
-      term_line = f"・VIX期間構造レシオ (VIX/VIX3M): {ratio} → {term_state}"
+      term_line = f"\n・VIX期間構造レシオ (VIX/VIX3M): {ratio} → {term_state}"
 
   n225_df = histories.get("^N225", pd.DataFrame())
   topix_df = histories.get("1306.T", pd.DataFrame())
@@ -483,7 +582,7 @@ def get_macro_data_and_history():
       )
 
   macro_text = (
-      f"・CNN Fear & Greed Index: {fg_str}\n{term_line}{jp_rel_line}\n\n"
+      f"・CNN Fear & Greed Index: {fg_str}{term_line}{jp_rel_line}\n\n"
       "[グローバルマクロ＆ボラティリティ時系列マトリクス（13指標・瞬間高安値・Zスコア・252日動的基準補正付）]\n"
       + "\n".join(rows)
   )
@@ -498,20 +597,82 @@ def get_macro_data():
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_macro_policy_news() -> str:
-  """Google News RSSから①世界情勢・米金融/通商政策、②日本の政策・日銀動向・国策の最新ヘッドラインを並列取得し重複除去して返す。"""
+  """Google News RSSから4カテゴリ独立でヘッドラインを取得し、ゴシップ・一般事故を除外、経済メディア優先ソート＆出典メディア名を明記して返す。"""
   queries = [
       (
-          "🌍[世界情勢・米政策]",
-          "(FOMC OR FRB OR 米関税 OR 対中規制 OR 地政学リスク OR 中東情勢 OR 台湾 OR 米雇用統計 OR 米CPI) when:7d",
-          "(FOMC OR FRB OR 米関税 OR 対中規制 OR 地政学リスク OR 米雇用統計 OR 米CPI)",
-          5,
+          "🇺🇸[米金融政策・米マクロ]",
+          "(FOMC OR FRB OR パウエル OR 米利下げ OR 米利上げ OR 米雇用統計 OR 米CPI OR 米長期金利) when:7d",
+          "(FOMC OR FRB OR 米雇用統計 OR 米CPI OR 米長期金利)",
+          3,
       ),
       (
-          "🇯🇵[日本政策・日銀・国策]",
-          "(日銀 決定会合 OR 日銀 利上げ OR 為替介入 OR 国策 OR 防衛省 OR 半導体 補助金 OR GX OR 経済安保 OR 補正予算 OR 税制改正) when:7d",
-          "(日銀 金融政策 OR 為替介入 OR 国策 半導体 OR 防衛費 OR 経済安保 OR 補正予算)",
-          5,
+          "🌍[世界情勢・通商・地政学]",
+          "(米関税 OR トランプ関税 OR 対中規制 OR 半導体規制 OR 台湾海峡 OR 中東情勢 OR 原油先物 OR 地政学リスク) -火災 -事故 -芸能 when:7d",
+          "(米関税 OR 対中規制 OR 半導体規制 OR 地政学リスク) -火災 -事故",
+          3,
       ),
+      (
+          "🏦[日銀政策・為替・国内金利]",
+          "(日銀 決定会合 OR 日銀 利上げ OR 植田総裁 OR 為替介入 OR 円安 日銀 OR 長期金利 日銀) when:7d",
+          "(日銀 金融政策 OR 植田総裁 OR 為替介入 OR 長期金利)",
+          3,
+      ),
+      (
+          "🇯🇵[日本の国策・産業政策]",
+          "(半導体 補助金 OR ラピダス OR 防衛省 OR 防衛費 OR GX 投資 OR 経済安保 OR 補正予算 OR 税制改正) -火災 -事故 when:7d",
+          "(国策 半導体 OR 防衛費 OR 経済安保 OR 補正予算 OR 税制改正)",
+          3,
+      ),
+  ]
+
+  blacklist_sources = [
+      "デイリー新潮",
+      "文春オンライン",
+      "週刊文春",
+      "週刊新潮",
+      "日刊ゲンダイ",
+      "東スポ",
+      "女性自身",
+      "女性セブン",
+      "ポストセブン",
+      "アサ芸",
+      "まいじつ",
+      "スポーツ報知",
+      "日刊スポーツ",
+      "スポニチ",
+      "サンスポ",
+      "デイリースポーツ",
+  ]
+  blacklist_words = [
+      "火災で",
+      "工場で火災",
+      "行方不明",
+      "交通事故",
+      "逮捕",
+      "不倫",
+      "芸能",
+  ]
+  preferred_sources = [
+      "日本経済新聞",
+      "日経",
+      "Reuters",
+      "ロイター",
+      "Bloomberg",
+      "ブルームバーグ",
+      "株探",
+      "Kabutan",
+      "みんかぶ",
+      "四季報",
+      "東洋経済",
+      "ダイヤモンド",
+      "ウエルスアドバイザー",
+      "時事通信",
+      "共同通信",
+      "NHK",
+      "テレビ東京",
+      "テレ東",
+      "野村證券",
+      "大和証券",
   ]
 
   def _fetch_category_rss(tag: str, q_recent: str, q_fallback: str, limit: int):
@@ -530,52 +691,85 @@ def get_macro_policy_news() -> str:
         except Exception:
           return []
 
-      extracted = []
-      for entry in getattr(feed, "entries", [])[: limit + 3]:
+      candidates = []
+      for entry in getattr(feed, "entries", [])[: limit + 10]:
         raw_title = getattr(entry, "title", "")
-        title = raw_title.split(" - ")[0].strip()
+        if not raw_title:
+          continue
+        parts = raw_title.rsplit(" - ", 1)
+        title = parts[0].strip()
+        src_from_title = parts[1].strip() if len(parts) > 1 else ""
+        src_obj = entry.get("source")
+        src_name = (
+            (src_obj.get("title") if isinstance(src_obj, dict) else "")
+            or src_from_title
+            or "ニュース配信"
+        ).strip()
+
         if not title:
           continue
+        if any(bs in src_name or bs in raw_title for bs in blacklist_sources):
+          continue
+        if any(bw in title for bw in blacklist_words):
+          continue
+
         pub = entry.get("published", "")[:16]
-        desc = html.unescape(
-            re.sub(r"<[^>]+>", "", entry.get("description", ""))
-        )
-        desc_clean = re.sub(r"\s+", " ", desc).strip()
-        if title in desc_clean:
-          desc_clean = desc_clean.replace(title, "").strip(" ・-—")
-        if len(desc_clean) > 95:
-          desc_clean = desc_clean[:95] + "..."
-        line = f"・{tag} {title} ({pub})"
-        if desc_clean and len(desc_clean) > 10:
-          line += f"\n  概要: {desc_clean}"
-        extracted.append((title, line))
-      return extracted
+        is_pref = any(ps in src_name or ps in raw_title for ps in preferred_sources)
+        line = f"・{tag} {title} [出典: {src_name}] ({pub})"
+        candidates.append((0 if is_pref else 1, title, line))
+
+      # 経済専門メディアを優先しつつ元の新着順を維持
+      candidates.sort(key=lambda x: x[0])
+      return [(t, l) for _, t, l in candidates]
 
     items = _parse_query(q_recent)
     if not items:
       items = _parse_query(q_fallback)
-    return items[:limit]
+    return items[: limit + 2]
 
   results_by_idx = {}
-  with ThreadPoolExecutor(max_workers=2) as executor:
+  with ThreadPoolExecutor(max_workers=4) as executor:
     future_map = {
-        executor.submit(_fetch_category_rss, tag, qr, qf, lim): idx
+        executor.submit(_fetch_category_rss, tag, qr, qf, lim): (idx, lim)
         for idx, (tag, qr, qf, lim) in enumerate(queries)
     }
     for f in as_completed(future_map):
-      idx = future_map[f]
+      idx, lim = future_map[f]
       try:
-        results_by_idx[idx] = f.result()
+        results_by_idx[idx] = (f.result(), lim)
       except Exception:
-        results_by_idx[idx] = []
+        results_by_idx[idx] = ([], lim)
 
-  unique_lines, seen_keys = [], set()
+  unique_lines, seen_titles = [], []
+
+  def _is_duplicate_topic(new_title: str) -> bool:
+    norm_new = re.sub(r"[\s ・、。「」『』（）()【】\[\]―-]+", "", new_title)
+    for old_t in seen_titles:
+      if norm_new[:14] == old_t[:14]:
+        return True
+      if difflib.SequenceMatcher(None, norm_new, old_t).ratio() >= 0.52:
+        return True
+      # 同一イベント記事（例：「日銀」＋「主な意見」）の重複ブロック
+      if (
+          "日銀" in norm_new
+          and "日銀" in old_t
+          and "主な意見" in norm_new
+          and "主な意見" in old_t
+      ):
+        return True
+    return False
+
   for idx in sorted(results_by_idx.keys()):
-    for title, line in results_by_idx[idx]:
-      norm_key = re.sub(r"[\s ・、。「」『』（）()【】\[\]]+", "", title)[:18]
-      if norm_key and norm_key not in seen_keys:
-        seen_keys.add(norm_key)
+    cand_list, lim = results_by_idx[idx]
+    cat_count = 0
+    for title, line in cand_list:
+      if not _is_duplicate_topic(title):
+        norm_t = re.sub(r"[\s ・、。「」『』（）()【】\[\]―-]+", "", title)
+        seen_titles.append(norm_t)
         unique_lines.append(line)
+        cat_count += 1
+        if cat_count >= lim:
+          break
 
   return (
       "\n".join(unique_lines)
@@ -1000,7 +1194,17 @@ def get_news(company_name, is_jp, edinet_reasons=None):
     try:
       feed = feedparser.parse(url)
       for entry in feed.entries[:limit]:
-        title = entry.title.split(" - ")[0]
+        raw_title = getattr(entry, "title", "")
+        parts = raw_title.rsplit(" - ", 1)
+        title = parts[0].strip()
+        src_from_title = parts[1].strip() if len(parts) > 1 else ""
+        src_obj = entry.get("source")
+        src_name = (
+            (src_obj.get("title") if isinstance(src_obj, dict) else "")
+            or src_from_title
+            or "ニュース配信"
+        ).strip()
+
         if filter_jp and not (
             company_name in title
             or any(
@@ -1020,13 +1224,9 @@ def get_news(company_name, is_jp, edinet_reasons=None):
         ):
           continue
         pub = entry.get("published", "")[:16]
-        desc = html.unescape(
-            re.sub(r"<[^>]+>", "", entry.get("description", ""))
+        items.append(
+            f"■ {prefix}{title} [出典: {src_name}] ({pub})"
         )
-        desc_clean = re.sub(r"\s+", " ", desc).strip()
-        if len(desc_clean) > 120:
-          desc_clean = desc_clean[:120] + "..."
-        items.append(f"■ {prefix}{title} ({pub})\n   概要: {desc_clean}")
     except Exception:
       pass
     return items
@@ -1061,7 +1261,7 @@ def get_news(company_name, is_jp, edinet_reasons=None):
 
   unique_news, seen_titles = [], set()
   for item in news_list:
-    t = item.split("\n")[0]
+    t = item.split(" [出典:")[0]
     if t not in seen_titles:
       seen_titles.add(t)
       unique_news.append(item)
@@ -1130,12 +1330,86 @@ def _estimate_next_earnings_period(announce_date_str: str) -> str:
   return ""
 
 
+def _normalize_jp_market_segment(raw_market: str) -> str:
+  """株探・Yahoo!・日経等の市場表記を『東証プライム』『東証スタンダード』『東証グロース』等に正規化する。"""
+  if not raw_market:
+    return ""
+  s = str(raw_market).strip()
+  if any(k in s for k in ["東証Ｐ", "東証P", "プライム", "PRM", "Prime"]):
+    return "東証プライム"
+  if any(k in s for k in ["東証Ｓ", "東証S", "スタンダード", "STD", "Standard"]):
+    return "東証スタンダード"
+  if any(k in s for k in ["東証Ｇ", "東証G", "グロース", "GRT", "Growth"]):
+    return "東証グロース"
+  if "名証" in s:
+    return "名証"
+  if "札証" in s:
+    return "札証"
+  if "福証" in s:
+    return "福証"
+  return ""
+
+
+def evaluate_topix_passive_status(market_seg: str, market_cap_str: str) -> str:
+  """上場市場区分と時価総額(億円)から、JPXのTOPIX第2段階見直し基準に基づくパッシブ需給区分を5段階で自動定量判定する。"""
+  seg_label = market_seg if market_seg and market_seg != "N/A" else "東証上場(詳細区分要確認)"
+  mcap_oku = None
+  if market_cap_str and market_cap_str != "N/A":
+    m = re.search(r"([0-9,]+(?:\.[0-9]+)?)", str(market_cap_str))
+    if m:
+      try:
+        mcap_oku = float(m.group(1).replace(",", ""))
+      except Exception:
+        mcap_oku = None
+
+  if mcap_oku is None:
+    return f"上場市場: {seg_label} | TOPIXパッシブ需給区分: 時価総額取得不可のため要検索確認"
+
+  is_regional_only = seg_label in ["名証", "札証", "福証"]
+  if is_regional_only:
+    return (
+        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+        "⚪TOPIX非構成銘柄圏（地方単独上場・TOPIXパッシブ需給影響なし）"
+    )
+
+  if mcap_oku >= 500.0:
+    return (
+        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+        f"🟢TOPIX中核・継続採用圏（時価総額{mcap_oku:,.1f}億円：500億円超の主力銘柄・段階的ウエイト低減リスクなし）"
+    )
+  if mcap_oku >= 250.0:
+    if "プライム" in seg_label:
+      return (
+          f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+          f"🔵TOPIX継続採用圏（時価総額{mcap_oku:,.1f}億円：浮動株比率が極端に低くない限り継続採用圏）"
+      )
+    return (
+        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+        f"🔵TOPIX第2段階・新規採用候補/継続採用圏（時価総額{mcap_oku:,.1f}億円：250億円以上のため新規採用基準候補圏・要検索確認）"
+    )
+  if mcap_oku >= 100.0:
+    return (
+        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+        f"🟡TOPIX第2段階入替・境界圏（時価総額{mcap_oku:,.1f}億円：浮動株時価総額100億円基準の当落線上・1/4/7/10月末リバランス影響は要検索確認）"
+    )
+
+  if "プライム" in seg_label:
+    return (
+        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+        f"🟠段階的ウエイト低減警戒圏（時価総額{mcap_oku:,.1f}億円：100億円未満のため2026年10月〜2028年7月の四半期ごと8段階ウエイト低減対象の可能性大）"
+    )
+  return (
+      f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
+      f"⚪TOPIX非構成銘柄圏（時価総額{mcap_oku:,.1f}億円：100億円未満のスタンダード/グロース銘柄・パッシブ需給影響軽微）"
+  )
+
+
 def get_japanese_fundamentals(stock_code):
-  """日本株ファンダメンタルズを5段階フォールバック（株探 → Yahoo!日本版 → 日経電子版 → みんかぶ → EDINET CSV）で取得する。"""
+  """日本株ファンダメンタルズ（上場市場区分含む）を5段階フォールバック（株探 → Yahoo!日本版 → 日経電子版 → みんかぶ → EDINET CSV）で取得する。"""
   cache_key = f"fund_cache_{stock_code}"
   if cache_key in st.session_state:
     cached_val, cached_ts = st.session_state[cache_key]
-    if time.time() - cached_ts < 3600:
+    if time.time() - cached_ts < 3600 and cached_val.get("market_segment"):
       return cached_val
 
   result = {
@@ -1145,6 +1419,7 @@ def get_japanese_fundamentals(stock_code):
       "margin": "N/A",
       "market_cap": "N/A",
       "earnings_date": "要検索確認",
+      "market_segment": "N/A",
   }
 
   def _clean_num(raw_str):
@@ -1170,6 +1445,19 @@ def get_japanese_fundamentals(stock_code):
     if html_text:
       soup = BeautifulSoup(html_text, "html.parser")
       page_txt = soup.get_text(" ", strip=True)
+
+      mkt_span = soup.find("span", class_="market")
+      if mkt_span:
+        norm_m = _normalize_jp_market_segment(mkt_span.get_text(strip=True))
+        if norm_m:
+          result["market_segment"] = norm_m
+      if result["market_segment"] == "N/A":
+        m_mkt = re.search(r"(東証[ＰＳＧPSG]|東証プライム|東証スタンダード|東証グロース|名証[ＰＭＮ]?|札証|福証)", page_txt)
+        if m_mkt:
+          norm_m = _normalize_jp_market_segment(m_mkt.group(1))
+          if norm_m:
+            result["market_segment"] = norm_m
+
       info_div = soup.find("div", id="stockinfo_i3")
       if info_div:
         tds = [td.get_text(strip=True) for td in info_div.find_all("td")]
@@ -1209,7 +1497,10 @@ def get_japanese_fundamentals(stock_code):
 
   # 2. Yahoo!ファイナンス日本版
   if (
-      any(result[k] == "N/A" for k in ["per", "pbr", "div", "margin", "market_cap"])
+      any(
+          result[k] == "N/A"
+          for k in ["per", "pbr", "div", "margin", "market_cap", "market_segment"]
+      )
       or result["earnings_date"] == "要検索確認"
   ):
     try:
@@ -1220,6 +1511,13 @@ def get_japanese_fundamentals(stock_code):
         full_txt = BeautifulSoup(yh_html, "html.parser").get_text(
             " ", strip=True
         )
+        if result["market_segment"] == "N/A":
+          m_ym = re.search(
+              r"(東証プライム|東証スタンダード|東証グロース|東証PRM|東証STD|東証GRT)",
+              full_txt,
+          )
+          if m_ym:
+            result["market_segment"] = _normalize_jp_market_segment(m_ym.group(1))
         if result["margin"] == "N/A":
           v = _extract_regex(
               r"信用倍率.{0,20}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍", full_txt
@@ -1283,13 +1581,17 @@ def get_japanese_fundamentals(stock_code):
       pass
 
   # 3. 日経電子版 (nikkei.com)
-  if any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap"]):
+  if any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap", "market_segment"]):
     try:
       nk_html = _http_get_html(
           f"https://www.nikkei.com/nkd/company/?scode={stock_code}", timeout=8
       )
       if nk_html:
         nk_txt = BeautifulSoup(nk_html, "html.parser").get_text(" ", strip=True)
+        if result["market_segment"] == "N/A":
+          m_nk = re.search(r"(東証プライム|東証スタンダード|東証グロース)", nk_txt)
+          if m_nk:
+            result["market_segment"] = m_nk.group(1)
         if result["per"] == "N/A":
           v = _extract_regex(r"予想PER.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", nk_txt)
           if v:
@@ -1314,13 +1616,17 @@ def get_japanese_fundamentals(stock_code):
       pass
 
   # 4. みんかぶ (minkabu.jp)
-  if any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap"]):
+  if any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap", "market_segment"]):
     try:
       mk_html = _http_get_html(
           f"https://minkabu.jp/stock/{stock_code}", timeout=8
       )
       if mk_html:
         mk_txt = BeautifulSoup(mk_html, "html.parser").get_text(" ", strip=True)
+        if result["market_segment"] == "N/A":
+          m_mk = re.search(r"(東証プライム|東証スタンダード|東証グロース)", mk_txt)
+          if m_mk:
+            result["market_segment"] = m_mk.group(1)
         if result["per"] == "N/A":
           v = _extract_regex(
               r"PER\s*(?:\(調整後\))?.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍",

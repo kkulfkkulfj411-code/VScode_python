@@ -1,11 +1,12 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.7)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.8)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #            日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 /
 #            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応 /
-#            マクロ13指標表(WTI原油・金先物追加)＆マクロ5段チャート(11指標)連動 /
-#            世界情勢・日米金融政策・日本の国策RSS統合 ＆ 15営業日重要イベント地雷原検索指示
+#            マクロ13指標表(WTI原油・金先物＋CBOE公式CSV補完)＆マクロ5段チャート(11指標)連動 /
+#            世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合 ＆ 15営業日イベント検索指示 /
+#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定([上場市場・TOPIXパッシブ需給区分]出力・区分不明の根絶)
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io
@@ -20,6 +21,7 @@ from chart_maker import (
 )
 from data_fetcher import (
     check_edinet_api_status,
+    evaluate_topix_passive_status,
     get_edinet_documents,
     get_japanese_fundamentals,
     get_japanese_name,
@@ -750,9 +752,11 @@ if generate_button and stock_code:
 
     yf_earn_str = _extract_yf_earnings_date(stock)
     us_extra_section = ""
+    market_seg = "N/A"
 
     if is_jp:
       fund_data = get_japanese_fundamentals(stock_code)
+      market_seg = fund_data.get("market_segment", "N/A")
       if fund_data.get("per") and fund_data["per"] != "N/A":
         per_str = (
             f"{fund_data['per']}倍"
@@ -861,24 +865,37 @@ if generate_button and stock_code:
       market_cap_str = _fallback_fast_mcap(stock, is_jp)
 
     if is_jp:
+      # ※fast_infoによる時価総額最終補完の「後」にTOPIXパッシブ需給区分を5段階定量判定する
+      topix_passive_str = evaluate_topix_passive_status(
+          market_seg, market_cap_str
+      )
+      topix_section = f"[上場市場・TOPIXパッシブ需給区分]\n{topix_passive_str}\n"
       edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
       news_str = get_news(name, True, edinet_reasons)
       edinet_section = f"[EDINET 公式開示情報 / 有報財務データ]\n{edinet_str}\n"
       market_specific_section = get_sbi_order_limit_dates()
+      market_header_label = (
+          f"日本株（{market_seg}）"
+          if market_seg and market_seg != "N/A"
+          else "日本株"
+      )
     else:
+      topix_section = ""
       news_str = get_news(name, False)
       edinet_section = ""
       market_specific_section = us_extra_section
+      market_header_label = "米国株"
 
     full_text_data = (
         f"【分析対象銘柄：{name}（{stock_code} / {ticker}）】\n\n"
         f"【グローバルマクロ＆ボラティリティ参考値】\n{macro_text}\n\n"
         f"[リアルタイム世界情勢・日米金融政策・日本の国策ヘッドライン]\n{macro_policy_news_str}\n\n"
         f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分:"
-        f" {'日本株' if is_jp else '米国株'}】 ---\n"
+        f" {market_header_label}】 ---\n"
         f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per_str}"
         f" | PBR: {pbr_str} | 配当利回り:"
         f" {div_str}{margin_str}{earnings_info_str}\n"
+        f"{topix_section}"
         f"{market_specific_section}"
         f"[直近ニュース・話題・アナリスト動向]\n{news_str}\n{edinet_section}"
         f"[テクニカル基本値]\n最新営業日({latest_date_str})の四本値{bar_status_tag}:"
@@ -956,7 +973,8 @@ if st.session_state.generated_data:
   if data.get("is_jp", True):
     search_focus = (
         f"・重点検索①（企業・需給）：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、"
-        "次回決算日、配当権利月、日次信用残・機関空売り残高、TOPIX定期入替区分（不明時は『区分不明』と記載）\n"
+        "次回決算日、配当権利月、日次信用残・機関空売り残高、および提供データ内『[上場市場・TOPIXパッシブ需給区分]』の5段階定量判定に基づくパッシブ需給影響"
+        "（安易に『区分不明』とせず、時価総額100〜300億円程度の境界圏や段階的ウエイト低減警戒圏・新規採用候補圏の場合はJPX第2段階見直し［1・4・7・10月末リバランス］該当有無を検索確認）\n"
         "・重点検索②（向こう15営業日の日米重要イベント地雷原＆国策織り込み検証）：発注日から15営業日以内の日米重要イベント日程"
         "（日銀金融政策決定会合・FOMC・米雇用統計・米CPI・日米SQ日・主要選挙/政治日程）を必ずGoogle検索で特定し、"
         "イベント通過時のギャップダウン被弾を防ぐため決済タイムリミット（イベント前営業日の後場撤退）または見送り判断に反映すること。"
