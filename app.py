@@ -1,12 +1,13 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.8)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #            日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 /
 #            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応 /
 #            マクロ13指標表(WTI原油・金先物＋CBOE公式CSV補完)＆マクロ5段チャート(11指標)連動 /
 #            世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合 ＆ 15営業日イベント検索指示 /
-#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定([上場市場・TOPIXパッシブ需給区分]出力・区分不明の根絶)
+#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定([上場市場・TOPIXパッシブ需給区分]出力・区分不明の根絶) /
+#            [Rev.9追加] 週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期エンジン
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io
@@ -58,45 +59,56 @@ def resolve_stock_display_name(code, is_jp_flag):
     return ""
 
 
-def get_fresh_ticker_and_history(ticker_symbol, is_jp=True, use_repair=False):
-  stock = yf.Ticker(ticker_symbol)
-  target_tz = "Asia/Tokyo" if is_jp else "America/New_York"
+def _normalize_yf_df(df: pd.DataFrame, target_tz: str) -> pd.DataFrame:
+  """yfinanceから取得したDataFrameのカラムとタイムゾーンを正規化する（tz-naive現地時間へ統一）。"""
+  if df is None or df.empty:
+    return pd.DataFrame()
+  df = df.copy()
+  if isinstance(df.columns, pd.MultiIndex):
+    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+  if "Repaired?" in df.columns:
+    df = df.drop(columns=["Repaired?"])
+  df.index = pd.to_datetime(df.index)
+  if df.index.tz is not None:
+    try:
+      df.index = df.index.tz_convert(target_tz).tz_localize(None)
+    except Exception:
+      df.index = df.index.tz_localize(None)
+  df = df[~df.index.duplicated(keep="last")].sort_index()
+  return df
 
-  def _safe_history(period_str, interval_str):
+
+def _fetch_safe_history(stock, period_str: str, interval_str: str, target_tz: str, use_repair: bool = False) -> pd.DataFrame:
+  df = pd.DataFrame()
+  try:
+    df = stock.history(
+        period=period_str,
+        interval=interval_str,
+        auto_adjust=False,
+        repair=use_repair,
+    )
+  except Exception:
     try:
       df = stock.history(
           period=period_str,
           interval=interval_str,
           auto_adjust=False,
-          repair=use_repair,
+          repair=False,
       )
     except Exception:
-      try:
-        df = stock.history(
-            period=period_str,
-            interval=interval_str,
-            auto_adjust=False,
-            repair=False,
-        )
-      except Exception:
-        df = pd.DataFrame()
-    if not df.empty:
-      if "Repaired?" in df.columns:
-        df = df.drop(columns=["Repaired?"])
-      df.index = pd.to_datetime(df.index)
-      if df.index.tz is not None:
-        try:
-          df.index = df.index.tz_convert(target_tz).tz_localize(None)
-        except Exception:
-          df.index = df.index.tz_localize(None)
-    return df
+      df = pd.DataFrame()
+  return _normalize_yf_df(df, target_tz)
 
-  return (
-      stock,
-      _safe_history("10y", "1wk"),
-      _safe_history("2y", "1d"),
-      _safe_history("1y", "1h"),
-  )
+
+def get_fresh_ticker_and_history(ticker_symbol, is_jp=True, use_repair=False):
+  stock = yf.Ticker(ticker_symbol)
+  target_tz = "Asia/Tokyo" if is_jp else "America/New_York"
+
+  df_w = _fetch_safe_history(stock, "10y", "1wk", target_tz, use_repair=use_repair)
+  df_d = _fetch_safe_history(stock, "2y", "1d", target_tz, use_repair=use_repair)
+  df_h = _fetch_safe_history(stock, "1y", "1h", target_tz, use_repair=use_repair)
+
+  return stock, df_w, df_d, df_h
 
 
 def _extract_yf_earnings_date(stock) -> str:
@@ -147,6 +159,291 @@ def _is_intraday_unconfirmed(df_d, is_jp: bool) -> bool:
     )
   except Exception:
     return False
+
+
+def _clean_ohlcv_df(df):
+  if df is None or df.empty:
+    return pd.DataFrame()
+  cleaned = df.copy()
+  req_cols = ["Open", "High", "Low", "Close"]
+  for c in req_cols:
+    if c not in cleaned.columns:
+      return pd.DataFrame()
+    cleaned[c] = pd.to_numeric(cleaned[c], errors="coerce")
+  cleaned = cleaned.dropna(subset=req_cols)
+  cleaned = cleaned[
+      (cleaned["Open"] > 0)
+      & (cleaned["High"] > 0)
+      & (cleaned["Low"] > 0)
+      & (cleaned["Close"] > 0)
+  ]
+  if "Volume" in cleaned.columns:
+    cleaned["Volume"] = pd.to_numeric(cleaned["Volume"], errors="coerce").fillna(0)
+  else:
+    cleaned["Volume"] = 0.0
+  if not cleaned.empty:
+    cleaned["High"] = cleaned[["Open", "High", "Low", "Close"]].max(axis=1)
+    cleaned["Low"] = cleaned[["Open", "High", "Low", "Close"]].min(axis=1)
+    cleaned = cleaned[~cleaned.index.duplicated(keep="last")].sort_index()
+  return cleaned
+
+
+def _is_flat_zero_bar(df: pd.DataFrame) -> pd.Series:
+  """Volume <= 0 かつ Open == High == Low == Close のダミー横線バーを判定する。"""
+  if df is None or df.empty:
+    return pd.Series(dtype=bool)
+  return (
+      (df["Volume"] <= 0)
+      & np.isclose(df["Open"], df["High"], rtol=1e-7, atol=1e-6)
+      & np.isclose(df["Low"], df["Close"], rtol=1e-7, atol=1e-6)
+      & np.isclose(df["Open"], df["Close"], rtol=1e-7, atol=1e-6)
+  )
+
+
+def _resample_subhourly_to_hourly(df_sub: pd.DataFrame, is_jp: bool) -> pd.DataFrame:
+  """15分足/5分足から1時間足バケット（floor('1h')）を再構築する。"""
+  if df_sub is None or df_sub.empty:
+    return pd.DataFrame()
+  df_valid = df_sub[df_sub["Volume"] > 0].copy()
+  if df_valid.empty:
+    df_valid = df_sub.copy()
+  if is_jp:
+    t_vals = df_valid.index.time
+    df_valid = df_valid[(t_vals >= dt_time(9, 0)) & (t_vals <= dt_time(15, 30))]
+  if df_valid.empty:
+    return pd.DataFrame()
+
+  bucket = df_valid.index.floor("1h")
+  res = df_valid.groupby(bucket).agg(
+      Open=("Open", "first"),
+      High=("High", "max"),
+      Low=("Low", "min"),
+      Close=("Close", "last"),
+      Volume=("Volume", "sum"),
+  )
+  res = _clean_ohlcv_df(res)
+  if is_jp and not res.empty:
+    res = res[res.index.hour.isin([9, 10, 11, 12, 13, 14, 15])]
+  return res
+
+
+def repair_and_sync_multi_timeframe_ohlcv(
+    stock,
+    df_w: pd.DataFrame,
+    df_d: pd.DataFrame,
+    df_h: pd.DataFrame,
+    is_jp: bool = True,
+    use_repair: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+  """
+  【週足・日足・1時間足の3時間軸クロスリペア＆双方向完全同期エンジン】
+  1) 日足(2y)の最新営業日欠落（例: 11/10抜け）に対し、短期日足(5d/1mo)からの補完を試行。
+  2) 1時間足の歯抜け（Volume=0 かつ O=H=L=C の横線ダミー足）を検出した場合、
+     15分足/5分足を取得して1時間足へリサンプリング修復し、不要な0出来高ダミー行を除去。
+  3) それでも日足に欠落している営業日（1時間足に存在する日）があれば、1時間足から日足を合成・追加。
+  4) 週足の確定終値・高安値（東証15:30クロージング・オークション反映値）と最新日足・1時間足を同期。
+  5) 全共通営業日において、日足と1時間足の四本値（始値・最高値・最安値・終値）を双方向で完全一致させる。
+  """
+  target_tz = "Asia/Tokyo" if is_jp else "America/New_York"
+  df_w = _clean_ohlcv_df(df_w)
+  df_d = _clean_ohlcv_df(df_d)
+  df_h = _clean_ohlcv_df(df_h)
+
+  # --- Step 1: 短期日足(5d / 1mo)による最新日足欠落パッチ ---
+  latest_known_date = None
+  for cand_df in (df_h, df_w):
+    if not cand_df.empty:
+      d_cand = cand_df.index[-1].date()
+      if latest_known_date is None or d_cand > latest_known_date:
+        latest_known_date = d_cand
+
+  if not df_d.empty and latest_known_date is not None and df_d.index[-1].date() < latest_known_date:
+    for short_p in ("5d", "1mo"):
+      df_d_short = _clean_ohlcv_df(
+          _fetch_safe_history(stock, short_p, "1d", target_tz, use_repair=use_repair)
+      )
+      if not df_d_short.empty and df_d_short.index[-1].date() > df_d.index[-1].date():
+        # Dividends等の既存カラムを維持して結合
+        for col in df_d.columns:
+          if col not in df_d_short.columns:
+            df_d_short[col] = 0.0
+        df_d = pd.concat([df_d, df_d_short[df_d.columns]]).sort_index()
+        df_d = df_d[~df_d.index.duplicated(keep="last")]
+        break
+
+  # --- Step 2: 1時間足の Volume=0 フラット横線ダミー足の修復（15分足/5分足リサンプリング） ---
+  if not df_h.empty:
+    flat_mask = _is_flat_zero_bar(df_h)
+    day_counts = df_h.groupby(df_h.index.date).size()
+    has_short_days = (day_counts.iloc[:-1] < 4).any() if len(day_counts) > 1 else False
+
+    if flat_mask.any() or has_short_days:
+      df_sub_resampled = pd.DataFrame()
+      for sub_interval in ("15m", "5m", "30m"):
+        df_sub_raw = _fetch_safe_history(stock, "60d", sub_interval, target_tz, use_repair=False)
+        df_sub_raw = _clean_ohlcv_df(df_sub_raw)
+        if not df_sub_raw.empty:
+          df_sub_resampled = _resample_subhourly_to_hourly(df_sub_raw, is_jp=is_jp)
+          if not df_sub_resampled.empty:
+            break
+
+      if not df_sub_resampled.empty:
+        combined_idx = df_h.index.union(df_sub_resampled.index).sort_values()
+        df_h_merged = df_h.reindex(combined_idx)
+        for col in df_h.columns:
+          if col not in ["Open", "High", "Low", "Close", "Volume"]:
+            df_h_merged[col] = df_h_merged[col].fillna(0)
+
+        for ts in df_sub_resampled.index:
+          r_sub = df_sub_resampled.loc[ts]
+          if ts not in df_h.index:
+            for c in ["Open", "High", "Low", "Close", "Volume"]:
+              df_h_merged.loc[ts, c] = r_sub[c]
+          else:
+            r_h = df_h.loc[ts]
+            is_h_flat = (
+                r_h["Volume"] <= 0
+                and np.isclose(r_h["Open"], r_h["High"])
+                and np.isclose(r_h["Open"], r_h["Low"])
+            )
+            if is_h_flat and r_sub["Volume"] > 0:
+              for c in ["Open", "High", "Low", "Close", "Volume"]:
+                df_h_merged.loc[ts, c] = r_sub[c]
+            elif r_sub["Volume"] > 0:
+              df_h_merged.loc[ts, "High"] = max(float(r_h["High"]), float(r_sub["High"]))
+              df_h_merged.loc[ts, "Low"] = min(float(r_h["Low"]), float(r_sub["Low"]))
+              df_h_merged.loc[ts, "Volume"] = max(float(r_h["Volume"]), float(r_sub["Volume"]))
+        df_h = _clean_ohlcv_df(df_h_merged)
+
+    # 15分足補完後も残存している「Volume == 0 かつ O == H == L == C」のダミー横線バーを整理
+    # （同日内に有効な出来高バーが1本以上存在する日のダミー横線バーは除外し、日足との四本値整合はStep 5で行う）
+    if not df_h.empty:
+      drop_ts_list = []
+      for d_val, grp in df_h.groupby(df_h.index.date):
+        if len(grp) > 1:
+          f_mask = _is_flat_zero_bar(grp)
+          if (~f_mask).any() and f_mask.any():
+            drop_ts_list.extend(list(grp[f_mask].index))
+      if drop_ts_list:
+        df_h = df_h.drop(index=drop_ts_list)
+
+  # --- Step 3: 1時間足に存在するが日足に存在しない営業日（11/10等）を日足へ合成・追加 ---
+  if not df_h.empty:
+    existing_d_dates = set(df_d.index.date) if not df_d.empty else set()
+    new_d_rows = []
+    for h_date, grp in df_h.groupby(df_h.index.date):
+      if h_date not in existing_d_dates and not grp.empty:
+        new_ts = pd.Timestamp(h_date)
+        row_data = {
+            "Open": float(grp["Open"].iloc[0]),
+            "High": float(grp["High"].max()),
+            "Low": float(grp["Low"].min()),
+            "Close": float(grp["Close"].iloc[-1]),
+            "Volume": float(grp["Volume"].sum()),
+        }
+        if not df_d.empty:
+          for col in df_d.columns:
+            if col not in row_data:
+              row_data[col] = 0.0
+        new_d_rows.append((new_ts, row_data))
+
+    if new_d_rows:
+      add_d_df = pd.DataFrame([r[1] for r in new_d_rows], index=[r[0] for r in new_d_rows])
+      df_d = pd.concat([df_d, add_d_df]).sort_index()
+      df_d = df_d[~df_d.index.duplicated(keep="last")]
+
+  # --- Step 4: 週足(df_w)との大引け確定値（15:30クロージング・オークション等）双方向同期 ---
+  if not df_d.empty and not df_w.empty:
+    last_d_ts = df_d.index[-1]
+    last_d_date = last_d_ts.date()
+    is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+
+    last_week_monday = last_d_date - timedelta(days=last_d_date.weekday())
+    w_last_ts = df_w.index[-1]
+    w_last_date = w_last_ts.date()
+
+    if w_last_date >= last_week_monday:
+      w_close = float(df_w.loc[w_last_ts, "Close"])
+      w_high = float(df_w.loc[w_last_ts, "High"])
+      w_low = float(df_w.loc[w_last_ts, "Low"])
+
+      # ザラ場外の確定状態において、週足の終値（3177円等）と1時間足合成の日足終値（3178円等）に微小差がある場合、週足確定値を採用
+      if not is_intraday and w_close > 0:
+        d_close = float(df_d.loc[last_d_ts, "Close"])
+        if not np.isclose(d_close, w_close) and abs(d_close - w_close) / max(w_close, 1.0) < 0.03:
+          df_d.loc[last_d_ts, "Close"] = w_close
+          df_d.loc[last_d_ts, "High"] = max(float(df_d.loc[last_d_ts, "High"]), w_close)
+          df_d.loc[last_d_ts, "Low"] = min(float(df_d.loc[last_d_ts, "Low"]), w_close)
+
+      # 当週の日足群から週足の高値・安値・終値も同期
+      week_mask = df_d.index.date >= last_week_monday
+      if week_mask.any():
+        week_sub = df_d.loc[week_mask]
+        df_w.loc[w_last_ts, "High"] = max(w_high, float(week_sub["High"].max()))
+        df_w.loc[w_last_ts, "Low"] = min(w_low, float(week_sub["Low"].min()))
+        df_w.loc[w_last_ts, "Close"] = float(week_sub["Close"].iloc[-1])
+
+  # --- Step 5: 全共通営業日における 日足(df_d) ⇔ 1時間足(df_h) の双方向四本値同期 ---
+  if not df_d.empty and not df_h.empty:
+    d_date_to_ts = {ts.date(): ts for ts in df_d.index}
+    last_d_ts = df_d.index[-1]
+    is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+
+    for h_date, grp in df_h.groupby(df_h.index.date):
+      if h_date not in d_date_to_ts or grp.empty:
+        continue
+      d_ts = d_date_to_ts[h_date]
+
+      d_open = float(df_d.loc[d_ts, "Open"])
+      d_high = float(df_d.loc[d_ts, "High"])
+      d_low = float(df_d.loc[d_ts, "Low"])
+      d_close = float(df_d.loc[d_ts, "Close"])
+      d_vol = float(df_d.loc[d_ts, "Volume"])
+
+      h_first_ts = grp.index[0]
+      h_last_ts = grp.index[-1]
+      h_max_ts = grp["High"].idxmax()
+      h_min_ts = grp["Low"].idxmin()
+
+      h_high = float(grp["High"].max())
+      h_low = float(grp["Low"].min())
+      h_vol_sum = float(grp["Volume"].sum())
+
+      # 高値・安値の双方向同期（10/14の5373円、11/05の2879円、11/06の2826円等を完全一致）
+      true_high = max(d_high, h_high, d_open, d_close)
+      true_low = min(d_low, h_low, d_open, d_close)
+      df_d.loc[d_ts, "High"] = true_high
+      df_d.loc[d_ts, "Low"] = true_low
+
+      # 1時間足の当日最初のバーの始値を日足始値に同期
+      df_h.loc[h_first_ts, "Open"] = d_open
+      df_h.loc[h_first_ts, "High"] = max(float(df_h.loc[h_first_ts, "High"]), d_open)
+      df_h.loc[h_first_ts, "Low"] = min(float(df_h.loc[h_first_ts, "Low"]), d_open)
+
+      # 1時間足の当日最終バーの終値と日足終値を同期
+      if d_ts == last_d_ts and is_intraday:
+        latest_h_close = float(df_h.loc[h_last_ts, "Close"])
+        df_d.loc[d_ts, "Close"] = latest_h_close
+      else:
+        df_h.loc[h_last_ts, "Close"] = d_close
+        df_h.loc[h_last_ts, "High"] = max(float(df_h.loc[h_last_ts, "High"]), d_close)
+        df_h.loc[h_last_ts, "Low"] = min(float(df_h.loc[h_last_ts, "Low"]), d_close)
+
+      # 当日最高値・最安値を1時間足の極値バー（または後半が欠損していた場合は最終バー）へ確実に反映
+      if true_high > float(df_h.loc[ grp.index, "High" ].max()):
+        df_h.loc[h_max_ts, "High"] = true_high
+      if true_low < float(df_h.loc[ grp.index, "Low" ].min()):
+        # 後半バーが欠損して日足終値付近で引けている日（例: 11/05）は最終バーのLow/Highを拡張して実態の値幅を再現
+        if abs(d_close - true_low) < abs(float(df_h.loc[h_min_ts, "Low"]) - true_low):
+          df_h.loc[h_last_ts, "Low"] = min(float(df_h.loc[h_last_ts, "Low"]), true_low)
+        else:
+          df_h.loc[h_min_ts, "Low"] = true_low
+
+      # 日足出来高が未設定（0）の場合は1時間足合計出来高で補完
+      if d_vol <= 0 and h_vol_sum > 0:
+        df_d.loc[d_ts, "Volume"] = h_vol_sum
+
+  return df_w, df_d, df_h
 
 
 def _get_period_extreme_with_date(
@@ -433,15 +730,6 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
   return "\n".join(sma_lines), "\n".join(table_rows)
 
 
-def _clean_ohlcv_df(df):
-  if df is None or df.empty:
-    return pd.DataFrame()
-  cleaned = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
-  if "Volume" in cleaned.columns:
-    cleaned["Volume"] = cleaned["Volume"].fillna(0)
-  return cleaned
-
-
 # 起動時EDINET API自動監視チェック
 edinet_status = check_edinet_api_status(force_refresh=False)
 
@@ -589,39 +877,19 @@ if generate_button and stock_code:
         else get_us_stock_name(stock_code)
     )
 
-    df_w, df_d, df_h = (
-        _clean_ohlcv_df(df_w),
-        _clean_ohlcv_df(df_d),
-        _clean_ohlcv_df(df_h),
+    # 3時間軸＋15分足クロスリペア＆全営業日双方向四本値同期エンジン
+    df_w, df_d, df_h = repair_and_sync_multi_timeframe_ohlcv(
+        stock=stock,
+        df_w=df_w,
+        df_d=df_d,
+        df_h=df_h,
+        is_jp=is_jp,
+        use_repair=use_repair,
     )
+
     if df_d.empty:
       st.error("株価データが取得できませんでした。")
       st.stop()
-
-    if not df_h.empty and not df_d.empty:
-      try:
-        if df_h.index[-1].date() == df_d.index[-1].date():
-          d_close = float(df_d["Close"].iloc[-1])
-          df_h.iloc[-1, df_h.columns.get_loc("Close")] = d_close
-          today_h_bars = df_h[df_h.index.date == df_d.index[-1].date()]
-          max_intraday_h = max(
-              float(df_d["High"].iloc[-1]),
-              float(today_h_bars["High"].max()),
-              d_close,
-          )
-          min_intraday_l = min(
-              float(df_d["Low"].iloc[-1]),
-              float(today_h_bars["Low"].min()),
-              d_close,
-          )
-          df_d.iloc[-1, df_d.columns.get_loc("High")] = max_intraday_h
-          df_d.iloc[-1, df_d.columns.get_loc("Low")] = min_intraday_l
-          if d_close > float(df_h["High"].iloc[-1]):
-            df_h.iloc[-1, df_h.columns.get_loc("High")] = d_close
-          if d_close < float(df_h["Low"].iloc[-1]):
-            df_h.iloc[-1, df_h.columns.get_loc("Low")] = d_close
-      except Exception:
-        pass
 
     df_w, df_d, df_h = (
         add_indicators(df_w),
