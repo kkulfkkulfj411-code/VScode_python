@@ -1,12 +1,14 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.8)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
 #            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ除外 /
-#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定(区分不明の根絶)
+#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定(区分不明の根絶) /
+#            [Rev.9追加] マクロ指標(1306.T/N225等)の最新営業日欠落に対する短期足(5d/1h)自動合成パッチ
+#                        ＆ CBOE公式CSV補完の高感度化(直近営業日ラグの即時解消)・MultiIndex安全化
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -320,20 +322,87 @@ def get_macro_data_and_history():
       ("1306.T", "TOPIX連動ETF (1306.T)", 1, "円"),
   ]
 
-  def _normalize_yf_df(df: pd.DataFrame, target_tz: str) -> pd.DataFrame:
+  def _normalize_yf_df(df: pd.DataFrame, target_tz: str, normalize_date: bool = True) -> pd.DataFrame:
     if df is None or df.empty:
       return pd.DataFrame()
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+      df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
     if "Repaired?" in df.columns:
       df = df.drop(columns=["Repaired?"])
+    if "Close" not in df.columns:
+      return pd.DataFrame()
+    df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    if df.empty:
+      return pd.DataFrame()
+    for c in ["Open", "High", "Low"]:
+      if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(df["Close"])
+      else:
+        df[c] = df["Close"]
+    df["High"] = df[["Open", "High", "Low", "Close"]].max(axis=1)
+    df["Low"] = df[["Open", "High", "Low", "Close"]].min(axis=1)
+
     df.index = pd.to_datetime(df.index)
     if df.index.tz is not None:
       try:
         df.index = df.index.tz_convert(target_tz).tz_localize(None)
       except Exception:
         df.index = df.index.tz_localize(None)
-    df.index = df.index.normalize()
+    if normalize_date:
+      df.index = df.index.normalize()
     df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df.dropna(subset=["Close"])
+    return df
+
+  def _patch_latest_from_intraday(t_sym: str, df_daily: pd.DataFrame, target_tz: str) -> pd.DataFrame:
+    """長期日足(1y)で直近営業日が欠落している場合、短期日足(5d)および1時間足(5d)から最新日足を合成・補完する。"""
+    if df_daily is None or df_daily.empty:
+      return pd.DataFrame()
+    last_d = df_daily.index[-1]
+
+    # 1) 短期日足(5d)でのパッチ試行
+    try:
+      raw_5d = yf.Ticker(t_sym).history(period="5d", interval="1d", auto_adjust=False)
+      df_5d = _normalize_yf_df(raw_5d, target_tz, normalize_date=True)
+      if not df_5d.empty and df_5d.index[-1] > last_d:
+        combined = pd.concat([df_daily, df_5d])
+        df_daily = combined[~combined.index.duplicated(keep="last")].sort_index()
+        last_d = df_daily.index[-1]
+    except Exception:
+      pass
+
+    # 2) 1時間足(5d)からの最新営業日合成パッチ（日足エンドポイント自体の反映遅延対策）
+    try:
+      raw_1h = yf.Ticker(t_sym).history(period="5d", interval="1h", auto_adjust=False)
+      df_1h = _normalize_yf_df(raw_1h, target_tz, normalize_date=False)
+      if not df_1h.empty:
+        df_1h["DateNorm"] = df_1h.index.normalize()
+        agg_1h = df_1h.groupby("DateNorm").agg(
+            Open=("Open", "first"),
+            High=("High", "max"),
+            Low=("Low", "min"),
+            Close=("Close", "last"),
+        )
+        new_dates = agg_1h[agg_1h.index > last_d]
+        if not new_dates.empty:
+          for col in df_daily.columns:
+            if col not in new_dates.columns:
+              new_dates[col] = 0.0
+          combined = pd.concat([df_daily, new_dates[df_daily.columns]])
+          df_daily = combined[~combined.index.duplicated(keep="last")].sort_index()
+        elif last_d in agg_1h.index:
+          # 最終日の高安値がイントラデイで更新されている場合は同期
+          df_daily.loc[last_d, "High"] = max(
+              float(df_daily.loc[last_d, "High"]), float(agg_1h.loc[last_d, "High"])
+          )
+          df_daily.loc[last_d, "Low"] = min(
+              float(df_daily.loc[last_d, "Low"]), float(agg_1h.loc[last_d, "Low"])
+          )
+    except Exception:
+      pass
+
+    return df_daily
 
   def _fetch_one(sym):
     target_tz = (
@@ -348,14 +417,16 @@ def get_macro_data_and_history():
     if sym == "^VIX3M":
       alt_tickers.append("^VXV")
 
+    used_ticker = sym
     for t_sym in alt_tickers:
       for period_try in ["1y", "6mo"]:
         try:
           raw = yf.Ticker(t_sym).history(
               period=period_try, interval="1d", auto_adjust=False
           )
-          df = _normalize_yf_df(raw, target_tz)
+          df = _normalize_yf_df(raw, target_tz, normalize_date=True)
           if not df.empty and len(df) >= 30:
+            used_ticker = t_sym
             break
         except Exception:
           pass
@@ -367,9 +438,9 @@ def get_macro_data_and_history():
     if sym in CBOE_CSV_URLS:
       need_cboe = df.empty or len(df) < 60
       if not need_cboe:
-        # 直近営業日が7日以上古い場合もCBOE公式CSVで補完・マージする
+        # 週末を考慮しても直近営業日が3日以上古い場合はCBOE公式CSVで最新日を照合・マージする
         days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days
-        if days_lag > 7:
+        if days_lag >= 3:
           need_cboe = True
       if need_cboe:
         cboe_df = _fetch_cboe_csv_fallback(sym)
@@ -377,8 +448,14 @@ def get_macro_data_and_history():
           if df.empty:
             df = cboe_df
           else:
-            combined = pd.concat([cboe_df, df])
+            combined = pd.concat([df, cboe_df])
             df = combined[~combined.index.duplicated(keep="last")].sort_index()
+    elif not df.empty:
+      # 3. 東証指数・ETF(^N225, 1306.T)や主要先物・ETFの最新営業日欠落パッチ
+      now_jst_date = datetime.datetime.now(JST).date()
+      days_lag = (now_jst_date - df.index[-1].date()).days
+      if sym in ["1306.T", "^N225", "USDJPY=X"] or days_lag >= 2:
+        df = _patch_latest_from_intraday(used_ticker, df, target_tz)
 
     return sym, df
 
