@@ -7,15 +7,14 @@
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
 #            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ除外 /
 #            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定(区分不明の根絶) /
-#            [Rev.9追加] マクロ指標(1306.T/N225等)の最新営業日欠落に対する短期足(5d/1h)自動合成パッチ
-#                        ＆ CBOE公式CSV補完の高感度化(直近営業日ラグの即時解消)・MultiIndex安全化
+#            [Rev.9] マクロ指標(1306.T/N225等)の最新営業日欠落に対する短期足(5d/1h)自動合成パッチ
+#                    ＆ CBOE公式CSV補完の高感度化・レガシー(GASスプレッドシート連携等)完全削除済
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 from datetime import date, time as dt_time, timedelta, timezone
 import difflib
-import html
 import io
 import re
 import time
@@ -298,8 +297,7 @@ def _fetch_cboe_csv_fallback(sym: str) -> pd.DataFrame:
       else:
         out[target_c] = out["Close"]
 
-    out = out.dropna(subset=["Close"]).tail(265)
-    return out
+    return out.dropna(subset=["Close"]).tail(265)
   except Exception:
     return pd.DataFrame()
 
@@ -322,12 +320,16 @@ def get_macro_data_and_history():
       ("1306.T", "TOPIX連動ETF (1306.T)", 1, "円"),
   ]
 
-  def _normalize_yf_df(df: pd.DataFrame, target_tz: str, normalize_date: bool = True) -> pd.DataFrame:
+  def _normalize_yf_df(
+      df: pd.DataFrame, target_tz: str, normalize_date: bool = True
+  ) -> pd.DataFrame:
     if df is None or df.empty:
       return pd.DataFrame()
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
-      df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+      df.columns = [
+          col[0] if isinstance(col, tuple) else col for col in df.columns
+      ]
     if "Repaired?" in df.columns:
       df = df.drop(columns=["Repaired?"])
     if "Close" not in df.columns:
@@ -352,18 +354,20 @@ def get_macro_data_and_history():
         df.index = df.index.tz_localize(None)
     if normalize_date:
       df.index = df.index.normalize()
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-    return df
+    return df[~df.index.duplicated(keep="last")].sort_index()
 
-  def _patch_latest_from_intraday(t_sym: str, df_daily: pd.DataFrame, target_tz: str) -> pd.DataFrame:
+  def _patch_latest_from_intraday(
+      t_sym: str, df_daily: pd.DataFrame, target_tz: str
+  ) -> pd.DataFrame:
     """長期日足(1y)で直近営業日が欠落している場合、短期日足(5d)および1時間足(5d)から最新日足を合成・補完する。"""
     if df_daily is None or df_daily.empty:
       return pd.DataFrame()
     last_d = df_daily.index[-1]
 
-    # 1) 短期日足(5d)でのパッチ試行
     try:
-      raw_5d = yf.Ticker(t_sym).history(period="5d", interval="1d", auto_adjust=False)
+      raw_5d = yf.Ticker(t_sym).history(
+          period="5d", interval="1d", auto_adjust=False
+      )
       df_5d = _normalize_yf_df(raw_5d, target_tz, normalize_date=True)
       if not df_5d.empty and df_5d.index[-1] > last_d:
         combined = pd.concat([df_daily, df_5d])
@@ -372,9 +376,10 @@ def get_macro_data_and_history():
     except Exception:
       pass
 
-    # 2) 1時間足(5d)からの最新営業日合成パッチ（日足エンドポイント自体の反映遅延対策）
     try:
-      raw_1h = yf.Ticker(t_sym).history(period="5d", interval="1h", auto_adjust=False)
+      raw_1h = yf.Ticker(t_sym).history(
+          period="5d", interval="1h", auto_adjust=False
+      )
       df_1h = _normalize_yf_df(raw_1h, target_tz, normalize_date=False)
       if not df_1h.empty:
         df_1h["DateNorm"] = df_1h.index.normalize()
@@ -390,14 +395,17 @@ def get_macro_data_and_history():
             if col not in new_dates.columns:
               new_dates[col] = 0.0
           combined = pd.concat([df_daily, new_dates[df_daily.columns]])
-          df_daily = combined[~combined.index.duplicated(keep="last")].sort_index()
+          df_daily = combined[
+              ~combined.index.duplicated(keep="last")
+          ].sort_index()
         elif last_d in agg_1h.index:
-          # 最終日の高安値がイントラデイで更新されている場合は同期
           df_daily.loc[last_d, "High"] = max(
-              float(df_daily.loc[last_d, "High"]), float(agg_1h.loc[last_d, "High"])
+              float(df_daily.loc[last_d, "High"]),
+              float(agg_1h.loc[last_d, "High"]),
           )
           df_daily.loc[last_d, "Low"] = min(
-              float(df_daily.loc[last_d, "Low"]), float(agg_1h.loc[last_d, "Low"])
+              float(df_daily.loc[last_d, "Low"]),
+              float(agg_1h.loc[last_d, "Low"]),
           )
     except Exception:
       pass
@@ -411,13 +419,9 @@ def get_macro_data_and_history():
         else "America/New_York"
     )
     df = pd.DataFrame()
-
-    # 1. yfinance 標準取得 + リトライ / 代替シンボル試行
-    alt_tickers = [sym]
-    if sym == "^VIX3M":
-      alt_tickers.append("^VXV")
-
+    alt_tickers = [sym, "^VXV"] if sym == "^VIX3M" else [sym]
     used_ticker = sym
+
     for t_sym in alt_tickers:
       for period_try in ["1y", "6mo"]:
         try:
@@ -434,26 +438,24 @@ def get_macro_data_and_history():
       if not df.empty and len(df) >= 30:
         break
 
-    # 2. CBOE指数(^VIX3M, ^VIX, ^VVIX, ^SKEW)のCBOE公式CDN CSV直接補完
     if sym in CBOE_CSV_URLS:
       need_cboe = df.empty or len(df) < 60
       if not need_cboe:
-        # 週末を考慮しても直近営業日が3日以上古い場合はCBOE公式CSVで最新日を照合・マージする
         days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days
         if days_lag >= 3:
           need_cboe = True
       if need_cboe:
         cboe_df = _fetch_cboe_csv_fallback(sym)
         if not cboe_df.empty:
-          if df.empty:
-            df = cboe_df
-          else:
-            combined = pd.concat([df, cboe_df])
-            df = combined[~combined.index.duplicated(keep="last")].sort_index()
+          df = (
+              cboe_df
+              if df.empty
+              else pd.concat([df, cboe_df])[
+                  ~pd.concat([df, cboe_df]).index.duplicated(keep="last")
+              ].sort_index()
+          )
     elif not df.empty:
-      # 3. 東証指数・ETF(^N225, 1306.T)や主要先物・ETFの最新営業日欠落パッチ
-      now_jst_date = datetime.datetime.now(JST).date()
-      days_lag = (now_jst_date - df.index[-1].date()).days
+      days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days
       if sym in ["1306.T", "^N225", "USDJPY=X"] or days_lag >= 2:
         df = _patch_latest_from_intraday(used_ticker, df, target_tz)
 
@@ -667,12 +669,6 @@ def get_macro_data_and_history():
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_macro_data():
-  text, _ = get_macro_data_and_history()
-  return text
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
 def get_macro_policy_news() -> str:
   """Google News RSSから4カテゴリ独立でヘッドラインを取得し、ゴシップ・一般事故を除外、経済メディア優先ソート＆出典メディア名を明記して返す。"""
   queries = [
@@ -703,53 +699,16 @@ def get_macro_policy_news() -> str:
   ]
 
   blacklist_sources = [
-      "デイリー新潮",
-      "文春オンライン",
-      "週刊文春",
-      "週刊新潮",
-      "日刊ゲンダイ",
-      "東スポ",
-      "女性自身",
-      "女性セブン",
-      "ポストセブン",
-      "アサ芸",
-      "まいじつ",
-      "スポーツ報知",
-      "日刊スポーツ",
-      "スポニチ",
-      "サンスポ",
-      "デイリースポーツ",
+      "デイリー新潮", "文春オンライン", "週刊文春", "週刊新潮", "日刊ゲンダイ",
+      "東スポ", "女性自身", "女性セブン", "ポストセブン", "アサ芸", "まいじつ",
+      "スポーツ報知", "日刊スポーツ", "スポニチ", "サンスポ", "デイリースポーツ",
   ]
-  blacklist_words = [
-      "火災で",
-      "工場で火災",
-      "行方不明",
-      "交通事故",
-      "逮捕",
-      "不倫",
-      "芸能",
-  ]
+  blacklist_words = ["火災で", "工場で火災", "行方不明", "交通事故", "逮捕", "不倫", "芸能"]
   preferred_sources = [
-      "日本経済新聞",
-      "日経",
-      "Reuters",
-      "ロイター",
-      "Bloomberg",
-      "ブルームバーグ",
-      "株探",
-      "Kabutan",
-      "みんかぶ",
-      "四季報",
-      "東洋経済",
-      "ダイヤモンド",
-      "ウエルスアドバイザー",
-      "時事通信",
-      "共同通信",
-      "NHK",
-      "テレビ東京",
-      "テレ東",
-      "野村證券",
-      "大和証券",
+      "日本経済新聞", "日経", "Reuters", "ロイター", "Bloomberg", "ブルームバーグ",
+      "株探", "Kabutan", "みんかぶ", "四季報", "東洋経済", "ダイヤモンド",
+      "ウエルスアドバイザー", "時事通信", "共同通信", "NHK", "テレビ東京",
+      "テレ東", "野村證券", "大和証券",
   ]
 
   def _fetch_category_rss(tag: str, q_recent: str, q_fallback: str, limit: int):
@@ -758,10 +717,11 @@ def get_macro_policy_news() -> str:
       url = f"https://news.google.com/rss/search?q={encoded_q}&hl=ja&gl=JP&ceid=JP:ja"
       try:
         res = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=6)
-        if res.status_code == 200 and res.content:
-          feed = feedparser.parse(res.content)
-        else:
-          feed = feedparser.parse(url)
+        feed = (
+            feedparser.parse(res.content)
+            if (res.status_code == 200 and res.content)
+            else feedparser.parse(url)
+        )
       except Exception:
         try:
           feed = feedparser.parse(url)
@@ -795,13 +755,10 @@ def get_macro_policy_news() -> str:
         line = f"・{tag} {title} [出典: {src_name}] ({pub})"
         candidates.append((0 if is_pref else 1, title, line))
 
-      # 経済専門メディアを優先しつつ元の新着順を維持
       candidates.sort(key=lambda x: x[0])
       return [(t, l) for _, t, l in candidates]
 
-    items = _parse_query(q_recent)
-    if not items:
-      items = _parse_query(q_fallback)
+    items = _parse_query(q_recent) or _parse_query(q_fallback)
     return items[: limit + 2]
 
   results_by_idx = {}
@@ -826,7 +783,6 @@ def get_macro_policy_news() -> str:
         return True
       if difflib.SequenceMatcher(None, norm_new, old_t).ratio() >= 0.52:
         return True
-      # 同一イベント記事（例：「日銀」＋「主な意見」）の重複ブロック
       if (
           "日銀" in norm_new
           and "日銀" in old_t
@@ -841,8 +797,9 @@ def get_macro_policy_news() -> str:
     cat_count = 0
     for title, line in cand_list:
       if not _is_duplicate_topic(title):
-        norm_t = re.sub(r"[\s ・、。「」『』（）()【】\[\]―-]+", "", title)
-        seen_titles.append(norm_t)
+        seen_titles.append(
+            re.sub(r"[\s ・、。「」『』（）()【】\[\]―-]+", "", title)
+        )
         unique_lines.append(line)
         cat_count += 1
         if cat_count >= lim:
@@ -875,64 +832,73 @@ def _get_edinet_key_and_type() -> tuple:
 
 
 def _run_edinet_connectivity_test(edinet_key: str, key_type: str) -> dict:
-  if not edinet_key or key_type == "missing":
+  def _build_status(ok: bool, ktype: str, sname: str, msg: str, guide: str) -> dict:
     return {
-        "ok": False,
-        "key_type": "missing",
-        "service_name": "未設定",
-        "message": "Streamlit Secrets に EDINET_API_KEY が設定されていません。",
-        "guide": (
-            'Streamlit Secrets に `EDINET_API_KEY = "..."` を設定してください。'
-            "（金融庁公式EDINET API v2キー、または `edb_` で始まる EDINET DB APIキーの両方に自動対応しています）"
-        ),
+        "ok": ok,
+        "key_type": ktype,
+        "service_name": sname,
+        "message": msg,
+        "guide": guide,
     }
 
-  if key_type == "edinetdb":
-    url = "https://edinetdb.jp/v1/companies/E02144"
-    try:
-      res = requests.get(url, headers={"X-API-Key": edinet_key}, timeout=10)
-      if res.status_code == 200:
-        return {
-            "ok": True,
-            "key_type": "edinetdb",
-            "service_name": "EDINET DB API (edinetdb.jp)",
-            "message": "🟢 EDINET DB API (edinetdb.jp) 正常接続確認済 (HTTP 200)",
-            "guide": (
-                "現在 `edb_` 始まりのEDINET DBキーで接続中です。有報XBRLベースの確定財務時系列・信用スコアを自動取得します。"
-            ),
-        }
-      if res.status_code in [401, 403]:
-        return {
-            "ok": False,
-            "key_type": "edinetdb",
-            "service_name": "EDINET DB API (edinetdb.jp)",
-            "message": f"🔴 EDINET DB API 認証エラー (HTTP {res.status_code})",
-            "guide": "設定されている `edb_...` キーが無効または失効しています。edinetdb.jp/developers で確認してください。",
-        }
-      if res.status_code == 429:
-        return {
-            "ok": False,
-            "key_type": "edinetdb",
-            "service_name": "EDINET DB API (edinetdb.jp)",
-            "message": "🟠 EDINET DB API レートリミット到達 (HTTP 429)",
-            "guide": "EDINET DB (Freeプラン: 1日100リクエスト上限) の制限に達しています。",
-        }
-      return {
-          "ok": False,
-          "key_type": "edinetdb",
-          "service_name": "EDINET DB API (edinetdb.jp)",
-          "message": f"🟠 EDINET DB API 応答異常 (HTTP {res.status_code})",
-          "guide": "EDINET DBサーバー側の一時的な障害または仕様変更の可能性があります。",
-      }
-    except Exception as e:
-      return {
-          "ok": False,
-          "key_type": "edinetdb",
-          "service_name": "EDINET DB API (edinetdb.jp)",
-          "message": f"🔴 EDINET DB API 通信エラー: {e}",
-          "guide": "ネットワーク接続または edinetdb.jp の稼働状況を確認してください。",
-      }
+  if not edinet_key or key_type == "missing":
+    return _build_status(
+        False,
+        "missing",
+        "未設定",
+        "Streamlit Secrets に EDINET_API_KEY が設定されていません。",
+        'Streamlit Secrets に `EDINET_API_KEY = "..."` を設定してください。（金融庁公式EDINET API v2キー、または `edb_` で始まる EDINET DB APIキーの両方に自動対応しています）',
+    )
 
+  if key_type == "edinetdb":
+    sname = "EDINET DB API (edinetdb.jp)"
+    try:
+      res = requests.get(
+          "https://edinetdb.jp/v1/companies/E02144",
+          headers={"X-API-Key": edinet_key},
+          timeout=10,
+      )
+      if res.status_code == 200:
+        return _build_status(
+            True,
+            "edinetdb",
+            sname,
+            "🟢 EDINET DB API (edinetdb.jp) 正常接続確認済 (HTTP 200)",
+            "現在 `edb_` 始まりのEDINET DBキーで接続中です。有報XBRLベースの確定財務時系列・信用スコアを自動取得します。",
+        )
+      if res.status_code in [401, 403]:
+        return _build_status(
+            False,
+            "edinetdb",
+            sname,
+            f"🔴 EDINET DB API 認証エラー (HTTP {res.status_code})",
+            "設定されている `edb_...` キーが無効または失効しています。edinetdb.jp/developers で確認してください。",
+        )
+      if res.status_code == 429:
+        return _build_status(
+            False,
+            "edinetdb",
+            sname,
+            "🟠 EDINET DB API レートリミット到達 (HTTP 429)",
+            "EDINET DB (Freeプラン: 1日100リクエスト上限) の制限に達しています。",
+        )
+      return _build_status(
+          False,
+          "edinetdb",
+          sname,
+          f"🟠 EDINET DB API 応答異常 (HTTP {res.status_code})",
+          "EDINET DBサーバー側の一時的な障害または仕様変更の可能性があります。",
+      )
+    except Exception as e:
+      return _build_status(
+          False,
+          "edinetdb",
+          sname,
+          f"🔴 EDINET DB API 通信エラー: {e}",
+          "ネットワーク接続または edinetdb.jp の稼働状況を確認してください。",
+      )
+
+  sname = "金融庁公式 EDINET API v2"
   today_str = datetime.datetime.now(JST).strftime("%Y-%m-%d")
   url = "https://api.edinet-fsa.go.jp/api/v2/documents.json"
   params = {"date": today_str, "type": 1, "Subscription-Key": edinet_key}
@@ -944,38 +910,34 @@ def _run_edinet_connectivity_test(edinet_key: str, key_type: str) -> dict:
     data = res.json() if res.content else {}
     meta = data.get("metadata", {}) if isinstance(data, dict) else {}
     if res.status_code == 200 and str(meta.get("status", "")) == "200":
-      return {
-          "ok": True,
-          "key_type": "fsa",
-          "service_name": "金融庁公式 EDINET API v2",
-          "message": f"🟢 金融庁公式 EDINET API v2 正常接続確認済 (HTTP 200 / {today_str})",
-          "guide": "直近60日間の公式開示書類（有報・臨時報告書・大量保有報告書等）を自動取得します。",
-      }
-    msg = (
-        data.get("message")
-        or meta.get("message")
-        or f"HTTP {res.status_code}"
-    )
+      return _build_status(
+          True,
+          "fsa",
+          sname,
+          f"🟢 金融庁公式 EDINET API v2 正常接続確認済 (HTTP 200 / {today_str})",
+          "直近60日間の公式開示書類（有報・臨時報告書・大量保有報告書等）を自動取得します。",
+      )
+    msg = data.get("message") or meta.get("message") or f"HTTP {res.status_code}"
     fmt_hint = (
         ""
         if is_hex32
         else "（※設定値が32桁の16進数ではないため、別サービスのキーまたはコピー漏れの可能性があります）"
     )
-    return {
-        "ok": False,
-        "key_type": "fsa",
-        "service_name": "金融庁公式 EDINET API v2",
-        "message": f"🔴 金融庁公式 EDINET API 認証失敗: {msg}",
-        "guide": f"金融庁EDINET API (`api.edinet-fsa.go.jp`) で認証が拒否されました{fmt_hint}。Secretsの `EDINET_API_KEY` を確認してください。",
-    }
+    return _build_status(
+        False,
+        "fsa",
+        sname,
+        f"🔴 金融庁公式 EDINET API 認証失敗: {msg}",
+        f"金融庁EDINET API (`api.edinet-fsa.go.jp`) で認証が拒否されました{fmt_hint}。Secretsの `EDINET_API_KEY` を確認してください。",
+    )
   except Exception as e:
-    return {
-        "ok": False,
-        "key_type": "fsa",
-        "service_name": "金融庁公式 EDINET API v2",
-        "message": f"🔴 金融庁公式 EDINET API 通信エラー: {e}",
-        "guide": "ネットワーク接続または金融庁EDINET APIのメンテナンス状況を確認してください。",
-    }
+    return _build_status(
+        False,
+        "fsa",
+        sname,
+        f"🔴 金融庁公式 EDINET API 通信エラー: {e}",
+        "ネットワーク接続または金融庁EDINET APIのメンテナンス状況を確認してください。",
+    )
 
 
 def check_edinet_api_status(force_refresh: bool = False) -> dict:
@@ -1042,9 +1004,7 @@ def _fetch_edinetdb_company_summary(
         c_score = c_data.get("credit_score")
         c_rating = c_data.get("credit_rating") or ""
         ind = c_data.get("industry") or ""
-        score_str = (
-            f"{c_score} ({c_rating})" if c_score is not None else "N/A"
-        )
+        score_str = f"{c_score} ({c_rating})" if c_score is not None else "N/A"
         lines.append(
             f"・有報基本属性: 業種={ind} | 会計基準={acc_std} |"
             f" EDINET DB財務健全性スコア={score_str}"
@@ -1067,9 +1027,7 @@ def _fetch_edinetdb_company_summary(
 
         def _fmt_oku(val):
           if isinstance(val, (int, float)) and pd.notna(val):
-            return (
-                f"{val / 1e8:,.1f}億円" if abs(val) >= 1e6 else f"{val:,}"
-            )
+            return f"{val / 1e8:,.1f}億円" if abs(val) >= 1e6 else f"{val:,}"
           return "N/A"
 
         def _fmt_val(val, suffix=""):
@@ -1287,23 +1245,14 @@ def get_news(company_name, is_jp, edinet_reasons=None):
             or any(
                 kw in title
                 for kw in [
-                    "TOPIX",
-                    "再編",
-                    "決算",
-                    "配当",
-                    "株",
-                    "業績",
-                    "アナリスト",
-                    "レーティング",
-                    "目標",
+                    "TOPIX", "再編", "決算", "配当", "株", "業績",
+                    "アナリスト", "レーティング", "目標",
                 ]
             )
         ):
           continue
         pub = entry.get("published", "")[:16]
-        items.append(
-            f"■ {prefix}{title} [出典: {src_name}] ({pub})"
-        )
+        items.append(f"■ {prefix}{title} [出典: {src_name}] ({pub})")
     except Exception:
       pass
     return items
@@ -1418,18 +1367,19 @@ def _normalize_jp_market_segment(raw_market: str) -> str:
     return "東証スタンダード"
   if any(k in s for k in ["東証Ｇ", "東証G", "グロース", "GRT", "Growth"]):
     return "東証グロース"
-  if "名証" in s:
-    return "名証"
-  if "札証" in s:
-    return "札証"
-  if "福証" in s:
-    return "福証"
+  for reg in ["名証", "札証", "福証"]:
+    if reg in s:
+      return reg
   return ""
 
 
 def evaluate_topix_passive_status(market_seg: str, market_cap_str: str) -> str:
   """上場市場区分と時価総額(億円)から、JPXのTOPIX第2段階見直し基準に基づくパッシブ需給区分を5段階で自動定量判定する。"""
-  seg_label = market_seg if market_seg and market_seg != "N/A" else "東証上場(詳細区分要確認)"
+  seg_label = (
+      market_seg
+      if market_seg and market_seg != "N/A"
+      else "東証上場(詳細区分要確認)"
+  )
   mcap_oku = None
   if market_cap_str and market_cap_str != "N/A":
     m = re.search(r"([0-9,]+(?:\.[0-9]+)?)", str(market_cap_str))
@@ -1439,46 +1389,22 @@ def evaluate_topix_passive_status(market_seg: str, market_cap_str: str) -> str:
       except Exception:
         mcap_oku = None
 
+  prefix = f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
   if mcap_oku is None:
-    return f"上場市場: {seg_label} | TOPIXパッシブ需給区分: 時価総額取得不可のため要検索確認"
-
-  is_regional_only = seg_label in ["名証", "札証", "福証"]
-  if is_regional_only:
-    return (
-        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-        "⚪TOPIX非構成銘柄圏（地方単独上場・TOPIXパッシブ需給影響なし）"
-    )
-
+    return f"{prefix}時価総額取得不可のため要検索確認"
+  if seg_label in ["名証", "札証", "福証"]:
+    return f"{prefix}⚪TOPIX非構成銘柄圏（地方単独上場・TOPIXパッシブ需給影響なし）"
   if mcap_oku >= 500.0:
-    return (
-        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-        f"🟢TOPIX中核・継続採用圏（時価総額{mcap_oku:,.1f}億円：500億円超の主力銘柄・段階的ウエイト低減リスクなし）"
-    )
+    return f"{prefix}🟢TOPIX中核・継続採用圏（時価総額{mcap_oku:,.1f}億円：500億円超の主力銘柄・段階的ウエイト低減リスクなし）"
   if mcap_oku >= 250.0:
     if "プライム" in seg_label:
-      return (
-          f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-          f"🔵TOPIX継続採用圏（時価総額{mcap_oku:,.1f}億円：浮動株比率が極端に低くない限り継続採用圏）"
-      )
-    return (
-        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-        f"🔵TOPIX第2段階・新規採用候補/継続採用圏（時価総額{mcap_oku:,.1f}億円：250億円以上のため新規採用基準候補圏・要検索確認）"
-    )
+      return f"{prefix}🔵TOPIX継続採用圏（時価総額{mcap_oku:,.1f}億円：浮動株比率が極端に低くない限り継続採用圏）"
+    return f"{prefix}🔵TOPIX第2段階・新規採用候補/継続採用圏（時価総額{mcap_oku:,.1f}億円：250億円以上のため新規採用基準候補圏・要検索確認）"
   if mcap_oku >= 100.0:
-    return (
-        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-        f"🟡TOPIX第2段階入替・境界圏（時価総額{mcap_oku:,.1f}億円：浮動株時価総額100億円基準の当落線上・1/4/7/10月末リバランス影響は要検索確認）"
-    )
-
+    return f"{prefix}🟡TOPIX第2段階入替・境界圏（時価総額{mcap_oku:,.1f}億円：浮動株時価総額100億円基準の当落線上・1/4/7/10月末リバランス影響は要検索確認）"
   if "プライム" in seg_label:
-    return (
-        f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-        f"🟠段階的ウエイト低減警戒圏（時価総額{mcap_oku:,.1f}億円：100億円未満のため2026年10月〜2028年7月の四半期ごと8段階ウエイト低減対象の可能性大）"
-    )
-  return (
-      f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-      f"⚪TOPIX非構成銘柄圏（時価総額{mcap_oku:,.1f}億円：100億円未満のスタンダード/グロース銘柄・パッシブ需給影響軽微）"
-  )
+    return f"{prefix}🟠段階的ウエイト低減警戒圏（時価総額{mcap_oku:,.1f}億円：100億円未満のため2026年10月〜2028年7月の四半期ごと8段階ウエイト低減対象の可能性大）"
+  return f"{prefix}⚪TOPIX非構成銘柄圏（時価総額{mcap_oku:,.1f}億円：100億円未満のスタンダード/グロース銘柄・パッシブ需給影響軽微）"
 
 
 def get_japanese_fundamentals(stock_code):
@@ -1529,11 +1455,14 @@ def get_japanese_fundamentals(stock_code):
         if norm_m:
           result["market_segment"] = norm_m
       if result["market_segment"] == "N/A":
-        m_mkt = re.search(r"(東証[ＰＳＧPSG]|東証プライム|東証スタンダード|東証グロース|名証[ＰＭＮ]?|札証|福証)", page_txt)
+        m_mkt = re.search(
+            r"(東証[ＰＳＧPSG]|東証プライム|東証スタンダード|東証グロース|名証[ＰＭＮ]?|札証|福証)",
+            page_txt,
+        )
         if m_mkt:
-          norm_m = _normalize_jp_market_segment(m_mkt.group(1))
-          if norm_m:
-            result["market_segment"] = norm_m
+          result["market_segment"] = (
+              _normalize_jp_market_segment(m_mkt.group(1)) or "N/A"
+          )
 
       info_div = soup.find("div", id="stockinfo_i3")
       if info_div:
@@ -1548,9 +1477,7 @@ def get_japanese_fundamentals(stock_code):
           result["market_cap"] = tds[4].replace("億円", "").strip()
 
       if result["market_cap"] == "N/A":
-        m_mc = re.search(
-            r"時価総額\s*([0-9,]+(?:\.[0-9]+)?)\s*億円", page_txt
-        )
+        m_mc = re.search(r"時価総額\s*([0-9,]+(?:\.[0-9]+)?)\s*億円", page_txt)
         if m_mc:
           result["market_cap"] = m_mc.group(1)
 
@@ -1585,22 +1512,23 @@ def get_japanese_fundamentals(stock_code):
           f"https://finance.yahoo.co.jp/quote/{stock_code}.T", timeout=8
       )
       if yh_html:
-        full_txt = BeautifulSoup(yh_html, "html.parser").get_text(
-            " ", strip=True
-        )
+        full_txt = BeautifulSoup(yh_html, "html.parser").get_text(" ", strip=True)
         if result["market_segment"] == "N/A":
           m_ym = re.search(
               r"(東証プライム|東証スタンダード|東証グロース|東証PRM|東証STD|東証GRT)",
               full_txt,
           )
           if m_ym:
-            result["market_segment"] = _normalize_jp_market_segment(m_ym.group(1))
+            result["market_segment"] = (
+                _normalize_jp_market_segment(m_ym.group(1)) or "N/A"
+            )
         if result["margin"] == "N/A":
-          v = _extract_regex(
-              r"信用倍率.{0,20}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍", full_txt
+          result["margin"] = (
+              _extract_regex(
+                  r"信用倍率.{0,20}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍", full_txt
+              )
+              or "N/A"
           )
-          if v:
-            result["margin"] = v
         if result["per"] == "N/A":
           m_per = re.search(
               r"PER\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍",
@@ -1609,24 +1537,24 @@ def get_japanese_fundamentals(stock_code):
           if m_per:
             val_p = m_per.group(1).replace(",", "")
             result["per"] = (
-                "測定不能(赤字・未定等)"
-                if val_p in ["---", "－", "―"]
-                else val_p
+                "測定不能(赤字・未定等)" if val_p in ["---", "－", "―"] else val_p
             )
         if result["pbr"] == "N/A":
-          v = _extract_regex(
-              r"PBR\s*（実績）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍",
-              full_txt,
+          result["pbr"] = (
+              _extract_regex(
+                  r"PBR\s*（実績）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*倍",
+                  full_txt,
+              )
+              or "N/A"
           )
-          if v:
-            result["pbr"] = v
         if result["div"] == "N/A":
-          v = _extract_regex(
-              r"配当利回り\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*%",
-              full_txt,
+          result["div"] = (
+              _extract_regex(
+                  r"配当利回り\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*%",
+                  full_txt,
+              )
+              or "N/A"
           )
-          if v:
-            result["div"] = v
         if result["market_cap"] == "N/A":
           v = _extract_regex(r"時価総額.{0,25}?([0-9,]+)\s*百万円", full_txt)
           if v:
@@ -1637,10 +1565,7 @@ def get_japanese_fundamentals(stock_code):
               full_txt,
           )
           if m_yh_sum:
-            ann_dt, fy_term = (
-                m_yh_sum.group(1).strip(),
-                m_yh_sum.group(2).strip(),
-            )
+            ann_dt, fy_term = m_yh_sum.group(1).strip(), m_yh_sum.group(2).strip()
             result["earnings_date"] = (
                 f"{fy_term} (直近発表:{ann_dt}{_estimate_next_earnings_period(ann_dt)})"
             )
@@ -1651,80 +1576,57 @@ def get_japanese_fundamentals(stock_code):
             )
             if m_yh_fy:
               result["earnings_date"] = (
-                  f"本決算 {int(m_yh_fy.group(2))}月期"
-                  f" ({m_yh_fy.group(1)}/{m_yh_fy.group(2)}期)"
+                  f"本決算 {int(m_yh_fy.group(2))}月期 ({m_yh_fy.group(1)}/{m_yh_fy.group(2)}期)"
               )
     except Exception:
       pass
 
-  # 3. 日経電子版 (nikkei.com)
-  if any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap", "market_segment"]):
+  # 3. 日経電子版 (nikkei.com) ＆ 4. みんかぶ (minkabu.jp)
+  fallback_sources = [
+      (
+          f"https://www.nikkei.com/nkd/company/?scode={stock_code}",
+          r"予想PER.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍",
+          r"PBR(?:（実績）)?.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍",
+          r"予想配当利回り.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]",
+          r"時価総額.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*億円",
+          False,
+      ),
+      (
+          f"https://minkabu.jp/stock/{stock_code}",
+          r"PER\s*(?:\(調整後\))?.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍",
+          r"PBR.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍",
+          r"配当利回り.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]",
+          r"時価総額.{0,20}?([0-9,]+)\s*百万円",
+          True,
+      ),
+  ]
+  for url, p_per, p_pbr, p_div, p_mc, is_million in fallback_sources:
+    if not any(
+        result[k] == "N/A"
+        for k in ["per", "pbr", "div", "market_cap", "market_segment"]
+    ):
+      break
     try:
-      nk_html = _http_get_html(
-          f"https://www.nikkei.com/nkd/company/?scode={stock_code}", timeout=8
-      )
-      if nk_html:
-        nk_txt = BeautifulSoup(nk_html, "html.parser").get_text(" ", strip=True)
-        if result["market_segment"] == "N/A":
-          m_nk = re.search(r"(東証プライム|東証スタンダード|東証グロース)", nk_txt)
-          if m_nk:
-            result["market_segment"] = m_nk.group(1)
-        if result["per"] == "N/A":
-          v = _extract_regex(r"予想PER.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", nk_txt)
-          if v:
-            result["per"] = v
-        if result["pbr"] == "N/A":
-          v = _extract_regex(
-              r"PBR(?:（実績）)?.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", nk_txt
+      sub_html = _http_get_html(url, timeout=8)
+      if not sub_html:
+        continue
+      sub_txt = BeautifulSoup(sub_html, "html.parser").get_text(" ", strip=True)
+      if result["market_segment"] == "N/A":
+        m_seg = re.search(r"(東証プライム|東証スタンダード|東証グロース)", sub_txt)
+        if m_seg:
+          result["market_segment"] = m_seg.group(1)
+      if result["per"] == "N/A":
+        result["per"] = _extract_regex(p_per, sub_txt) or "N/A"
+      if result["pbr"] == "N/A":
+        result["pbr"] = _extract_regex(p_pbr, sub_txt) or "N/A"
+      if result["div"] == "N/A":
+        result["div"] = _extract_regex(p_div, sub_txt) or "N/A"
+      if result["market_cap"] == "N/A":
+        v_mc = _extract_regex(p_mc, sub_txt)
+        if v_mc:
+          result["market_cap"] = (
+              f"{round(float(v_mc) / 100, 1):,}" if is_million else v_mc
           )
-          if v:
-            result["pbr"] = v
-        if result["div"] == "N/A":
-          v = _extract_regex(
-              r"予想配当利回り.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]", nk_txt
-          )
-          if v:
-            result["div"] = v
-        if result["market_cap"] == "N/A":
-          m = re.search(r"時価総額.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*億円", nk_txt)
-          if m:
-            result["market_cap"] = m.group(1)
-    except Exception:
-      pass
-
-  # 4. みんかぶ (minkabu.jp)
-  if any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap", "market_segment"]):
-    try:
-      mk_html = _http_get_html(
-          f"https://minkabu.jp/stock/{stock_code}", timeout=8
-      )
-      if mk_html:
-        mk_txt = BeautifulSoup(mk_html, "html.parser").get_text(" ", strip=True)
-        if result["market_segment"] == "N/A":
-          m_mk = re.search(r"(東証プライム|東証スタンダード|東証グロース)", mk_txt)
-          if m_mk:
-            result["market_segment"] = m_mk.group(1)
-        if result["per"] == "N/A":
-          v = _extract_regex(
-              r"PER\s*(?:\(調整後\))?.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍",
-              mk_txt,
-          )
-          if v:
-            result["per"] = v
-        if result["pbr"] == "N/A":
-          v = _extract_regex(r"PBR.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍", mk_txt)
-          if v:
-            result["pbr"] = v
-        if result["div"] == "N/A":
-          v = _extract_regex(
-              r"配当利回り.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]", mk_txt
-          )
-          if v:
-            result["div"] = v
-        if result["market_cap"] == "N/A":
-          v = _extract_regex(r"時価総額.{0,20}?([0-9,]+)\s*百万円", mk_txt)
-          if v:
-            result["market_cap"] = f"{round(float(v) / 100, 1):,}"
     except Exception:
       pass
 
@@ -1739,9 +1641,7 @@ def get_japanese_fundamentals(stock_code):
             f"本決算 {int(m_kb.group(1))}月期 (EDINET基準:{kessan_bi})"
         )
       elif kessan_bi and kessan_bi.lower() != "nan":
-        result["earnings_date"] = (
-            f"決算日:{kessan_bi} (次回発表日は要検索確認)"
-        )
+        result["earnings_date"] = f"決算日:{kessan_bi} (次回発表日は要検索確認)"
 
   if any(result[k] != "N/A" for k in ["per", "pbr", "market_cap", "div"]):
     st.session_state[cache_key] = (result, time.time())
@@ -1823,47 +1723,3 @@ def search_us_ticker_by_name(query):
     return _extract_quotes(getattr(yf.Search(query, max_results=10), "quotes", []))
   except Exception:
     return []
-
-
-# --- 以下、GASスプレッドシート連携用レガシー互換関数 ---
-def save_analysis_to_sheet(
-    date_str, stock_code, name, judgement, target_price, time_limit, report_text
-):
-  webapp_url = st.secrets.get("GAS_WEBAPP_URL", "")
-  if not webapp_url:
-    st.error("GAS_WEBAPP_URLが設定されていません。")
-    return False
-
-  payload = {
-      "date": date_str,
-      "stock_code": stock_code,
-      "name": name,
-      "judgement": judgement,
-      "target_price": target_price,
-      "time_limit": time_limit,
-      "report_text": report_text,
-  }
-  try:
-    res = requests.post(webapp_url, json=payload, timeout=10)
-    if res.status_code == 200 and res.json().get("status") == "success":
-      return True
-    st.error("スプレッドシートへの保存に失敗しました。")
-    return False
-  except Exception as e:
-    st.error(f"通信エラー: {e}")
-    return False
-
-
-def load_history_from_sheet():
-  webapp_url = st.secrets.get("GAS_WEBAPP_URL", "")
-  if not webapp_url:
-    return pd.DataFrame()
-  try:
-    res = requests.get(webapp_url, timeout=10)
-    if res.status_code == 200:
-      data = res.json()
-      if isinstance(data, list) and data:
-        return pd.DataFrame(data)
-  except Exception:
-    pass
-  return pd.DataFrame()
