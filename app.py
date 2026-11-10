@@ -1,12 +1,12 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9 高密度スリム版)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.1 高密度スリム版)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #   期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #   日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 / fast_info & Dividends最終補完 /
 #   LSEGレポート併用プロンプト対応 / マクロ13指標表＆マクロ5段チャート(11指標)連動 /
 #   世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合＆15営業日イベント検索指示 /
 #   上場市場抽出＆TOPIXパッシブ需給区分5段階自動定量判定 /
-#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期エンジン
+#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期エンジン(Step4巻き戻し防止付)
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io, os, re, unicodedata, zipfile
@@ -61,10 +61,11 @@ def _normalize_yf_df(df: pd.DataFrame, target_tz: str) -> pd.DataFrame:
 
 def _fetch_safe_history(stock, period_str: str, interval_str: str, target_tz: str, use_repair: bool = False) -> pd.DataFrame:
     df = pd.DataFrame()
-    for rep in (use_repair, False):
+    for rep in dict.fromkeys([use_repair, False]):
         try:
             df = stock.history(period=period_str, interval=interval_str, auto_adjust=False, repair=rep)
-            break
+            if df is not None and not df.empty:
+                break
         except Exception:
             df = pd.DataFrame()
     return _normalize_yf_df(df, target_tz)
@@ -105,15 +106,13 @@ def _is_intraday_unconfirmed(df_d, is_jp: bool) -> bool:
         return False
     try:
         last_bar_date = df_d.index[-1].date()
-        if is_jp:
-            now_local = datetime.now(timezone(timedelta(hours=9)))
-            return last_bar_date == now_local.date() and dt_time(9, 0) <= now_local.time() < dt_time(15, 30)
+        tz_name = "Asia/Tokyo" if is_jp else "America/New_York"
         try:
-            from zoneinfo import ZoneInfo
-            now_ny = datetime.now(ZoneInfo("America/New_York"))
+            now_local = pd.Timestamp.now(tz=tz_name)
         except Exception:
-            now_ny = datetime.now(timezone(timedelta(hours=-5)))
-        return last_bar_date == now_ny.date() and dt_time(9, 30) <= now_ny.time() < dt_time(16, 0)
+            now_local = datetime.now(timezone(timedelta(hours=9 if is_jp else -5)))
+        open_t, close_t = (dt_time(9, 0), dt_time(15, 30)) if is_jp else (dt_time(9, 30), dt_time(16, 0))
+        return last_bar_date == now_local.date() and open_t <= now_local.time() < close_t
     except Exception:
         return False
 
@@ -249,6 +248,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
                 df_h = df_h.drop(index=drop_ts_list)
 
     # --- Step 3: 1時間足に存在するが日足に存在しない営業日を日足へ合成・追加 ---
+    synthesized_dates = set()
     if not df_h.empty:
         existing_d_dates = set(df_d.index.date) if not df_d.empty else set()
         new_d_rows = []
@@ -264,6 +264,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
                         if col not in row_data:
                             row_data[col] = 0.0
                 new_d_rows.append((pd.Timestamp(h_date), row_data))
+                synthesized_dates.add(h_date)
 
         if new_d_rows:
             add_d_df = pd.DataFrame([r[1] for r in new_d_rows], index=[r[0] for r in new_d_rows])
@@ -283,9 +284,10 @@ def repair_and_sync_multi_timeframe_ohlcv(
             w_high = float(df_w.loc[w_last_ts, "High"])
             w_low = float(df_w.loc[w_last_ts, "Low"])
 
-            if not is_intraday and w_close > 0:
+            # 最新日足が1時間足からの新規合成ではなく、かつ確定状態で微小差(1.5%未満)の場合のみ週足確定終値を採用
+            if not is_intraday and last_d_date not in synthesized_dates and w_close > 0:
                 d_close = float(df_d.loc[last_d_ts, "Close"])
-                if not np.isclose(d_close, w_close) and abs(d_close - w_close) / max(w_close, 1.0) < 0.03:
+                if not np.isclose(d_close, w_close) and abs(d_close - w_close) / max(w_close, 1.0) < 0.015:
                     df_d.loc[last_d_ts, "Close"] = w_close
                     df_d.loc[last_d_ts, "High"] = max(float(df_d.loc[last_d_ts, "High"]), w_close)
                     df_d.loc[last_d_ts, "Low"] = min(float(df_d.loc[last_d_ts, "Low"]), w_close)

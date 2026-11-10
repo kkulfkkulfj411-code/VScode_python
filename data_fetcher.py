@@ -1,14 +1,14 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.1 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
-#            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
+#            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
 #            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ除外 /
 #            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定(区分不明の根絶) /
-#            [Rev.9] マクロ指標(1306.T/N225等)の最新営業日欠落に対する短期足(5d/1h)自動合成パッチ
-#                    ＆ CBOE公式CSV補完の高感度化・レガシー削除・3ファイル構成維持の高密度圧縮済
+#            [Rev.9.1] マクロ指標(1306.T/N225等)の最新営業日欠落に対する短期足(5d/1h)自動合成パッチ
+#                      ＆ CBOE公式CSV補完マージ最適化・3ファイル構成維持の高密度圧縮済
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -332,7 +332,8 @@ def get_macro_data_and_history():
       if df.empty or len(df) < 60 or days_lag >= 3:
         cboe_df = _fetch_cboe_csv_fallback(sym)
         if not cboe_df.empty:
-          df = cboe_df if df.empty else pd.concat([df, cboe_df])[~pd.concat([df, cboe_df]).index.duplicated(keep="last")].sort_index()
+          merged = cboe_df if df.empty else pd.concat([df, cboe_df])
+          df = merged[~merged.index.duplicated(keep="last")].sort_index()
     elif not df.empty:
       days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days
       if sym in ["1306.T", "^N225", "USDJPY=X"] or days_lag >= 2:
@@ -909,7 +910,7 @@ def get_japanese_fundamentals(stock_code):
   cache_key = f"fund_cache_{stock_code}"
   if cache_key in st.session_state:
     cached_val, cached_ts = st.session_state[cache_key]
-    if time.time() - cached_ts < 3600 and cached_val.get("market_segment"):
+    if time.time() - cached_ts < 3600 and cached_val.get("market_segment", "N/A") != "N/A":
       return cached_val
 
   result = {"per": "N/A", "pbr": "N/A", "div": "N/A", "margin": "N/A", "market_cap": "N/A", "earnings_date": "要検索確認", "market_segment": "N/A"}
@@ -1043,7 +1044,7 @@ def get_japanese_fundamentals(stock_code):
       elif kessan_bi and kessan_bi.lower() != "nan":
         result["earnings_date"] = f"決算日:{kessan_bi} (次回発表日は要検索確認)"
 
-  if any(result[k] != "N/A" for k in ["per", "pbr", "market_cap", "div"]):
+  if result["market_segment"] != "N/A" and any(result[k] != "N/A" for k in ["per", "pbr", "market_cap", "div"]):
     st.session_state[cache_key] = (result, time.time())
   return result
 
