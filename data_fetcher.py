@@ -1,10 +1,11 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.5)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.7)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
-#            マクロ11指標化(1306.T TOPIX追加・JST日付ズレ防止・対日経相対強弱サマリー算出)
+#            マクロ13指標化(1306.T TOPIX・WTI原油[CL=F]・金先物[GC=F]追加・JST日付ズレ防止) /
+#            リアルタイム世界情勢・日米金融政策・日本の国策RSS独立取得(get_macro_policy_news)
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -251,6 +252,8 @@ def get_macro_data_and_history():
       ("HYG", "HYG (ハイイールド債ETF)", 2, "$"),
       ("^SOX", "SOX (半導体株指数)", 1, ""),
       ("^TNX", "US10Y (米10年債利回り)", 2, "%"),
+      ("CL=F", "WTI原油先物 (エネルギー/地政学)", 2, "$"),
+      ("GC=F", "金先物 Gold (有事逃避/実質金利)", 1, "$"),
       ("USDJPY=X", "USD/JPY (ドル円)", 2, "円"),
       ("^N225", "Nikkei225 (日経平均)", 0, "円"),
       ("1306.T", "TOPIX連動ETF (1306.T)", 1, "円"),
@@ -481,7 +484,7 @@ def get_macro_data_and_history():
 
   macro_text = (
       f"・CNN Fear & Greed Index: {fg_str}\n{term_line}{jp_rel_line}\n\n"
-      "[グローバルマクロ＆ボラティリティ時系列マトリクス（瞬間高安値・Zスコア・252日動的基準補正付）]\n"
+      "[グローバルマクロ＆ボラティリティ時系列マトリクス（13指標・瞬間高安値・Zスコア・252日動的基準補正付）]\n"
       + "\n".join(rows)
   )
   return macro_text, histories
@@ -491,6 +494,94 @@ def get_macro_data_and_history():
 def get_macro_data():
   text, _ = get_macro_data_and_history()
   return text
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_macro_policy_news() -> str:
+  """Google News RSSから①世界情勢・米金融/通商政策、②日本の政策・日銀動向・国策の最新ヘッドラインを並列取得し重複除去して返す。"""
+  queries = [
+      (
+          "🌍[世界情勢・米政策]",
+          "(FOMC OR FRB OR 米関税 OR 対中規制 OR 地政学リスク OR 中東情勢 OR 台湾 OR 米雇用統計 OR 米CPI) when:7d",
+          "(FOMC OR FRB OR 米関税 OR 対中規制 OR 地政学リスク OR 米雇用統計 OR 米CPI)",
+          5,
+      ),
+      (
+          "🇯🇵[日本政策・日銀・国策]",
+          "(日銀 決定会合 OR 日銀 利上げ OR 為替介入 OR 国策 OR 防衛省 OR 半導体 補助金 OR GX OR 経済安保 OR 補正予算 OR 税制改正) when:7d",
+          "(日銀 金融政策 OR 為替介入 OR 国策 半導体 OR 防衛費 OR 経済安保 OR 補正予算)",
+          5,
+      ),
+  ]
+
+  def _fetch_category_rss(tag: str, q_recent: str, q_fallback: str, limit: int):
+    def _parse_query(q_str):
+      encoded_q = urllib.parse.quote(q_str)
+      url = f"https://news.google.com/rss/search?q={encoded_q}&hl=ja&gl=JP&ceid=JP:ja"
+      try:
+        res = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=6)
+        if res.status_code == 200 and res.content:
+          feed = feedparser.parse(res.content)
+        else:
+          feed = feedparser.parse(url)
+      except Exception:
+        try:
+          feed = feedparser.parse(url)
+        except Exception:
+          return []
+
+      extracted = []
+      for entry in getattr(feed, "entries", [])[: limit + 3]:
+        raw_title = getattr(entry, "title", "")
+        title = raw_title.split(" - ")[0].strip()
+        if not title:
+          continue
+        pub = entry.get("published", "")[:16]
+        desc = html.unescape(
+            re.sub(r"<[^>]+>", "", entry.get("description", ""))
+        )
+        desc_clean = re.sub(r"\s+", " ", desc).strip()
+        if title in desc_clean:
+          desc_clean = desc_clean.replace(title, "").strip(" ・-—")
+        if len(desc_clean) > 95:
+          desc_clean = desc_clean[:95] + "..."
+        line = f"・{tag} {title} ({pub})"
+        if desc_clean and len(desc_clean) > 10:
+          line += f"\n  概要: {desc_clean}"
+        extracted.append((title, line))
+      return extracted
+
+    items = _parse_query(q_recent)
+    if not items:
+      items = _parse_query(q_fallback)
+    return items[:limit]
+
+  results_by_idx = {}
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    future_map = {
+        executor.submit(_fetch_category_rss, tag, qr, qf, lim): idx
+        for idx, (tag, qr, qf, lim) in enumerate(queries)
+    }
+    for f in as_completed(future_map):
+      idx = future_map[f]
+      try:
+        results_by_idx[idx] = f.result()
+      except Exception:
+        results_by_idx[idx] = []
+
+  unique_lines, seen_keys = [], set()
+  for idx in sorted(results_by_idx.keys()):
+    for title, line in results_by_idx[idx]:
+      norm_key = re.sub(r"[\s ・、。「」『』（）()【】\[\]]+", "", title)[:18]
+      if norm_key and norm_key not in seen_keys:
+        seen_keys.add(norm_key)
+        unique_lines.append(line)
+
+  return (
+      "\n".join(unique_lines)
+      if unique_lines
+      else "・直近のマクロ・金融政策・国策に関する主要ヘッドラインは取得されませんでした（Step 0のGoogle検索で補完してください）。"
+  )
 
 
 # ==============================================================================

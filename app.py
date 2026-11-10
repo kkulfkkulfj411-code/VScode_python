@@ -1,10 +1,11 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.6)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.7)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
 #            期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #            日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 /
 #            fast_info & Dividends最終補完 / LSEGレポート併用プロンプト対応 /
-#            マクロ11指標(改定案A・日経SMA25・TOPIX相対軌道)連動プロンプト＆個別株対指数RS算出
+#            マクロ13指標表(WTI原油・金先物追加)＆マクロ5段チャート(11指標)連動 /
+#            世界情勢・日米金融政策・日本の国策RSS統合 ＆ 15営業日重要イベント地雷原検索指示
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io
@@ -23,6 +24,7 @@ from data_fetcher import (
     get_japanese_fundamentals,
     get_japanese_name,
     get_macro_data_and_history,
+    get_macro_policy_news,
     get_news,
     get_sbi_order_limit_dates,
     get_us_stock_name,
@@ -572,9 +574,10 @@ if generate_button and stock_code:
   ticker = f"{stock_code}.T" if is_jp else stock_code.upper()
 
   with st.spinner(
-      "市場データ・マクロボラティリティ(11指標・252日自動補正)の取得とチャート画像4枚を生成中..."
+      "市場データ・マクロボラティリティ(13指標)・世界情勢/政策ヘッドラインの取得とチャート画像4枚を生成中..."
   ):
     macro_text, macro_histories = get_macro_data_and_history()
+    macro_policy_news_str = get_macro_policy_news()
     stock, df_w, df_d, df_h = get_fresh_ticker_and_history(
         ticker, is_jp=is_jp, use_repair=use_repair
     )
@@ -870,6 +873,7 @@ if generate_button and stock_code:
     full_text_data = (
         f"【分析対象銘柄：{name}（{stock_code} / {ticker}）】\n\n"
         f"【グローバルマクロ＆ボラティリティ参考値】\n{macro_text}\n\n"
+        f"[リアルタイム世界情勢・日米金融政策・日本の国策ヘッドライン]\n{macro_policy_news_str}\n\n"
         f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分:"
         f" {'日本株' if is_jp else '米国株'}】 ---\n"
         f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per_str}"
@@ -951,19 +955,27 @@ if st.session_state.generated_data:
 
   if data.get("is_jp", True):
     search_focus = (
-        f"・重点検索：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、"
+        f"・重点検索①（企業・需給）：「{data['name']}（{data['stock_code']}）」の最新決算・業績推移、"
         "次回決算日、配当権利月、日次信用残・機関空売り残高、TOPIX定期入替区分（不明時は『区分不明』と記載）\n"
-        "・マクロ5段チャート（改定案A：11指標）＆対指数RS統合評価：Panel2(VVIX×SKEW)のオプション警戒感、Panel3(MOVE×HYG)のクレジット歪み、"
-        "およびPanel5(日経平均＆日経SMA25＆TOPIX相対軌道[1306.T]×ドル円)から『値がさハイテク主導か内需・東証全体への資金流入か』を判定し、本銘柄の対日経・対TOPIX相対強弱と照合すること。\n"
+        "・重点検索②（向こう15営業日の日米重要イベント地雷原＆国策織り込み検証）：発注日から15営業日以内の日米重要イベント日程"
+        "（日銀金融政策決定会合・FOMC・米雇用統計・米CPI・日米SQ日・主要選挙/政治日程）を必ずGoogle検索で特定し、"
+        "イベント通過時のギャップダウン被弾を防ぐため決済タイムリミット（イベント前営業日の後場撤退）または見送り判断に反映すること。"
+        "あわせて所属セクターに対する日本政府の国策・補助金・規制や米通商政策の影響を検索・評価しつつ、"
+        "すでに株価へ織り込み済み（材料出尽くし高値圏）でないかをWTI原油(CL=F)・金(GC=F)・VIX・対指数RS・52週高値比の数値で裏付け検証すること。\n"
+        "・マクロ13指標表＆5段チャート（改定案A：11指標）＆対指数RS統合評価：Panel2(VVIX×SKEW)のオプション警戒感、Panel3(MOVE×HYG)のクレジット歪み、"
+        "WTI原油・金先物の実物インフレ/有事動向、およびPanel5(日経平均＆日経SMA25＆TOPIX相対軌道[1306.T]×ドル円)から『値がさハイテク主導か内需・東証全体への資金流入か』を判定し、本銘柄の対日経・対TOPIX相対強弱と照合すること。\n"
         "・LSEGレポートPDF追加添付時：Q1/Q2単体の表面的な業績スコアと通期EPS予想修正トレンドの乖離（計上時期偏重の有無）、"
         "コンセンサス目標株価レンジ（最高・平均・最低）、対日経225ベータ・相関、過去10年月次リターン季節性を統合評価すること。"
     )
   else:
     search_focus = (
-        f"・重点検索：「{data['name']}（{data['stock_code']}）」の最新四半期決算"
+        f"・重点検索①（企業・需給）：「{data['name']}（{data['stock_code']}）」の最新四半期決算"
         f"（英語クエリ `{data['stock_code']} earnings release guidance` 必須）、"
         "次回Earnings Date、Form 13F/Form 4、Short Interest推移\n"
-        "・マクロ5段チャート（改定案A：11指標）統合評価：Panel1(VIX期間構造)、Panel2(VVIX×SKEW)、Panel3(MOVE×HYG)、Panel4(SOX×US10Y)の連動性と本銘柄の対指数相対強弱を照合すること。"
+        "・重点検索②（向こう15営業日の日米重要イベント地雷原＆政策織り込み検証）：発注日から15営業日以内の重要マクロイベント日程"
+        "（FOMC・米雇用統計・米CPI・米SQ日・主要政治/通商日程）を必ずGoogle検索で特定し、決済タイムリミットまたは見送り判断に反映すること。"
+        "あわせて所属セクターに対する米通商政策（関税・対中輸出規制・補助金等）の影響を検索し、すでに株価へ織り込み済みでないかをWTI原油(CL=F)・金(GC=F)・VIX・対SOX指数RSの数値で裏付け検証すること。\n"
+        "・マクロ13指標表＆5段チャート（改定案A：11指標）統合評価：Panel1(VIX期間構造)、Panel2(VVIX×SKEW)、Panel3(MOVE×HYG)、Panel4(SOX×US10Y)、およびWTI原油・金先物の連動性と本銘柄の対指数相対強弱を照合すること。"
     )
 
   chat_prompt = (
