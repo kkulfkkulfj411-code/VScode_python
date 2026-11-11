@@ -1,13 +1,13 @@
 yfinance==1.7.0
 streamlit==1.66.1
 pandas
+numpy
 ta
 fear-greed
-google-generativeai
 mplfinance
-python-dotenv
 feedparser
 requests
+curl_cffi
+beautifulsoup4
 matplotlib
-tenacity
 six
