@@ -1,14 +1,15 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.3 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.4 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
-#            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ＆ETF/定型ページノイズ除外 /
+#            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ＆ETF/適時開示ノイズ除外 /
 #            上場市場抽出 ＆ JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定 /
-#            [Rev.9.3] JPX公式 topixweight_j.csv 自動取得キャッシュ＆ウエイト・規模区分照合を導入し、
-#                      グロース/非構成スタンダード銘柄が継続採用圏・入替境界圏と誤判定されるバグを完全修正
+#            [Rev.9.4] JPX公式 topixweight_j.csv のNFKC正規化＆ヘッダー自動検出パース、
+#                      取得失敗時の空辞書キャッシュ防止(成功時のみsession_state保存＆キャッシュクリア連動)、
+#                      および国策RSSへの個別銘柄適時開示混入防止フィルタを追加
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,7 @@ import difflib
 import io
 import re
 import time
+import unicodedata
 import urllib.parse
 from bs4 import BeautifulSoup
 import fear_greed
@@ -510,7 +512,7 @@ def get_macro_policy_news() -> str:
       ("🇺🇸[米金融政策・米マクロ]", "(FOMC OR FRB OR パウエル OR 米利下げ OR 米利上げ OR 米雇用統計 OR 米CPI OR 米長期金利) when:7d", "(FOMC OR FRB OR 米雇用統計 OR 米CPI OR 米長期金利)", 3),
       ("🌍[世界情勢・通商・地政学]", "(米関税 OR トランプ関税 OR 対中規制 OR 半導体規制 OR 台湾海峡 OR 中東情勢 OR 原油先物 OR 地政学リスク) -火災 -事故 -芸能 when:7d", "(米関税 OR 対中規制 OR 半導体規制 OR 地政学リスク) -火災 -事故", 3),
       ("🏦[日銀政策・為替・国内金利]", "(日銀 決定会合 OR 日銀 利上げ OR 植田総裁 OR 為替介入 OR 円安 日銀 OR 長期金利 日銀) when:7d", "(日銀 金融政策 OR 植田総裁 OR 為替介入 OR 長期金利)", 3),
-      ("🇯🇵[日本の国策・産業政策]", "(半導体 補助金 OR ラピダス OR 防衛省 OR 防衛費 OR GX 投資 OR 経済安保 OR 補正予算 OR 税制改正) -ETF -上場投信 -火災 -事故 when:7d", "(国策 半導体 OR 防衛費 OR 経済安保 OR 補正予算 OR 税制改正) -ETF -上場投信 -火災 -事故", 3),
+      ("🇯🇵[日本の国策・産業政策]", "(半導体 補助金 OR ラピダス OR 防衛省 OR 防衛費 OR GX 投資 OR 経済安保 OR 補正予算 OR 税制改正) -ETF -上場投信 -適時開示 -火災 -事故 when:7d", "(国策 半導体 OR 防衛費 OR 経済安保 OR 補正予算 OR 税制改正) -ETF -上場投信 -適時開示 -火災 -事故", 3),
   ]
   blacklist_sources = ["デイリー新潮", "文春オンライン", "週刊文春", "週刊新潮", "日刊ゲンダイ", "東スポ", "女性自身", "女性セブン", "ポストセブン", "アサ芸", "まいじつ", "スポーツ報知", "日刊スポーツ", "スポニチ", "サンスポ", "デイリースポーツ"]
   blacklist_words = [
@@ -518,6 +520,7 @@ def get_macro_policy_news() -> str:
       "上場投信", "ＥＴＦ", "ETF[", "ETF（", "グローバルＸ", "NEXT FUNDS",
       "iシェアーズ", "MAXIS", "上場インデックス", "投資法人",
       "株価・株式情報", "夜間PTS含む", "みんなの売買予想",
+      "適時開示)", "日経会社情報",
   ]
   preferred_sources = ["日本経済新聞", "日経", "Reuters", "ロイター", "Bloomberg", "ブルームバーグ", "株探", "Kabutan", "みんかぶ", "四季報", "東洋経済", "ダイヤモンド", "ウエルスアドバイザー", "時事通信", "共同通信", "NHK", "テレビ東京", "テレ東", "野村證券", "大和証券"]
 
@@ -896,21 +899,26 @@ def _normalize_jp_market_segment(raw_market: str) -> str:
   return ""
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
 def _load_topix_constituents_map() -> dict:
-  """JPX公式のTOPIX構成銘柄ウエイト一覧CSVを自動取得し、4桁コード別のウエイト・規模区分辞書を返す。"""
+  """JPX公式のTOPIX構成銘柄ウエイト一覧CSVを自動取得し、1,000銘柄以上抽出成功時のみsession_stateへキャッシュする。"""
+  cache_key = "fund_cache__topix_csv_map"
+  if cache_key in st.session_state:
+    cached_map, cached_ts = st.session_state[cache_key]
+    if isinstance(cached_map, dict) and len(cached_map) >= 1000 and (time.time() - cached_ts) < 86400:
+      return cached_map
+
   raw_bytes = None
   for url in _TOPIX_CSV_URLS:
     if HAS_CURL_CFFI:
       try:
-        res = cffi_requests.get(url, impersonate="chrome", timeout=8)
+        res = cffi_requests.get(url, impersonate="chrome", timeout=10)
         if res.status_code == 200 and len(res.content) > 1000:
           raw_bytes = res.content
           break
       except Exception:
         pass
     try:
-      res = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=8)
+      res = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
       if res.status_code == 200 and len(res.content) > 1000:
         raw_bytes = res.content
         break
@@ -920,43 +928,55 @@ def _load_topix_constituents_map() -> dict:
   if not raw_bytes:
     return {}
 
-  df = pd.DataFrame()
+  text = ""
   for enc in ("cp932", "shift_jis", "utf-8-sig", "utf-8"):
     try:
-      text = raw_bytes.decode(enc)
-      cand_df = pd.read_csv(io.StringIO(text), dtype=str)
-      if cand_df is not None and not cand_df.empty and any("コード" in str(c) for c in cand_df.columns):
-        df = cand_df
+      cand_txt = raw_bytes.decode(enc)
+      if "コード" in cand_txt:
+        text = cand_txt
         break
     except Exception:
       continue
-
-  if df.empty:
+  if not text:
     return {}
 
-  code_col = next((c for c in df.columns if "コード" in str(c)), None)
-  weight_col = next((c for c in df.columns if "ウエイト" in str(c) or "ウェイト" in str(c)), None)
-  idx_col = next((c for c in df.columns if "区分" in str(c) or "インデックス" in str(c)), None)
-  date_col = next((c for c in df.columns if "日付" in str(c) or "基準" in str(c)), None)
+  lines = [line for line in text.splitlines() if line.strip()]
+  header_idx = next((i for i, line in enumerate(lines[:10]) if "コード" in line), 0)
+  try:
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), dtype=str)
+  except Exception:
+    return {}
+  if df is None or df.empty:
+    return {}
+
+  norm_cols = {c: unicodedata.normalize("NFKC", str(c)).strip() for c in df.columns}
+  code_col = next((c for c, nc in norm_cols.items() if "コード" in nc), None)
+  weight_col = next((c for c, nc in norm_cols.items() if "ウエイト" in nc or "ウェイト" in nc or "比率" in nc), None)
+  idx_col = next((c for c, nc in norm_cols.items() if "区分" in nc or "インデックス" in nc or "規模" in nc), None)
+  date_col = next((c for c, nc in norm_cols.items() if "日付" in nc or "基準" in nc), None)
   if not code_col:
     return {}
 
   out_map = {}
   for _, row in df.iterrows():
-    raw_c = str(row.get(code_col, "")).strip().upper()
+    raw_c = unicodedata.normalize("NFKC", str(row.get(code_col, ""))).strip().upper()
+    raw_c = raw_c[:-2] if raw_c.endswith(".0") else raw_c
     if not re.match(r"^[0-9]{3}[0-9A-Z]0?$", raw_c):
       continue
     code4 = raw_c[:-1] if (len(raw_c) == 5 and raw_c.endswith("0")) else raw_c[:4]
-    w_str = str(row.get(weight_col, "")).replace("%", "").strip() if weight_col else ""
+    w_str = unicodedata.normalize("NFKC", str(row.get(weight_col, ""))).replace("%", "").strip() if weight_col else ""
     try:
       w_val = float(w_str)
     except Exception:
       w_val = None
-    s_idx = str(row.get(idx_col, "")).strip() if idx_col else ""
-    if s_idx.lower() == "nan":
+    s_idx = unicodedata.normalize("NFKC", str(row.get(idx_col, ""))).strip() if idx_col else ""
+    if s_idx.lower() in ("nan", "none", "-"):
       s_idx = ""
-    dt_s = str(row.get(date_col, "")).strip() if date_col else ""
+    dt_s = unicodedata.normalize("NFKC", str(row.get(date_col, ""))).strip() if date_col else ""
     out_map[code4] = {"weight": w_val, "size_idx": s_idx, "date": dt_s}
+
+  if len(out_map) >= 1000:
+    st.session_state[cache_key] = (out_map, time.time())
   return out_map
 
 
