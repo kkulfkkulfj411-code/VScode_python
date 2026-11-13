@@ -1,12 +1,12 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.1 高密度スリム版)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.2 高密度スリム版)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #   右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
 #   マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部36%余白確保(凡例重なり完全防止) /
 #   改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
 #   VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・4種カスタム線種分離＋極薄帯） /
 #   Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 / 例外時Figure解放保護 /
-#   個別3チャート(週足・日足・1時間足)＆マクロ統合チャートの日本語タイトル化・生成日時＆基準日自動印字
+#   個別3チャート(週足・日足・1時間足)＆マクロ統合チャートの日本語2段タイトル化(下段SMA凡例)・生成日時＆基準日自動印字
 # ==============================================================================
 from datetime import datetime, timedelta, timezone
 import os, re
@@ -96,7 +96,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if df_plot.empty:
         return None
 
-    title = _localize_and_stamp_title(title, df_plot, timeframe_type)
+    title_line1 = _localize_and_stamp_title(title, df_plot, timeframe_type)
 
     aps, legend_texts = [], []
     for col, color, lbl in [('SMA25', 'blue', 'SMA25(青)'), ('SMA75', 'orange', 'SMA75(橙)'), ('SMA200', 'red', 'SMA200(赤)')]:
@@ -104,8 +104,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             aps.append(mpf.make_addplot(df_plot[col], color=color, width=1.2, secondary_y=False))
             legend_texts.append(lbl)
 
-    if legend_texts:
-        title = f"{title}   [{' / '.join(legend_texts)}]"
+    full_title = f"{title_line1}\n[{' / '.join(legend_texts)}]" if legend_texts else title_line1
 
     if 'BB_UP' in df_plot.columns and df_plot['BB_UP'].notna().any():
         for col, color in [('BB_UP', 'gray'), ('BB_MID', 'purple'), ('BB_LOW', 'gray')]:
@@ -146,7 +145,8 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     except Exception:
         my_style = 'yahoo'
 
-    plot_kwargs = dict(type='candle', style=my_style, volume=has_volume, figratio=(12, 10), title=title, ylabel='', returnfig=True)
+    # 2段タイトルがチャート上枠と衝突しないようmpf.plotのtitleは使わずax_main.set_titleで描画
+    plot_kwargs = dict(type='candle', style=my_style, volume=has_volume, figratio=(12, 10), ylabel='', returnfig=True)
     if aps:
         plot_kwargs['addplot'] = aps
     if len(panel_ratios) > 1:
@@ -154,11 +154,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
     try:
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
-        if getattr(fig, '_suptitle', None) is not None:
-            fig._suptitle.set_fontsize(10.0)
-            fig._suptitle.set_fontweight('bold')
         ax_main = axes[0]
         ax_main.set_ylabel('')
+        ax_main.set_title(full_title, fontsize=11.0, fontweight='bold', pad=10, linespacing=1.35)
 
         for ax in fig.axes:
             formatter = ScalarFormatter(useOffset=False, useMathText=False)
@@ -398,8 +396,9 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
         now_jst_str = datetime.now(timezone(timedelta(hours=9))).strftime('%Y/%m/%d %H:%M')
         end_dt_str = common_end_date.strftime('%Y-%m-%d') if common_end_date is not None and hasattr(common_end_date, 'strftime') else 'N/A'
         ax1.set_title(
-            f'グローバルマクロ＆ボラティリティ統合チャート [{now_jst_str}生成 / 基準:{end_dt_str}] (直近{tail_days}営業日・X軸同期 / 破線・薄帯は252日動的80%・90%基準)',
-            fontsize=10.2, fontweight='bold', pad=8,
+            f'グローバルマクロ＆ボラティリティ統合チャート [{now_jst_str}生成 / 基準:{end_dt_str}]\n'
+            f'[直近{tail_days}営業日・X軸完全同期 / 破線・薄帯は過去252日動的補正80%・90%基準]',
+            fontsize=10.5, fontweight='bold', pad=10, linespacing=1.35,
         )
 
         # Panel 2: VVIX (左軸・暖色系) & SKEW指数 (右軸・寒色系) 【株式オプション内部構造】
