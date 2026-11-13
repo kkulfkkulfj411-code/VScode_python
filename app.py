@@ -1,12 +1,13 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.1 高密度スリム版)
-# 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna / temp_*.png事前削除 /
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.3 高密度スリム版)
+# 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna＆分割未調整ヒゲ自動除去 /
 #   期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #   日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 / fast_info & Dividends最終補完 /
 #   LSEGレポート併用プロンプト対応 / マクロ13指標表＆マクロ5段チャート(11指標)連動 /
 #   世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合＆15営業日イベント検索指示 /
 #   上場市場抽出＆TOPIXパッシブ需給区分5段階自動定量判定 /
-#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期エンジン(Step4巻き戻し防止付)
+#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期(Step4巻戻し防止＆Step5異常値逆流防止) /
+#   分析基準日時(生成日時＋確定/未確定足)刻印・見出し末尾日付・SBIメモ先頭日付・ZIP日付付与・個別チャート日本語タイトル化
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io, os, re, unicodedata, zipfile
@@ -118,6 +119,7 @@ def _is_intraday_unconfirmed(df_d, is_jp: bool) -> bool:
 
 
 def _clean_ohlcv_df(df):
+    """OHLCV欠損除去・正値フィルタに加え、株式分割境界の未調整ヒゲ・孤立バッドティックを自動修復する。"""
     if df is None or df.empty:
         return pd.DataFrame()
     cleaned = df.copy()
@@ -130,9 +132,33 @@ def _clean_ohlcv_df(df):
     cleaned = cleaned[(cleaned["Open"] > 0) & (cleaned["High"] > 0) & (cleaned["Low"] > 0) & (cleaned["Close"] > 0)]
     cleaned["Volume"] = pd.to_numeric(cleaned["Volume"], errors="coerce").fillna(0) if "Volume" in cleaned.columns else 0.0
     if not cleaned.empty:
+        cleaned = cleaned[~cleaned.index.duplicated(keep="last")].sort_index()
+        if len(cleaned) >= 3:
+            # 1) 株式分割未調整等で1バー丸ごと前後中央値から+45%超/-35%超乖離した孤立バーを補正
+            med_c = cleaned["Close"].rolling(7, center=True, min_periods=1).median().bfill().ffill()
+            whole_spike = ((cleaned["Open"] > med_c * 1.45) & (cleaned["Close"] > med_c * 1.45)) | (
+                (cleaned["Open"] < med_c * 0.65) & (cleaned["Close"] < med_c * 0.65)
+            )
+            if whole_spike.any():
+                for c in req_cols:
+                    cleaned.loc[whole_spike, c] = med_c.loc[whole_spike]
+
+            # 2) 実体(Open/Close)は正常だがHighまたはLowのみ未調整(例: 1:2分割日のHigh=2倍)の異常ヒゲをクランプ
+            body_high = np.maximum(cleaned["Open"], cleaned["Close"])
+            body_low = np.minimum(cleaned["Open"], cleaned["Close"])
+            med_h = cleaned["High"].rolling(7, center=True, min_periods=1).median().bfill().ffill()
+            med_l = cleaned["Low"].rolling(7, center=True, min_periods=1).median().bfill().ffill()
+
+            bad_high = (cleaned["High"] > body_high * 1.25) & (cleaned["High"] > med_h * 1.25)
+            if bad_high.any():
+                cleaned.loc[bad_high, "High"] = np.maximum(body_high.loc[bad_high], np.minimum(cleaned.loc[bad_high, "High"], med_h.loc[bad_high] * 1.05))
+
+            bad_low = (cleaned["Low"] < body_low * 0.78) & (cleaned["Low"] < med_l * 0.78)
+            if bad_low.any():
+                cleaned.loc[bad_low, "Low"] = np.minimum(body_low.loc[bad_low], np.maximum(cleaned.loc[bad_low, "Low"], med_l.loc[bad_low] * 0.95))
+
         cleaned["High"] = cleaned[req_cols].max(axis=1)
         cleaned["Low"] = cleaned[req_cols].min(axis=1)
-        cleaned = cleaned[~cleaned.index.duplicated(keep="last")].sort_index()
     return cleaned
 
 
@@ -180,7 +206,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
     2) 1時間足の歯抜け（Volume=0 かつ O=H=L=C の横線ダミー足）を15分足/5分足からリサンプリング修復。
     3) 日足に欠落している営業日があれば、1時間足から日足を合成・追加。
     4) 週足の確定終値・高安値（東証15:30クロージング・オークション反映値）と最新日足・1時間足を同期。
-    5) 全共通営業日において、日足と1時間足の四本値を双方向で完全一致させる。
+    5) 全共通営業日において、分割未調整スパイクの逆流を防止しつつ日足と1時間足の四本値を双方向で完全一致させる。
     """
     target_tz = "Asia/Tokyo" if is_jp else "America/New_York"
     df_w, df_d, df_h = _clean_ohlcv_df(df_w), _clean_ohlcv_df(df_d), _clean_ohlcv_df(df_h)
@@ -195,7 +221,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
                     if col not in df_d_short.columns:
                         df_d_short[col] = 0.0
                 df_d = pd.concat([df_d, df_d_short[df_d.columns]]).sort_index()
-                df_d = df_d[~df_d.index.duplicated(keep="last")]
+                df_d = _clean_ohlcv_df(df_d[~df_d.index.duplicated(keep="last")])
                 break
 
     # --- Step 2: 1時間足の Volume=0 フラット横線ダミー足の修復（15分足/5分足リサンプリング） ---
@@ -232,8 +258,12 @@ def repair_and_sync_multi_timeframe_ohlcv(
                             for c in ["Open", "High", "Low", "Close", "Volume"]:
                                 df_h_merged.loc[ts, c] = r_sub[c]
                         elif r_sub["Volume"] > 0:
-                            df_h_merged.loc[ts, "High"] = max(float(r_h["High"]), float(r_sub["High"]))
-                            df_h_merged.loc[ts, "Low"] = min(float(r_h["Low"]), float(r_sub["Low"]))
+                            body_top = max(float(r_h["Open"]), float(r_h["Close"]))
+                            body_bot = min(float(r_h["Open"]), float(r_h["Close"]))
+                            if float(r_sub["High"]) <= body_top * 1.20:
+                                df_h_merged.loc[ts, "High"] = max(float(r_h["High"]), float(r_sub["High"]))
+                            if float(r_sub["Low"]) >= body_bot * 0.82:
+                                df_h_merged.loc[ts, "Low"] = min(float(r_h["Low"]), float(r_sub["Low"]))
                             df_h_merged.loc[ts, "Volume"] = max(float(r_h["Volume"]), float(r_sub["Volume"]))
                 df_h = _clean_ohlcv_df(df_h_merged)
 
@@ -269,7 +299,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
         if new_d_rows:
             add_d_df = pd.DataFrame([r[1] for r in new_d_rows], index=[r[0] for r in new_d_rows])
             df_d = pd.concat([df_d, add_d_df]).sort_index()
-            df_d = df_d[~df_d.index.duplicated(keep="last")]
+            df_d = _clean_ohlcv_df(df_d[~df_d.index.duplicated(keep="last")])
 
     # --- Step 4: 週足(df_w)との大引け確定値双方向同期 ---
     if not df_d.empty and not df_w.empty:
@@ -295,11 +325,12 @@ def repair_and_sync_multi_timeframe_ohlcv(
             week_mask = df_d.index.date >= last_week_monday
             if week_mask.any():
                 week_sub = df_d.loc[week_mask]
-                df_w.loc[w_last_ts, "High"] = max(w_high, float(week_sub["High"].max()))
-                df_w.loc[w_last_ts, "Low"] = min(w_low, float(week_sub["Low"].min()))
+                w_sub_max, w_sub_min = float(week_sub["High"].max()), float(week_sub["Low"].min())
+                df_w.loc[w_last_ts, "High"] = w_sub_max if w_high > w_sub_max * 1.22 else max(w_high, w_sub_max)
+                df_w.loc[w_last_ts, "Low"] = w_sub_min if w_low < w_sub_min * 0.80 else min(w_low, w_sub_min)
                 df_w.loc[w_last_ts, "Close"] = float(week_sub["Close"].iloc[-1])
 
-    # --- Step 5: 全共通営業日における 日足(df_d) ⇔ 1時間足(df_h) の双方向四本値同期 ---
+    # --- Step 5: 全共通営業日における 日足(df_d) ⇔ 1時間足(df_h) の双方向四本値同期（異常値逆流ブロック付） ---
     if not df_d.empty and not df_h.empty:
         d_date_to_ts = {ts.date(): ts for ts in df_d.index}
         last_d_ts = df_d.index[-1]
@@ -312,13 +343,29 @@ def repair_and_sync_multi_timeframe_ohlcv(
             d_open, d_high = float(df_d.loc[d_ts, "Open"]), float(df_d.loc[d_ts, "High"])
             d_low, d_close = float(df_d.loc[d_ts, "Low"]), float(df_d.loc[d_ts, "Close"])
             d_vol = float(df_d.loc[d_ts, "Volume"])
+            d_body_top, d_body_bot = max(d_open, d_close), min(d_open, d_close)
 
             h_first_ts, h_last_ts = grp.index[0], grp.index[-1]
             h_max_ts, h_min_ts = grp["High"].idxmax(), grp["Low"].idxmin()
             h_high, h_low, h_vol_sum = float(grp["High"].max()), float(grp["Low"].min()), float(grp["Volume"].sum())
 
-            true_high = max(d_high, h_high, d_open, d_close)
-            true_low = min(d_low, h_low, d_open, d_close)
+            # 一方の時間軸のみ実体上限から+22%超突出している場合は分割未調整ノイズとみなし正常側を採用
+            if d_high > d_body_top * 1.22 and h_high <= d_body_top * 1.22:
+                true_high = max(h_high, d_body_top)
+            elif h_high > d_body_top * 1.22 and d_high <= d_body_top * 1.22:
+                true_high = max(d_high, d_body_top)
+                df_h.loc[grp.index, "High"] = np.minimum(df_h.loc[grp.index, "High"], true_high)
+            else:
+                true_high = max(d_high, h_high, d_body_top)
+
+            if d_low < d_body_bot * 0.80 and h_low >= d_body_bot * 0.80:
+                true_low = min(h_low, d_body_bot)
+            elif h_low < d_body_bot * 0.80 and d_low >= d_body_bot * 0.80:
+                true_low = min(d_low, d_body_bot)
+                df_h.loc[grp.index, "Low"] = np.maximum(df_h.loc[grp.index, "Low"], true_low)
+            else:
+                true_low = min(d_low, h_low, d_body_bot)
+
             df_d.loc[d_ts, "High"] = true_high
             df_d.loc[d_ts, "Low"] = true_low
 
@@ -344,7 +391,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
             if d_vol <= 0 and h_vol_sum > 0:
                 df_d.loc[d_ts, "Volume"] = h_vol_sum
 
-    return df_w, df_d, df_h
+    return _clean_ohlcv_df(df_w), _clean_ohlcv_df(df_d), _clean_ohlcv_df(df_h)
 
 
 def _get_period_extreme_with_date(series: pd.Series, window: int, is_high: bool, is_jp: bool, include_year: bool = False) -> tuple:
@@ -652,7 +699,7 @@ if generate_button and stock_code:
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, is_jp=is_jp, use_repair=use_repair)
         name = (get_japanese_name(stock_code) or stock_code) if is_jp else get_us_stock_name(stock_code)
 
-        # 3時間軸＋15分足クロスリペア＆全営業日双方向四本値同期エンジン
+        # 3時間軸＋15分足クロスリペア＆全営業日双方向四本値同期エンジン（分割未調整ヒゲ除去付）
         df_w, df_d, df_h = repair_and_sync_multi_timeframe_ohlcv(
             stock=stock, df_w=df_w, df_d=df_d, df_h=df_h, is_jp=is_jp, use_repair=use_repair
         )
@@ -663,6 +710,20 @@ if generate_button and stock_code:
 
         df_w, df_d, df_h = add_indicators(df_w), add_indicators(df_d), add_indicators(df_h)
 
+        # 生成日時・株価基準日・確定状態の算出
+        now_jst = datetime.now(timezone(timedelta(hours=9)))
+        wd_jp = ["月", "火", "水", "木", "金", "土", "日"][now_jst.weekday()]
+        gen_date_slash = now_jst.strftime("%Y/%m/%d")
+        gen_date_short = now_jst.strftime("%m/%d")
+        gen_date_file = now_jst.strftime("%Y%m%d")
+        gen_dt_label = f"{gen_date_slash}({wd_jp}) {now_jst.strftime('%H:%M')} JST"
+
+        latest_d = df_d.iloc[-1]
+        latest_date_str = df_d.index[-1].strftime("%Y-%m-%d") if hasattr(df_d.index[-1], "strftime") else str(df_d.index[-1])[:10]
+        is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+        bar_confirm_status = "ザラ場立会中・未確定足" if is_intraday else "大引け確定足"
+        analysis_basis_str = f"{gen_dt_label}（株価基準日: {latest_date_str} [{bar_confirm_status}]）"
+
         for temp_file in ["temp_weekly.png", "temp_daily.png", "temp_hourly.png", "temp_macro.png"]:
             if os.path.exists(temp_file):
                 try:
@@ -670,13 +731,13 @@ if generate_button and stock_code:
                 except Exception:
                     pass
 
-        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} Weekly", 260, "weekly", is_jp=is_jp)
-        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} Daily", 130, "daily", is_jp=is_jp)
-        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} Hourly", 130, "hourly", is_jp=is_jp)
+        # 個別3チャートタイトルを日本語（週足/日足/1時間足）＋日付入りで描画（第5引数の判定キーは維持）
+        chart_date_tag = f"[{gen_date_slash}生成 / 基準:{latest_date_str}]"
+        img_w = generate_safe_chart_image(df_w, "temp_weekly.png", f"{name} ({stock_code}) 週足 {chart_date_tag}", 260, "weekly", is_jp=is_jp)
+        img_d = generate_safe_chart_image(df_d, "temp_daily.png", f"{name} ({stock_code}) 日足 {chart_date_tag}", 130, "daily", is_jp=is_jp)
+        img_h = generate_safe_chart_image(df_h, "temp_hourly.png", f"{name} ({stock_code}) 1時間足 {chart_date_tag}", 130, "hourly", is_jp=is_jp)
         img_m = generate_macro_chart_image(macro_histories, "temp_macro.png", tail_days=60)
 
-        latest_d = df_d.iloc[-1]
-        latest_date_str = df_d.index[-1].strftime("%Y-%m-%d") if hasattr(df_d.index[-1], "strftime") else str(df_d.index[-1])[:10]
         unit_str = "円" if is_jp else "ドル"
 
         open_price = format_price(latest_d.get("Open"), is_jp)
@@ -705,7 +766,6 @@ if generate_button and stock_code:
             if pd.notna(atr_val) and close_price_num > 0 else "N/A"
         )
 
-        is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
         bar_status_tag = " [※ザラ場立会中・未確定足]" if is_intraday else ""
         vol_avg20 = df_d["Volume"].tail(20).mean()
         vol_ratio = round(float(latest_d["Volume"]) / float(vol_avg20), 2) if pd.notna(vol_avg20) and vol_avg20 > 0 else 1.0
@@ -804,10 +864,11 @@ if generate_button and stock_code:
             market_header_label = "米国株"
 
         full_text_data = (
-            f"【分析対象銘柄：{name}（{stock_code} / {ticker}）】\n\n"
+            f"【分析対象銘柄：{name}（{stock_code} / {ticker}）】\n"
+            f"【データ生成・分析基準日時：{analysis_basis_str}】\n\n"
             f"【グローバルマクロ＆ボラティリティ参考値】\n{macro_text}\n\n"
             f"[リアルタイム世界情勢・日米金融政策・日本の国策ヘッドライン]\n{macro_policy_news_str}\n\n"
-            f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分: {market_header_label}】 ---\n"
+            f"【対象銘柄詳細データ】\n--- 【銘柄: {name} ({ticker}) | 市場区分: {market_header_label} | 分析基準日時: {analysis_basis_str}】 ---\n"
             f"[基本ファンダメンタルズ]\n時価総額: {market_cap_str} | PER: {per_str}"
             f" | PBR: {pbr_str} | 配当利回り: {div_str}{margin_str}{earnings_info_str}\n"
             f"{topix_section}"
@@ -827,12 +888,15 @@ if generate_button and stock_code:
             f"[直近10営業日の時系列推移（日足ベース）]\n{recent_10d_table_text}\n"
         )
 
+        # ZIP展開時の同名ファイル上書きを防ぐため、内部ファイル名にも日付(YYYYMMDD)を付与
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            zip_file.writestr(f"{stock_code}_market_data.txt", full_text_data.encode("utf-8"))
+            zip_file.writestr(f"{stock_code}_{gen_date_file}_market_data.txt", full_text_data.encode("utf-8"))
             for img_path, img_name in [
-                (img_w, f"{stock_code}_1_weekly.png"), (img_d, f"{stock_code}_2_daily.png"),
-                (img_h, f"{stock_code}_3_hourly.png"), (img_m, f"{stock_code}_4_macro.png"),
+                (img_w, f"{stock_code}_{gen_date_file}_1_weekly.png"),
+                (img_d, f"{stock_code}_{gen_date_file}_2_daily.png"),
+                (img_h, f"{stock_code}_{gen_date_file}_3_hourly.png"),
+                (img_m, f"{stock_code}_{gen_date_file}_4_macro.png"),
             ]:
                 if img_path and os.path.exists(img_path):
                     zip_file.write(img_path, img_name)
@@ -841,11 +905,17 @@ if generate_button and stock_code:
             "name": name, "text": full_text_data,
             "images": {"w": img_w, "d": img_d, "h": img_h, "m": img_m},
             "zip_data": zip_buffer.getvalue(), "stock_code": stock_code, "is_jp": is_jp,
+            "gen_date_slash": gen_date_slash, "gen_date_short": gen_date_short,
+            "gen_date_file": gen_date_file, "analysis_basis_str": analysis_basis_str,
         }
-        st.success("✅ データとチャート画像4枚の準備が完了しました！")
+        st.success(f"✅ データとチャート画像4枚の準備が完了しました！（{analysis_basis_str}）")
 
 if st.session_state.generated_data:
     data = st.session_state.generated_data
+    gen_date_slash = data.get("gen_date_slash", datetime.now(timezone(timedelta(hours=9))).strftime("%Y/%m/%d"))
+    gen_date_short = data.get("gen_date_short", datetime.now(timezone(timedelta(hours=9))).strftime("%m/%d"))
+    gen_date_file = data.get("gen_date_file", datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d"))
+    analysis_basis_str = data.get("analysis_basis_str", gen_date_slash)
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -853,13 +923,13 @@ if st.session_state.generated_data:
         st.markdown("ZIPを展開し、中のテキストと画像4枚（週足・日足・1時間足・マクロ統合）をGeminiにドラッグ＆ドロップしてください。")
     with col2:
         st.download_button(
-            label="ZIPファイルをダウンロード", data=data["zip_data"],
-            file_name=f"{data['stock_code']}_analysis_data.zip", mime="application/zip",
+            label=f"ZIPファイルをダウンロード ({gen_date_file})", data=data["zip_data"],
+            file_name=f"{data['stock_code']}_analysis_data_{gen_date_file}.zip", mime="application/zip",
             type="primary", width="stretch",
         )
 
     st.markdown("---")
-    st.subheader("📱 ① Geminiチャット送信用の命令文（スキル自動発動＆タイトル反映用）")
+    st.subheader("📱 ① Geminiチャット送信用の命令文（スキル自動発動＆タイトル・分析日反映用）")
     st.markdown("通常のGeminiチャット入力欄にコピー＆ペーストしてください（登録済みスキル `stock-swing-analyzer` が自動発動します）。")
 
     if data.get("is_jp", True):
@@ -889,13 +959,14 @@ if st.session_state.generated_data:
         )
 
     chat_prompt = (
-        f"【株式スイング分析リクエスト：{data['name']}（{data['stock_code']}）】\n"
+        f"【株式スイング分析リクエスト：{data['name']}（{data['stock_code']}）｜分析基準日時：{analysis_basis_str}】\n"
         "@Google 添付したデータとチャート画像4枚（週足・日足・1時間足・マクロボラティリティ統合チャート）をもとに、"
         "スキルの【Step 0】〜【7】に従って分析をお願いします。\n"
         f"{search_focus}\n"
-        f"・出力厳守：回答の1行目には必ず `# 📊 【銘柄分析】{data['name']}（{data['stock_code']}）` を出力し、"
-        "末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）で"
-        "「銘柄名」「証券コード」「IFDOCO」を一切含めずに出力してください。"
+        f"・出力厳守①（見出し末尾に分析日）：回答の1行目には必ず `# 📊 【銘柄分析】{data['name']}（{data['stock_code']}）[{gen_date_slash}分析]` を出力してください。\n"
+        f"・出力厳守②（判定表に分析基準日時）：「6. ファンドマネージャーの最終投資判断」の表の先頭行に必ず `分析基準日時：{analysis_basis_str}` を明記してください。\n"
+        f"・出力厳守③（SBIメモ先頭に短縮日付）：末尾の「7. 登録銘柄用メモ」はHYPER SBI 2仕様上限（全角100文字以内、推奨60〜80文字の1行）で、"
+        f"先頭に必ず `[{gen_date_short}] ` を付与し、「銘柄名」「証券コード」「IFDOCO」を一切含めずに出力してください。"
     )
     st.code(chat_prompt, language="text")
 

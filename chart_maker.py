@@ -1,13 +1,15 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6 高密度スリム版)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.1 高密度スリム版)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #   右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
 #   マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部36%余白確保(凡例重なり完全防止) /
 #   改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
 #   VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・4種カスタム線種分離＋極薄帯） /
-#   Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 / 例外時Figure解放保護
+#   Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 / 例外時Figure解放保護 /
+#   個別3チャート(週足・日足・1時間足)＆マクロ統合チャートの日本語タイトル化・生成日時＆基準日自動印字
 # ==============================================================================
-import os
+from datetime import datetime, timedelta, timezone
+import os, re
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
@@ -60,6 +62,23 @@ def _add_panel_tag(ax, label_text):
     ax.text(0.01, 0.90, label_text, transform=ax.transAxes, va='top', ha='left', fontsize=8.5, fontweight='bold', color='black', alpha=0.75)
 
 
+def _localize_and_stamp_title(title: str, df_plot: pd.DataFrame, timeframe_type: str) -> str:
+    """タイトル内のWeekly/Daily/Hourlyを週足/日足/1時間足へ変換し、日付未付与時は生成日・基準日を補完する。"""
+    tf_jp_map = {'weekly': '週足', 'daily': '日足', 'hourly': '1時間足'}
+    t_str = str(title or '').strip()
+    for eng, jp in [('Weekly', '週足'), ('Daily', '日足'), ('Hourly', '1時間足')]:
+        t_str = re.sub(rf'\b{eng}\b', jp, t_str, flags=re.IGNORECASE)
+    tf_jp = tf_jp_map.get(timeframe_type, '')
+    if tf_jp and tf_jp not in t_str:
+        t_str = f'{t_str} {tf_jp}'.strip()
+    if '生成' not in t_str and '基準:' not in t_str and not df_plot.empty:
+        now_jst = datetime.now(timezone(timedelta(hours=9))).strftime('%Y/%m/%d')
+        last_dt = df_plot.index[-1]
+        last_dt_s = last_dt.strftime('%Y-%m-%d') if hasattr(last_dt, 'strftime') else str(last_dt)[:10]
+        t_str = f'{t_str} [{now_jst}生成 / 基準:{last_dt_s}]'
+    return t_str
+
+
 def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_type, is_jp=True):
     if df_full is None or df_full.empty:
         return None
@@ -76,6 +95,8 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     df_plot = df_work.tail(tail_count).dropna(subset=['Open', 'High', 'Low', 'Close']).copy()
     if df_plot.empty:
         return None
+
+    title = _localize_and_stamp_title(title, df_plot, timeframe_type)
 
     aps, legend_texts = [], []
     for col, color, lbl in [('SMA25', 'blue', 'SMA25(青)'), ('SMA75', 'orange', 'SMA75(橙)'), ('SMA200', 'red', 'SMA200(赤)')]:
@@ -133,6 +154,9 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
 
     try:
         fig, axes = mpf.plot(df_plot, **plot_kwargs)
+        if getattr(fig, '_suptitle', None) is not None:
+            fig._suptitle.set_fontsize(10.0)
+            fig._suptitle.set_fontweight('bold')
         ax_main = axes[0]
         ax_main.set_ylabel('')
 
@@ -371,9 +395,11 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
                     ax1_r.axhline(1.0, color='purple', ls=':', lw=1.0, alpha=0.8)
                     _style_macro_axis(ax1_r, 'Term Ratio', 'purple', 'upper right', is_bold=False, top_margin=0.36)
 
+        now_jst_str = datetime.now(timezone(timedelta(hours=9))).strftime('%Y/%m/%d %H:%M')
+        end_dt_str = common_end_date.strftime('%Y-%m-%d') if common_end_date is not None and hasattr(common_end_date, 'strftime') else 'N/A'
         ax1.set_title(
-            'Global Macro & Volatility Time-Series Matrix (直近60営業日・X軸完全同期 / 破線・薄帯は252日動的補正80%・90%基準)',
-            fontsize=11, fontweight='bold', pad=8,
+            f'グローバルマクロ＆ボラティリティ統合チャート [{now_jst_str}生成 / 基準:{end_dt_str}] (直近{tail_days}営業日・X軸同期 / 破線・薄帯は252日動的80%・90%基準)',
+            fontsize=10.2, fontweight='bold', pad=8,
         )
 
         # Panel 2: VVIX (左軸・暖色系) & SKEW指数 (右軸・寒色系) 【株式オプション内部構造】
