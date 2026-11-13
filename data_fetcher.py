@@ -1,14 +1,14 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.2 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.3 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
 #            起動時API自動監視＆ワンクリック接続診断(check_edinet_api_status) /
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
 #            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ＆ETF/定型ページノイズ除外 /
-#            上場市場抽出 ＆ TOPIXパッシブ需給区分5段階自動定量判定(区分不明の根絶) /
-#            [Rev.9.2] マクロ指標(1306.T/N225等)の最新営業日欠落に対する短期足(5d/1h)自動合成パッチ
-#                      ＆ 国策RSSへのETF決算短信・株価定型ページ混入防止フィルタ追加済
+#            上場市場抽出 ＆ JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定 /
+#            [Rev.9.3] JPX公式 topixweight_j.csv 自動取得キャッシュ＆ウエイト・規模区分照合を導入し、
+#                      グロース/非構成スタンダード銘柄が継続採用圏・入替境界圏と誤判定されるバグを完全修正
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,6 +39,21 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# JPX公式 TOPIX構成銘柄ウエイト一覧CSV（月次更新）および10月定期入替ラグ補完用セット
+_TOPIX_CSV_URLS = [
+    "https://www.jpx.co.jp/automation/markets/indices/topix/files/topixweight_j.csv",
+    "https://www.jpx.co.jp/markets/indices/topix/tvdivq00000030ne-att/topixweight_j.csv",
+]
+_TOPIX_NEW_GROWTH_202610 = {
+    "2160", "4478", "4588", "6613", "7806",
+    "141A", "186A", "215A", "290A", "485A", "581A", "593A",
+}
+_TOPIX_NEW_STANDARD_202610 = {
+    "1723", "1965", "2702", "2782", "2805", "4107", "4816", "4966",
+    "5161", "6227", "6366", "6736", "6777", "6834", "6890", "6960",
+    "7287", "7564", "7716", "7906", "8117", "8508", "9436",
+}
 
 
 def _http_get_html(url: str, timeout: int = 8) -> str:
@@ -881,8 +896,81 @@ def _normalize_jp_market_segment(raw_market: str) -> str:
   return ""
 
 
-def evaluate_topix_passive_status(market_seg: str, market_cap_str: str) -> str:
-  seg_label = market_seg if market_seg and market_seg != "N/A" else "東証上場(詳細区分要確認)"
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_topix_constituents_map() -> dict:
+  """JPX公式のTOPIX構成銘柄ウエイト一覧CSVを自動取得し、4桁コード別のウエイト・規模区分辞書を返す。"""
+  raw_bytes = None
+  for url in _TOPIX_CSV_URLS:
+    if HAS_CURL_CFFI:
+      try:
+        res = cffi_requests.get(url, impersonate="chrome", timeout=8)
+        if res.status_code == 200 and len(res.content) > 1000:
+          raw_bytes = res.content
+          break
+      except Exception:
+        pass
+    try:
+      res = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=8)
+      if res.status_code == 200 and len(res.content) > 1000:
+        raw_bytes = res.content
+        break
+    except Exception:
+      continue
+
+  if not raw_bytes:
+    return {}
+
+  df = pd.DataFrame()
+  for enc in ("cp932", "shift_jis", "utf-8-sig", "utf-8"):
+    try:
+      text = raw_bytes.decode(enc)
+      cand_df = pd.read_csv(io.StringIO(text), dtype=str)
+      if cand_df is not None and not cand_df.empty and any("コード" in str(c) for c in cand_df.columns):
+        df = cand_df
+        break
+    except Exception:
+      continue
+
+  if df.empty:
+    return {}
+
+  code_col = next((c for c in df.columns if "コード" in str(c)), None)
+  weight_col = next((c for c in df.columns if "ウエイト" in str(c) or "ウェイト" in str(c)), None)
+  idx_col = next((c for c in df.columns if "区分" in str(c) or "インデックス" in str(c)), None)
+  date_col = next((c for c in df.columns if "日付" in str(c) or "基準" in str(c)), None)
+  if not code_col:
+    return {}
+
+  out_map = {}
+  for _, row in df.iterrows():
+    raw_c = str(row.get(code_col, "")).strip().upper()
+    if not re.match(r"^[0-9]{3}[0-9A-Z]0?$", raw_c):
+      continue
+    code4 = raw_c[:-1] if (len(raw_c) == 5 and raw_c.endswith("0")) else raw_c[:4]
+    w_str = str(row.get(weight_col, "")).replace("%", "").strip() if weight_col else ""
+    try:
+      w_val = float(w_str)
+    except Exception:
+      w_val = None
+    s_idx = str(row.get(idx_col, "")).strip() if idx_col else ""
+    if s_idx.lower() == "nan":
+      s_idx = ""
+    dt_s = str(row.get(date_col, "")).strip() if date_col else ""
+    out_map[code4] = {"weight": w_val, "size_idx": s_idx, "date": dt_s}
+  return out_map
+
+
+def evaluate_topix_passive_status(market_seg: str, market_cap_str: str, stock_code: str = "") -> str:
+  """JPX公式TOPIXウエイト一覧CSV（自動追尾）と上場市場・時価総額を統合し、5段階のパッシブ需給区分を判定する。"""
+  code4 = str(stock_code or "").strip().upper().replace(".T", "")
+  seg_norm = _normalize_jp_market_segment(market_seg)
+  if not seg_norm:
+    if code4 in _TOPIX_NEW_GROWTH_202610:
+      seg_norm = "東証グロース"
+    elif code4 in _TOPIX_NEW_STANDARD_202610:
+      seg_norm = "東証スタンダード"
+  seg_label = seg_norm if seg_norm else (market_seg if market_seg and market_seg != "N/A" else "東証上場(詳細区分要確認)")
+
   mcap_oku = None
   if market_cap_str and market_cap_str != "N/A":
     m = re.search(r"([0-9,]+(?:\.[0-9]+)?)", str(market_cap_str))
@@ -891,24 +979,81 @@ def evaluate_topix_passive_status(market_seg: str, market_cap_str: str) -> str:
         mcap_oku = float(m.group(1).replace(",", ""))
       except Exception:
         mcap_oku = None
+  mcap_txt = f"時価総額{mcap_oku:,.1f}億円" if mcap_oku is not None else "時価総額N/A"
   prefix = f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
-  if mcap_oku is None:
-    return f"{prefix}時価総額取得不可のため要検索確認"
+
   if seg_label in ["名証", "札証", "福証"]:
     return f"{prefix}⚪TOPIX非構成銘柄圏（地方単独上場・TOPIXパッシブ需給影響なし）"
-  if mcap_oku >= 500.0:
-    return f"{prefix}🟢TOPIX中核・継続採用圏（時価総額{mcap_oku:,.1f}億円：500億円超の主力銘柄・段階的ウエイト低減リスクなし）"
-  if mcap_oku >= 250.0:
+
+  topix_map = _load_topix_constituents_map()
+  csv_ready = len(topix_map) >= 1000
+  is_in_csv = (code4 in topix_map) if (csv_ready and code4) else False
+  is_new_fallback = code4 in (_TOPIX_NEW_GROWTH_202610 | _TOPIX_NEW_STANDARD_202610)
+
+  # --- A. JPX公式CSV自動取得成功時（または新規採用確定コード一致時）の厳密判定 ---
+  if (csv_ready and code4) or is_new_fallback:
+    if is_in_csv or is_new_fallback:
+      item = topix_map.get(code4, {})
+      w_val, s_idx = item.get("weight"), item.get("size_idx") or "区分なし"
+      w_info = f" | TOPIXウエイト:{w_val:.4f}% / 規模:{s_idx}" if w_val is not None else " | 2026年10月定期入替採用"
+
+      if "グロース" in seg_label:
+        return (
+            f"{prefix}🟢TOPIX採用銘柄［グロース市場組入済］（{mcap_txt}{w_info}："
+            "JPX公式TOPIX構成銘柄に採用済・段階的ウエイト低減対象外）"
+        )
+      is_core_large_mid = any(k in s_idx for k in ("Core30", "Large70", "Mid400", "100", "400"))
+      if is_core_large_mid or (w_val is not None and w_val >= 0.015) or (mcap_oku is not None and mcap_oku >= 500.0):
+        return (
+            f"{prefix}🟢TOPIX中核・継続採用圏（{mcap_txt}{w_info}："
+            "JPX公式TOPIX構成銘柄の主力規模・段階的ウエイト低減リスクなし）"
+        )
+      if (w_val is not None and w_val >= 0.005) and (mcap_oku is None or mcap_oku >= 250.0):
+        return (
+            f"{prefix}🔵TOPIX継続採用圏（{mcap_txt}{w_info}："
+            "JPX公式TOPIX構成銘柄・浮動株比率が極端に低くない限り継続採用圏）"
+        )
+      if (mcap_oku is not None and mcap_oku < 100.0) or (w_val is not None and w_val < 0.002):
+        return (
+            f"{prefix}🟠TOPIX採用・段階的ウエイト低減警戒圏（{mcap_txt}{w_info}："
+            "現在はTOPIX構成銘柄だが、2026年10月〜2028年7月の四半期ごと8段階［1/4/7/10月末×12.5%］ウエイト低減対象の可能性大）"
+        )
+      return (
+          f"{prefix}🟡TOPIX採用・第2段階入替境界圏（{mcap_txt}{w_info}："
+          "JPX公式TOPIX構成銘柄だが浮動株時価総額100億円基準の境界圏・段階的ウエイト低減［683銘柄：1/4/7/10月末リバランス］該当有無は要検索確認）"
+      )
+
+    # CSVに掲載がない場合 ＝ 確定でTOPIX非構成銘柄（グロース・非採用スタンダードの誤判定を完全防止）
+    if mcap_oku is not None and mcap_oku >= 250.0:
+      return (
+          f"{prefix}🔵TOPIX非構成銘柄・次回新規採用候補圏（{mcap_txt} | JPX公式TOPIX一覧:非掲載："
+          "現在はTOPIX非採用のため段階的ウエイト低減売りの影響なし。時価総額250億円以上のため次回10月定期入替［8月末基準］の新規採用候補として要検索確認）"
+      )
     return (
-        f"{prefix}🔵TOPIX継続採用圏（時価総額{mcap_oku:,.1f}億円：浮動株比率が極端に低くない限り継続採用圏）"
-        if "プライム" in seg_label
-        else f"{prefix}🔵TOPIX第2段階・新規採用候補/継続採用圏（時価総額{mcap_oku:,.1f}億円：250億円以上のため新規採用基準候補圏・要検索確認）"
+        f"{prefix}⚪TOPIX非構成銘柄圏（{mcap_txt} | JPX公式TOPIX一覧:非掲載："
+        "現在TOPIXに組み入れられておらず、1/4/7/10月末の段階的ウエイト低減売り等のパッシブ需給影響なし）"
     )
+
+  # --- B. 万一JPX公式CSVが通信エラー等で取得不能だった場合の市場別フォールバック ---
+  if mcap_oku is None:
+    return f"{prefix}時価総額およびJPX構成銘柄CSV取得不可のため要検索確認"
+  if "グロース" in seg_label:
+    if mcap_oku >= 250.0:
+      return f"{prefix}🔵TOPIX非構成銘柄・次回新規採用候補圏（{mcap_txt}：グロース市場・次回10月定期入替での新規採用候補有無は要検索確認）"
+    return f"{prefix}⚪TOPIX非構成銘柄圏（{mcap_txt}：グロース市場・TOPIXパッシブ需給影響なし）"
+  if "スタンダード" in seg_label:
+    if mcap_oku >= 250.0:
+      return f"{prefix}🔵TOPIX継続採用または次回新規採用候補圏（{mcap_txt}：旧東証一部出身なら継続採用圏、旧二部/JASDAQ出身なら次回新規採用候補圏・要検索確認）"
+    if mcap_oku >= 100.0:
+      return f"{prefix}🟡TOPIX非構成または第2段階入替境界圏（{mcap_txt}：旧東証一部出身の場合は1/4/7/10月末リバランス影響を要検索確認）"
+    return f"{prefix}⚪TOPIX非構成または段階的ウエイト低減圏（{mcap_txt}：100億円未満のスタンダード銘柄）"
+  if mcap_oku >= 500.0:
+    return f"{prefix}🟢TOPIX中核・継続採用圏（{mcap_txt}：500億円超の主力銘柄・段階的ウエイト低減リスクなし）"
+  if mcap_oku >= 250.0:
+    return f"{prefix}🔵TOPIX継続採用圏（{mcap_txt}：浮動株比率が極端に低くない限り継続採用圏）"
   if mcap_oku >= 100.0:
-    return f"{prefix}🟡TOPIX第2段階入替・境界圏（時価総額{mcap_oku:,.1f}億円：浮動株時価総額100億円基準の当落線上・1/4/7/10月末リバランス影響は要検索確認）"
-  if "プライム" in seg_label:
-    return f"{prefix}🟠段階的ウエイト低減警戒圏（時価総額{mcap_oku:,.1f}億円：100億円未満のため2026年10月〜2028年7月の四半期ごと8段階ウエイト低減対象の可能性大）"
-  return f"{prefix}⚪TOPIX非構成銘柄圏（時価総額{mcap_oku:,.1f}億円：100億円未満のスタンダード/グロース銘柄・パッシブ需給影響軽微）"
+    return f"{prefix}🟡TOPIX第2段階入替・境界圏（{mcap_txt}：浮動株時価総額100億円基準の当落線上・1/4/7/10月末リバランス影響は要検索確認）"
+  return f"{prefix}🟠段階的ウエイト低減警戒圏（{mcap_txt}：100億円未満のため2026年10月〜2028年7月の四半期ごと8段階ウエイト低減対象の可能性大）"
 
 
 def get_japanese_fundamentals(stock_code):

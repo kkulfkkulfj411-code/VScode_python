@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.5 高密度スリム版)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.6 高密度スリム版)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna＆分割未調整ヒゲ自動除去 /
 #   期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #   日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 / fast_info & Dividends最終補完 /
@@ -7,7 +7,7 @@
 #   世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合＆15営業日イベント検索指示 /
 #   重要ニュース1〜2件のピンポイント本文深掘り検索指示（好悪材料混在時の実質理由特定） /
 #   数週間スイング・損切り1.0〜1.8ATR(0.8ATR未満禁止)・最低RR1:1.5原則(1:1.3未満見送り)・15営業日超OCOロールオーバー指示 /
-#   上場市場抽出＆TOPIXパッシブ需給区分5段階自動定量判定 /
+#   上場市場抽出＆JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定(stock_code連携) /
 #   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期(Step4巻戻し防止＆Step5異常値逆流防止) /
 #   分析基準日時(生成日時＋確定/未確定足)刻印・見出し末尾日付・SBIメモ先頭日付・ZIP日付付与・個別チャート日本語タイトル化
 # ==============================================================================
@@ -851,8 +851,8 @@ if generate_button and stock_code:
             market_cap_str = _fallback_fast_mcap(stock, is_jp)
 
         if is_jp:
-            # ※fast_infoによる時価総額最終補完の「後」にTOPIXパッシブ需給区分を5段階定量判定する
-            topix_passive_str = evaluate_topix_passive_status(market_seg, market_cap_str)
+            # ※fast_infoによる時価総額最終補完の「後」にJPX公式TOPIX CSV照合＋5段階定量判定を実行する
+            topix_passive_str = evaluate_topix_passive_status(market_seg, market_cap_str, stock_code)
             topix_section = f"[上場市場・TOPIXパッシブ需給区分]\n{topix_passive_str}\n"
             edinet_str, edinet_reasons = get_edinet_documents(stock_code, days=60)
             news_str = get_news(name, True, edinet_reasons)
