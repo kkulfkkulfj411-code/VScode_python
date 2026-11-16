@@ -605,7 +605,7 @@ with st.sidebar:
         "検索対象市場", ["日本株のみ", "すべて（日米）", "米国株のみ"],
         index=0, horizontal=True, help="日本株の英字社名（MTGなど）が米国株と混同されるのを防ぎます。",
     )
-    raw_input = st.text_input("銘柄コード または 企業名（日米対応）", value="6844").strip()
+    raw_input = st.text_input("銘柄コード または 企業名（日米対応）", value="").strip()
 
     jp_code_pattern = r"^[0-9]{3}[0-9A-Za-z]$"
     stock_code, is_jp, selected_label_name = "", False, ""
