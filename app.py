@@ -1,16 +1,22 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.7 高密度スリム版)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.8 高密度スリム版)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna＆分割未調整ヒゲ自動除去 /
 #   期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #   日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 / fast_info & Dividends最終補完 /
 #   LSEGレポート併用プロンプト対応 / マクロ13指標表＆マクロ5段チャート(11指標)連動 /
-#   世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合＆15営業日イベント検索指示 /
-#   重要ニュース1〜2件のピンポイント本文深掘り検索指示（好悪材料混在時の実質理由特定） /
-#   勝率・第1抵抗線手前利確(1.2〜3.0ATR)・5営業日約定実現性(1.2ATR以内)最優先＆無理な数値合わせ指値禁止 /
-#   損切り1.0〜1.6ATR(0.8ATR未満禁止)・高勝率時RR1:1.1以上(標準1:1.2以上、1:1.0未満強制見送り)・15営業日超OCO延長指示 /
-#   上場市場抽出＆JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定(stock_code連携) /
-#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期(Step4巻戻し防止＆Step5異常値逆流防止) /
-#   分析基準日時(生成日時＋確定/未確定足)刻印・見出し末尾日付・SBIメモ先頭日付・ZIP日付付与・個別チャート日本語タイトル化
+#   世界情勢・日米金融政策・日本の国策RSS(4カテゴリ独立・出典付)統合＆15営業日イベント2段階切り分け /
+#   重要ニュース1〜2件のピンポイント本文深掘り検索指示 / 資金500万円許容損失基準＆推奨株数判定 /
+#   勝率・第1抵抗線手前利確(1.2〜3.0ATR・青天井ブレイクアウト例外付)・5営業日約定実現性(1.2ATR以内)最優先 /
+#   損切り1.0〜1.6ATR(0.8ATR未満禁止)・高勝率時RR1:1.1以上(標準1:1.2以上、1:1.0未満強制見送り)・15営業日超OCO延長 /
+#   上場市場抽出＆JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定 /
+#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期 /
+#   分析基準日時刻印・見出し末尾日付・SBIメモ先頭日付・ZIP日付付与・個別チャート日本語タイトル化 /
+#   [Rev.9.8] 改修①: 最新MACD(線/Sig/Hist)全表記＆直近10日表MACD(線/Hist)化 /
+#             改修③: 日本株確定足合成・出来高異常低下時のget_jp_latest_daily_ohlcv上書き補正＆補完不能警告刻印 /
+#             改修⑤: 資金500万円・許容損失基準(理想1%=5万円/上限2%=10万円)適合判定＆推奨株数指示追加 /
+#             改修⑥: 青天井ブレイクアウト局面(2.0〜3.0ATR/ボックス倍返し＋OCO延長)例外規定明記 /
+#             改修⑦: 15営業日イベント2段階切り分け(5営業日内決算・中銀＝見送り／6〜15営業日先月次指標＝撤退管理) /
+#             改修⑧: 日足ATR(14)欄へ60日平均比(X.XX倍)併記
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io, os, re, unicodedata, zipfile
@@ -22,9 +28,10 @@ import yfinance as yf
 from chart_maker import add_indicators, generate_macro_chart_image, generate_safe_chart_image
 from data_fetcher import (
     check_edinet_api_status, evaluate_topix_passive_status, get_edinet_documents,
-    get_japanese_fundamentals, get_japanese_name, get_macro_data_and_history,
-    get_macro_policy_news, get_news, get_sbi_order_limit_dates, get_us_stock_name,
-    search_japanese_code_by_name, search_us_ticker_by_name, verify_edinet_api_key,
+    get_japanese_fundamentals, get_japanese_name, get_jp_latest_daily_ohlcv,
+    get_macro_data_and_history, get_macro_policy_news, get_news,
+    get_sbi_order_limit_dates, get_us_stock_name, search_japanese_code_by_name,
+    search_us_ticker_by_name, verify_edinet_api_key,
 )
 
 st.set_page_config(page_title="AI株式分析データジェネレーター", layout="wide")
@@ -201,14 +208,16 @@ def _resample_subhourly_to_hourly(df_sub: pd.DataFrame, is_jp: bool) -> pd.DataF
 
 
 def repair_and_sync_multi_timeframe_ohlcv(
-    stock, df_w: pd.DataFrame, df_d: pd.DataFrame, df_h: pd.DataFrame, is_jp: bool = True, use_repair: bool = False
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    stock, df_w: pd.DataFrame, df_d: pd.DataFrame, df_h: pd.DataFrame,
+    is_jp: bool = True, use_repair: bool = False, stock_code: str = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     """
-    【週足・日足・1時間足の3時間軸クロスリペア＆双方向完全同期エンジン】
+    【週足・日足・1時間足の3時間軸クロスリペア＆双方向完全同期エンジン（改修③対応）】
     1) 日足(2y)の最新営業日欠落に対し、短期日足(5d/1mo)からの補完を試行。
     2) 1時間足の歯抜け（Volume=0 かつ O=H=L=C の横線ダミー足）を15分足/5分足からリサンプリング修復。
-    3) 日足に欠落している営業日があれば、1時間足から日足を合成・追加。
-    4) 週足の確定終値・高安値（東証15:30クロージング・オークション反映値）と最新日足・1時間足を同期。
+    3) 日足に欠落している営業日を1時間足から合成・追加後、日本株確定足の合成時または出来高異常低下時に
+       get_jp_latest_daily_ohlcv で当日確定OHLCVを上書き補正（補完不能な合成足のみ警告文字列を返却）。
+    4) 週足の確定終値・高安値と最新日足・1時間足を同期（前日終値への巻戻しガード付・合成足もチェック対象）。
     5) 全共通営業日において、分割未調整スパイクの逆流を防止しつつ日足と1時間足の四本値を双方向で完全一致させる。
     """
     target_tz = "Asia/Tokyo" if is_jp else "America/New_York"
@@ -304,11 +313,37 @@ def repair_and_sync_multi_timeframe_ohlcv(
             df_d = pd.concat([df_d, add_d_df]).sort_index()
             df_d = _clean_ohlcv_df(df_d[~df_d.index.duplicated(keep="last")])
 
-    # --- Step 4: 週足(df_w)との大引け確定値双方向同期 ---
+    # --- Step 3.5 [改修③]: 日本株確定足の合成時・出来高異常低下時に株探/Yahoo日本から確定OHLCV上書き補正 ---
+    synth_warning_str = ""
+    if not df_d.empty:
+        last_d_ts = df_d.index[-1]
+        last_d_date = last_d_ts.date()
+        is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+        is_last_synthesized = last_d_date in synthesized_dates
+        vol_anomaly = False
+        if len(df_d) >= 5:
+            prev_vol_avg20 = float(df_d["Volume"].iloc[:-1].tail(20).mean())
+            if pd.notna(prev_vol_avg20) and prev_vol_avg20 > 0:
+                vol_anomaly = float(df_d.loc[last_d_ts, "Volume"]) < prev_vol_avg20 * 0.55
+
+        if is_jp and stock_code and not is_intraday and (is_last_synthesized or vol_anomaly):
+            jp_ohlcv = get_jp_latest_daily_ohlcv(stock_code)
+            if jp_ohlcv and jp_ohlcv.get("date") == last_d_date:
+                for col in ["Open", "High", "Low", "Close", "Volume"]:
+                    df_d.loc[last_d_ts, col] = float(jp_ohlcv[col])
+                synthesized_dates.discard(last_d_date)
+                is_last_synthesized = False
+            elif is_last_synthesized:
+                synth_warning_str = " [※1時間足合成・出来高/終値不完全の可能性]"
+        elif is_last_synthesized and not is_intraday:
+            synth_warning_str = " [※1時間足合成・出来高/終値不完全の可能性]"
+
+    # --- Step 4: 週足(df_w)との大引け確定値双方向同期（合成足も前日巻戻しガード付きでチェック） ---
     if not df_d.empty and not df_w.empty:
         last_d_ts = df_d.index[-1]
         last_d_date = last_d_ts.date()
         is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+        is_last_synthesized = last_d_date in synthesized_dates
         last_week_monday = last_d_date - timedelta(days=last_d_date.weekday())
         w_last_ts = df_w.index[-1]
 
@@ -317,8 +352,13 @@ def repair_and_sync_multi_timeframe_ohlcv(
             w_high = float(df_w.loc[w_last_ts, "High"])
             w_low = float(df_w.loc[w_last_ts, "Low"])
 
-            # 最新日足が1時間足からの新規合成ではなく、かつ確定状態で微小差(1.5%未満)の場合のみ週足確定終値を採用
-            if not is_intraday and last_d_date not in synthesized_dates and w_close > 0:
+            prev_d_close = float(df_d["Close"].iloc[-2]) if len(df_d) >= 2 else None
+            is_w_stale_prev = (
+                is_last_synthesized
+                and prev_d_close is not None
+                and np.isclose(w_close, prev_d_close, rtol=1e-6, atol=1e-6)
+            )
+            if not is_intraday and w_close > 0 and not is_w_stale_prev:
                 d_close = float(df_d.loc[last_d_ts, "Close"])
                 if not np.isclose(d_close, w_close) and abs(d_close - w_close) / max(w_close, 1.0) < 0.015:
                     df_d.loc[last_d_ts, "Close"] = w_close
@@ -394,7 +434,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
             if d_vol <= 0 and h_vol_sum > 0:
                 df_d.loc[d_ts, "Volume"] = h_vol_sum
 
-    return _clean_ohlcv_df(df_w), _clean_ohlcv_df(df_d), _clean_ohlcv_df(df_h)
+    return _clean_ohlcv_df(df_w), _clean_ohlcv_df(df_d), _clean_ohlcv_df(df_h), synth_warning_str
 
 
 def _get_period_extreme_with_date(series: pd.Series, window: int, is_high: bool, is_jp: bool, include_year: bool = False) -> tuple:
@@ -568,7 +608,8 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
     recent_vol_avg = vol_avg20_series.tail(10)
     last_idx = recent_df.index[-1] if not recent_df.empty else None
 
-    table_rows = ["日付 | 始値 | 高値(上ヒゲ) | 安値(下ヒゲ) | 終値 | 出来高比(20日平均比) | RSI | MACD"]
+    # [改修①] MACD列を標準EMA(12,26,9)の MACD(線/Hist) 併記形式へ変更
+    table_rows = ["日付 | 始値 | 高値(上ヒゲ) | 安値(下ヒゲ) | 終値 | 出来高比(20日平均比) | RSI | MACD(線/Hist)"]
     for idx, row in recent_df.iterrows():
         date_str = idx.strftime("%m/%d") if hasattr(idx, "strftime") else str(idx)[:10]
         v_avg = recent_vol_avg.loc[idx] if idx in recent_vol_avg.index else pd.NA
@@ -577,8 +618,14 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
         else:
             v_ratio = "N/A"
 
-        rsi_val = f"{round(row['RSI'], 1)}" if "RSI" in row and pd.notna(row["RSI"]) else "N/A"
-        macd_val = f"{round(row['MACD'], 1)}" if "MACD" in row and pd.notna(row["MACD"]) else "N/A"
+        rsi_val = f"{round(float(row['RSI']), 1)}" if "RSI" in row and pd.notna(row["RSI"]) else "N/A"
+        m_line, m_hist = row.get("MACD_Line"), row.get("MACD_Hist")
+        if pd.notna(m_line) or pd.notna(m_hist):
+            ml_s = f"{round(float(m_line), 1)}" if pd.notna(m_line) else "N/A"
+            mh_s = f"{round(float(m_hist), 1)}" if pd.notna(m_hist) else "N/A"
+            macd_val = f"{ml_s} / {mh_s}"
+        else:
+            macd_val = "N/A"
         table_rows.append(
             f"{date_str} | {format_price(row.get('Open'), is_jp)} | {format_price(row.get('High'), is_jp)} |"
             f" {format_price(row.get('Low'), is_jp)} | {format_price(row.get('Close'), is_jp)} | {v_ratio} | {rsi_val} | {macd_val}"
@@ -702,9 +749,10 @@ if generate_button and stock_code:
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, is_jp=is_jp, use_repair=use_repair)
         name = (get_japanese_name(stock_code) or stock_code) if is_jp else get_us_stock_name(stock_code)
 
-        # 3時間軸＋15分足クロスリペア＆全営業日双方向四本値同期エンジン（分割未調整ヒゲ除去付）
-        df_w, df_d, df_h = repair_and_sync_multi_timeframe_ohlcv(
-            stock=stock, df_w=df_w, df_d=df_d, df_h=df_h, is_jp=is_jp, use_repair=use_repair
+        # [改修③] 3時間軸＋15分足クロスリペア＆確定OHLCV上書き補正＋双方向四本値同期エンジン
+        df_w, df_d, df_h, synth_warning_str = repair_and_sync_multi_timeframe_ohlcv(
+            stock=stock, df_w=df_w, df_d=df_d, df_h=df_h,
+            is_jp=is_jp, use_repair=use_repair, stock_code=stock_code,
         )
 
         if df_d.empty:
@@ -763,13 +811,27 @@ if generate_button and stock_code:
             if pd.notna(high_52w_val) and high_52w_val > 0 else ""
         )
 
+        # [改修⑧] 日足ATR(14)へ60日平均比を併記
         atr_val = latest_d.get("ATR")
+        atr_ratio_str = ""
+        if pd.notna(atr_val) and "ATR" in df_d.columns:
+            atr_mean60 = pd.to_numeric(df_d["ATR"], errors="coerce").dropna().tail(60).mean()
+            if pd.notna(atr_mean60) and atr_mean60 > 0:
+                atr_ratio_str = f" / 60日平均比 {float(atr_val) / float(atr_mean60):.2f}倍"
         atr_str = (
-            f"{format_price(atr_val, is_jp)}{unit_str} ({round((float(atr_val) / close_price_num) * 100, 2)}%)"
+            f"{format_price(atr_val, is_jp)}{unit_str} ({round((float(atr_val) / close_price_num) * 100, 2)}%{atr_ratio_str})"
             if pd.notna(atr_val) and close_price_num > 0 else "N/A"
         )
 
-        bar_status_tag = " [※ザラ場立会中・未確定足]" if is_intraday else ""
+        # [改修①] 最新MACD(線/Sig/Hist)全表記
+        _fmt_m = lambda v: f"{round(float(v), 1)}" if pd.notna(v) else "N/A"
+        macd_summary_str = (
+            f"{_fmt_m(latest_d.get('MACD_Line'))} / "
+            f"{_fmt_m(latest_d.get('MACD_Signal'))} / "
+            f"{_fmt_m(latest_d.get('MACD_Hist'))}"
+        )
+
+        bar_status_tag = (" [※ザラ場立会中・未確定足]" if is_intraday else "") + synth_warning_str
         vol_avg20 = df_d["Volume"].tail(20).mean()
         vol_ratio = round(float(latest_d["Volume"]) / float(vol_avg20), 2) if pd.notna(vol_avg20) and vol_avg20 > 0 else 1.0
 
@@ -885,8 +947,8 @@ if generate_button and stock_code:
             f" | [直近60日] 高値 {recent_high_60d_lbl} / 安値 {recent_low_60d_lbl}"
             f" | [52週(250日)] 高値 {high_52w_lbl} / 安値 {low_52w_lbl}{from_52w_str}\n"
             f"日足ATR(14日平均値幅): {atr_str} | 出来高20日平均比: {vol_ratio_str}"
-            f" | 最新RSI: {round(latest_d['RSI'],1) if pd.notna(latest_d.get('RSI')) else 'N/A'}"
-            f" | 最新MACD: {round(latest_d['MACD'],1) if pd.notna(latest_d.get('MACD')) else 'N/A'}\n\n"
+            f" | 最新RSI: {round(float(latest_d['RSI']), 1) if pd.notna(latest_d.get('RSI')) else 'N/A'}"
+            f" | 最新MACD(線/Sig/Hist): {macd_summary_str}\n\n"
             f"[日足 移動平均線（現在値・乖離率・5日前比の傾き）]\n{sma_summary_text}\n\n"
             f"[直近10営業日の時系列推移（日足ベース）]\n{recent_10d_table_text}\n"
         )
@@ -942,15 +1004,20 @@ if st.session_state.generated_data:
             "（安易に『区分不明』とせず、入替境界圏・段階的ウエイト低減警戒圏・次回新規採用候補圏の場合はJPX第2段階見直し［1・4・7・10月末リバランス］該当有無を検索確認）。"
             "さらに、提供ヘッドラインのうち直近の株価急騰・急落や出来高急増の主因となっている重要記事（上方修正と減損の混在、好決算後の株価下落、重大な規制・国策報道など）が1〜2件存在する場合は、"
             "タイトルの字面だけで判断せず必ずその記事内容をGoogle検索で深掘りし、市場が好感または嫌気した実質的な理由（コンセンサス比や一過性要因の有無）を特定すること（※周辺ニュース全件の網羅検索は検索枠枯渇を防ぐため不要）。\n"
-            "・重点検索②（向こう15営業日の日米重要イベント地雷原＆国策織り込み検証）：発注日から15営業日以内の日米重要イベント日程"
-            "（日銀金融政策決定会合・FOMC・米雇用統計・米CPI・日米SQ日・主要選挙/政治日程）を必ずGoogle検索で特定し、"
-            "イベント通過時のギャップダウン被弾を防ぐため撤退条件（含み益クッション1.5×ATR未満でのイベント前営業日後場撤退）または見送り判断に反映すること。"
+            "・重点検索②（向こう15営業日の日米重要イベント2段階切り分け＆国策織り込み検証）：発注日から15営業日以内の日米重要イベント日程"
+            "（当該銘柄決算・日銀金融政策決定会合・FOMC・米雇用統計・米CPI・日米SQ日・主要選挙/政治日程）を必ずGoogle検索で特定し、"
+            "『①直近5営業日以内の決算・FOMC・日銀会合＝原則見送り』、"
+            "『②6〜15営業日先の月次指標（雇用統計・CPI・SQ）＝平時VIX下では見送り要件とせず約定後の含み益1.5×ATR未満撤退ルール（前営業日後場撤退）で管理（同期間の決算・中銀会合はイベント前撤退前提で慎重判定）』の2段階で切り分けること。"
             "あわせて所属セクターに対する日本政府の国策・補助金・規制や米通商政策の影響を検索・評価しつつ、"
             "すでに株価へ織り込み済み（材料出尽くし高値圏）でないかをWTI原油(CL=F)・金(GC=F)・VIX・対指数RS・52週高値比の数値で裏付け検証すること。\n"
             "・マクロ13指標表＆5段チャート（改定案A：11指標）＆対指数RS統合評価：Panel2(VVIX×SKEW)のオプション警戒感、Panel3(MOVE×HYG)のクレジット歪み、"
             "WTI原油・金先物の実物インフレ/有事動向、およびPanel5(日経平均＆日経SMA25＆TOPIX相対軌道[1306.T]×ドル円)から『値がさハイテク主導か内需・東証全体への資金流入か』を判定し、本銘柄の対日経・対TOPIX相対強弱と照合すること。\n"
             "・LSEGレポートPDF追加添付時：Q1/Q2単体の表面的な業績スコアと通期EPS予想修正トレンドの乖離（計上時期偏重の有無）、"
             "コンセンサス目標株価レンジ（最高・平均・最低）、対日経225ベータ・相関、過去10年月次リターン季節性を統合評価すること。"
+        )
+        position_size_rule = (
+            "・資金管理基準（総資金500万円・単元株100株売買）：1トレードの許容損失は『理想1%＝5万円以内（上限2%＝10万円以内）』とする。"
+            "必ず100株あたりの想定損切り額を算出し、『5万円以内＝適合／5万超〜10万円以内＝許容上限内（高確信度のみ可・リスク明記）／10万円超＝原則見送り（例外採用時は過大リスク警告必須）』の適合判定と推奨株数目安（100株単位）を最終判断に明記すること。"
         )
     else:
         search_focus = (
@@ -959,10 +1026,16 @@ if st.session_state.generated_data:
             "次回Earnings Date、Form 13F/Form 4、Short Interest推移。"
             "さらに、提供ヘッドラインのうち直近の株価急変や出来高急増の主因となっている重要記事（決算ビート/ミスとガイダンスの乖離、アナリスト格付け変更、重大な規制報道など）が1〜2件存在する場合は、"
             "タイトルの字面だけで判断せず必ずその記事内容を検索で深掘りし、市場が反応した実質的な理由を特定すること。\n"
-            "・重点検索②（向こう15営業日の日米重要イベント地雷原＆政策織り込み検証）：発注日から15営業日以内の重要マクロイベント日程"
-            "（FOMC・米雇用統計・米CPI・米SQ日・主要政治/通商日程）を必ずGoogle検索で特定し、撤退条件または見送り判断に反映すること。"
+            "・重点検索②（向こう15営業日の日米重要イベント2段階切り分け＆政策織り込み検証）：発注日から15営業日以内の重要マクロイベント日程"
+            "（当該銘柄決算・FOMC・米雇用統計・米CPI・米SQ日・主要政治/通商日程）を必ずGoogle検索で特定し、"
+            "『①直近5営業日以内の決算・FOMC＝原則見送り』、"
+            "『②6〜15営業日先の月次指標（雇用統計・CPI・SQ）＝平時VIX下では見送り要件とせず約定後の含み益1.5×ATR未満撤退ルールで管理（同期間の決算・FOMCはイベント前撤退前提で慎重判定）』の2段階で切り分けること。"
             "あわせて所属セクターに対する米通商政策（関税・対中輸出規制・補助金等）の影響を検索し、すでに株価へ織り込み済みでないかをWTI原油(CL=F)・金(GC=F)・VIX・対SOX指数RSの数値で裏付け検証すること。\n"
             "・マクロ13指標表＆5段チャート（改定案A：11指標）統合評価：Panel1(VIX期間構造)、Panel2(VVIX×SKEW)、Panel3(MOVE×HYG)、Panel4(SOX×US10Y)、およびWTI原油・金先物の連動性と本銘柄の対指数相対強弱を照合すること。"
+        )
+        position_size_rule = (
+            "・資金管理基準（総資金500万円・米国株1株単位売買）：1トレードの許容損失は『理想1%＝5万円以内（上限2%＝10万円以内）』とする。"
+            "マクロ表のドル円レートを用いて1株あたり想定損切り額から推奨株数目安（理想5万円枠および上限10万円枠）とリスク適合判定を最終判断に明記すること。"
         )
 
     chat_prompt = (
@@ -970,8 +1043,11 @@ if st.session_state.generated_data:
         "@Google 添付したデータとチャート画像4枚（週足・日足・1時間足・マクロボラティリティ統合チャート）をもとに、"
         "スキルの【Step 0】〜【7】に従って分析をお願いします。\n"
         f"{search_focus}\n"
+        f"{position_size_rule}\n"
         "・戦略厳守（勝率・利確到達率・約定実現性の最優先）：評価の優先順位は『①勝率と利確到達確率 ＞ ②5営業日以内の約定実現性 ＞ ③リスクリワード比率』としてください。"
-        "利確目標は必ず『最も手前にある確実な第1上値抵抗線（SMA25/75や直近高値）の手前（1.2〜3.0×ATR目安）』に設定し、計算上のRRを稼ぐために手前の抵抗線を無視して遠くに利確目標を置くことを厳禁とします。"
+        "利確目標は原則『最も手前にある確実な第1上値抵抗線（SMA25/75や直近高値）の手前（1.2〜3.0×ATR目安）』に設定し、計算上のRRを稼ぐために手前の抵抗線を無視して遠くに利確目標を置くことを厳禁とします。"
+        "ただし例外として、52週高値・上場来高値更新など頭上に第1抵抗線が存在しないブレイクアウト・青天井局面（モメンタム初動・三角持ち合い上抜け等）に限り、"
+        "『買値＋2.0〜3.0×日足ATR』またはボックス倍返し値幅を初期利確目標とし、OCOロールオーバーでトレンド追随することを認めます。"
         "損切り幅はノイズ狩り防止のため買値から『1.0〜1.6×日足ATR（0.8×ATR未満禁止）』とし、高勝率セットアップでは『RR 1 : 1.1以上（標準1 : 1.2以上、1 : 1.0未満は強制見送り）』を適用してください。"
         "また、現在値から『1.2×日足ATR』以内の現実的な距離（3〜5営業日以内に約定可能な範囲）で上記条件が成立しない場合や、急落中で下げ止まり未確認の場合は、数値合わせの無理な深い買い指値をひねり出すことを禁止し、躊躇なく『見送り（アラート待機）』と判定してください。"
         "なお約定後に含み益が乗りトレンド継続中は期間経過だけで売却せず、15営業日目到来時に建値以上へ逆指値を引き上げてOCO再発注する【延長条件】と、7〜10営業日停滞時または含み益1.5×ATR未満での重要イベント前営業日後場に撤退する【撤退条件】を分けて提示してください。\n"

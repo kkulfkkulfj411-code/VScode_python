@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.5 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.6 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
@@ -7,8 +7,12 @@
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
 #            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ＆ETF/適時開示ノイズ除外 /
 #            上場市場抽出 ＆ JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定 /
-#            [Rev.9.5] EDINET DB APIのコールドスタートReadTimeout対策として自動リトライ＆timeout=(5,15)を導入、
-#                      およびAPI状態監視で通信エラー時(ok=False)に1時間キャッシュ固定される問題を解消(60秒自動再試行)
+#            [Rev.9.5] EDINET DB APIのコールドスタートReadTimeout対策(リトライ＆timeout=(5,15)) /
+#                      通信エラー時(ok=False)のAPI状態監視キャッシュを60秒短縮 /
+#            [Rev.9.6] 改修②: _patch_latest_from_intradayのindex>last_d限定廃止＆全欠落日付マージ穴埋め /
+#                      改修③: 日本株当日確定OHLCV取得関数 get_jp_latest_daily_ohlcv 新規実装 /
+#                      改修④: TOPIX対日経60日差起点同期用 histories["_jp_rel_meta"] 格納 /
+#                      改修⑨: _judge_dynamic_regimeにmax_5d_h追加＆絶対警戒圏ピークアウト収縮判定付記
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -309,15 +313,37 @@ def get_macro_data_and_history():
     return df[~df.index.duplicated(keep="last")].sort_index()
 
   def _patch_latest_from_intraday(t_sym: str, df_daily: pd.DataFrame, target_tz: str) -> pd.DataFrame:
+    """[改修②] df_5dおよびagg_1hに存在する全欠落日付をマージ穴埋めし、既存最新日のOHLC整合性を維持する。"""
     if df_daily is None or df_daily.empty:
       return pd.DataFrame()
-    last_d = df_daily.index[-1]
+    min_d = df_daily.index[0]
+
+    def _merge_missing_and_sync_latest(base_df: pd.DataFrame, patch_df: pd.DataFrame, update_latest_close: bool) -> pd.DataFrame:
+      if patch_df is None or patch_df.empty:
+        return base_df
+      valid_patch = patch_df[patch_df.index >= min_d]
+      if valid_patch.empty:
+        return base_df
+      missing_idx = valid_patch.index.difference(base_df.index)
+      if not missing_idx.empty:
+        add_df = valid_patch.loc[missing_idx].copy()
+        for col in base_df.columns:
+          if col not in add_df.columns:
+            add_df[col] = 0.0
+        base_df = pd.concat([base_df, add_df[base_df.columns]])
+        base_df = base_df[~base_df.index.duplicated(keep="last")].sort_index()
+      latest_d = base_df.index[-1]
+      if latest_d in valid_patch.index and latest_d not in missing_idx:
+        if update_latest_close:
+          base_df.loc[latest_d, "Close"] = float(valid_patch.loc[latest_d, "Close"])
+        o_v, c_v = float(base_df.loc[latest_d, "Open"]), float(base_df.loc[latest_d, "Close"])
+        base_df.loc[latest_d, "High"] = max(float(base_df.loc[latest_d, "High"]), float(valid_patch.loc[latest_d, "High"]), o_v, c_v)
+        base_df.loc[latest_d, "Low"] = min(float(base_df.loc[latest_d, "Low"]), float(valid_patch.loc[latest_d, "Low"]), o_v, c_v)
+      return base_df
+
     try:
       df_5d = _normalize_yf_df(yf.Ticker(t_sym).history(period="5d", interval="1d", auto_adjust=False), target_tz, True)
-      if not df_5d.empty and df_5d.index[-1] > last_d:
-        df_daily = pd.concat([df_daily, df_5d])
-        df_daily = df_daily[~df_daily.index.duplicated(keep="last")].sort_index()
-        last_d = df_daily.index[-1]
+      df_daily = _merge_missing_and_sync_latest(df_daily, df_5d, update_latest_close=True)
     except Exception:
       pass
     try:
@@ -325,16 +351,7 @@ def get_macro_data_and_history():
       if not df_1h.empty:
         df_1h["DateNorm"] = df_1h.index.normalize()
         agg_1h = df_1h.groupby("DateNorm").agg(Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"), Close=("Close", "last"))
-        new_dates = agg_1h[agg_1h.index > last_d]
-        if not new_dates.empty:
-          for col in df_daily.columns:
-            if col not in new_dates.columns:
-              new_dates[col] = 0.0
-          df_daily = pd.concat([df_daily, new_dates[df_daily.columns]])
-          df_daily = df_daily[~df_daily.index.duplicated(keep="last")].sort_index()
-        elif last_d in agg_1h.index:
-          df_daily.loc[last_d, "High"] = max(float(df_daily.loc[last_d, "High"]), float(agg_1h.loc[last_d, "High"]))
-          df_daily.loc[last_d, "Low"] = min(float(df_daily.loc[last_d, "Low"]), float(agg_1h.loc[last_d, "Low"]))
+        df_daily = _merge_missing_and_sync_latest(df_daily, agg_1h, update_latest_close=False)
     except Exception:
       pass
     return df_daily
@@ -386,7 +403,7 @@ def get_macro_data_and_history():
       return "N/A"
     return f"{int(round(val))}{unit}" if digits == 0 else f"{val:.{digits}f}{unit}"
 
-  def _judge_dynamic_regime(sym, digits, curr, z_score, diff_1d, c_series):
+  def _judge_dynamic_regime(sym, digits, curr, z_score, diff_1d, c_series, max_5d_h=None):
     if pd.isna(curr) or c_series.empty:
       return "N/A", None, None
     win252 = c_series.tail(252)
@@ -400,7 +417,18 @@ def get_macro_data_and_history():
       th_label = f"基準:{warn_th:.{digits}f}/{alert_th:.{digits}f}"
       z_v = 0.0 if pd.isna(z_score) else z_score
       if curr >= hard_cap:
-        status = f"🔴絶対警戒圏(上限{hard_cap:g}突破)"
+        is_peaking_out = (
+            diff_1d < 0
+            and max_5d_h is not None
+            and pd.notna(max_5d_h)
+            and max_5d_h > 0
+            and curr < max_5d_h * 0.90
+        )
+        status = (
+            f"🔴絶対警戒圏(上限{hard_cap:g}超・ピークアウト収縮中)"
+            if is_peaking_out
+            else f"🔴絶対警戒圏(上限{hard_cap:g}突破)"
+        )
       elif curr >= alert_th and z_v >= 1.0:
         if sym in ["^VIX", "^VIX3M"]:
           status = f"🔴パニック圏({th_label})" if diff_1d > 0 else f"🟡高ボラ収縮開始({th_label})"
@@ -466,7 +494,7 @@ def get_macro_data_and_history():
 
     tail60_h, tail60_l = h_series.tail(60).max(), l_series.tail(60).min()
     pos_str = f"{int(round(((curr - tail60_l) / (tail60_h - tail60_l)) * 100))}%" if pd.notna(tail60_h) and pd.notna(tail60_l) and tail60_h > tail60_l else "N/A"
-    regime_str, warn_th, alert_th = _judge_dynamic_regime(sym, digits, curr, z_val, diff_1d_val, c_series)
+    regime_str, warn_th, alert_th = _judge_dynamic_regime(sym, digits, curr, z_val, diff_1d_val, c_series, max_5d_h=max_5d_h)
     dynamic_thresholds[sym] = {"warn": warn_th, "alert": alert_th}
 
     rows.append(
@@ -492,16 +520,20 @@ def get_macro_data_and_history():
 
   n225_df, topix_df = histories.get("^N225", pd.DataFrame()), histories.get("1306.T", pd.DataFrame())
   jp_rel_line = ""
+  histories["_jp_rel_meta"] = {}
   if not n225_df.empty and not topix_df.empty:
     n_c, t_c = n225_df["Close"].dropna(), topix_df["Close"].dropna()
-    common_jp = n_c.index.intersection(t_c.index)
+    common_jp = n_c.index.intersection(t_c.index).sort_values()
     if len(common_jp) >= 21:
       n_c, t_c = n_c.loc[common_jp], t_c.loc[common_jp]
       def _rel_spread(days):
         if len(common_jp) > days:
           return ((t_c.iloc[-1] / t_c.iloc[-(days + 1)] - 1.0) - (n_c.iloc[-1] / n_c.iloc[-(days + 1)] - 1.0)) * 100.0
         return 0.0
-      sp5, sp20, sp60 = _rel_spread(5), _rel_spread(20), _rel_spread(min(59, len(common_jp) - 1))
+      days60 = min(59, len(common_jp) - 1)
+      start_jp_60, end_jp = common_jp[-(days60 + 1)], common_jp[-1]
+      sp5, sp20, sp60 = _rel_spread(5), _rel_spread(20), _rel_spread(days60)
+      histories["_jp_rel_meta"] = {"start_date": start_jp_60, "end_date": end_jp, "sp60": float(sp60)}
       if sp20 >= 1.0:
         jp_rot = "🔵TOPIX優位(内需・バリュー・東証全体への広範な資金流入)"
       elif sp20 <= -1.0:
@@ -881,6 +913,226 @@ def get_us_stock_name(stock_code):
   except Exception:
     pass
   return code_up
+
+
+def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
+  """[改修③] 日本株の当日確定OHLCVと日付を株探→Yahoo!ファイナンス日本版HTMLの順で抽出する（失敗時 {}）。"""
+  code4 = str(stock_code or "").strip().upper().replace(".T", "")
+  if not code4:
+    return {}
+
+  cache_key = f"fund_cache__ohlcv_{code4}"
+  if cache_key in st.session_state:
+    cached_val, cached_ts = st.session_state[cache_key]
+    if isinstance(cached_val, dict) and cached_val and (time.time() - cached_ts) < 300:
+      return cached_val
+
+  today_jst = datetime.datetime.now(JST).date()
+  ng_labels = ("前日", "年初来", "上場来", "52週", "ストップ", "売買代金", "単元", "時価総額")
+
+  def _to_float(val_str: str):
+    if not val_str:
+      return None
+    s = unicodedata.normalize("NFKC", str(val_str)).replace(",", "").strip()
+    if any(x in s for x in ("---", "－", "―")) or s == "-":
+      return None
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", s)
+    if not m:
+      return None
+    try:
+      return float(m.group(1))
+    except Exception:
+      return None
+
+  def _to_volume(val_str: str):
+    if not val_str:
+      return None
+    s = unicodedata.normalize("NFKC", str(val_str)).replace(",", "").strip()
+    base = _to_float(s)
+    if base is None:
+      return None
+    if "万株" in s:
+      return base * 10000.0
+    if "千株" in s:
+      return base * 1000.0
+    return base
+
+  def _parse_jp_date(raw_txt: str):
+    if not raw_txt:
+      return None
+    s = unicodedata.normalize("NFKC", str(raw_txt)).strip()
+    m_iso = re.search(r"(20[0-9]{2})[-/年]([0-9]{1,2})[-/月]([0-9]{1,2})", s)
+    if m_iso:
+      try:
+        return date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+      except ValueError:
+        return None
+    m_yy = re.search(r"(?<![0-9])([0-9]{2})/([0-9]{1,2})/([0-9]{1,2})(?![0-9])", s)
+    if m_yy:
+      try:
+        return date(2000 + int(m_yy.group(1)), int(m_yy.group(2)), int(m_yy.group(3)))
+      except ValueError:
+        return None
+    m_md = re.search(r"(?<![0-9])([0-9]{1,2})[/月]([0-9]{1,2})日?(?![0-9:])", s)
+    if m_md:
+      mo, dy = int(m_md.group(1)), int(m_md.group(2))
+      if 1 <= mo <= 12 and 1 <= dy <= 31:
+        try:
+          cand = date(today_jst.year, mo, dy)
+          if cand > today_jst + timedelta(days=7):
+            cand = date(today_jst.year - 1, mo, dy)
+          return cand
+        except ValueError:
+          return None
+    return None
+
+  def _build_valid_result(d_obj, o, h, l, c, v, src: str) -> dict:
+    if not isinstance(d_obj, date):
+      return {}
+    if any(x is None or not isinstance(x, (int, float)) for x in (o, h, l, c, v)):
+      return {}
+    o, h, l, c, v = float(o), float(h), float(l), float(c), float(v)
+    if min(o, h, l, c) <= 0.0 or v <= 0.0:
+      return {}
+    if not (l <= o <= h and l <= c <= h):
+      return {}
+    if h / l > 5.0:
+      return {}
+    return {"date": d_obj, "Open": o, "High": h, "Low": l, "Close": c, "Volume": v, "source": src}
+
+  # 1. 株探 (kabutan.jp)
+  try:
+    kb_html = _http_get_html(f"https://kabutan.jp/stock/?code={code4}", timeout=8)
+    if kb_html:
+      soup = BeautifulSoup(kb_html, "html.parser")
+      d_obj, o, h, l, c, v = None, None, None, None, None, None
+      info_i1 = soup.find("div", id="stockinfo_i1")
+      for t_tag in (info_i1.find_all("time") if info_i1 else []) + soup.find_all("time")[:4]:
+        d_obj = _parse_jp_date(t_tag.get("datetime", "")) or _parse_jp_date(t_tag.get_text(" ", strip=True))
+        if d_obj:
+          break
+      kabuka_span = soup.find("span", class_="kabuka")
+      if kabuka_span:
+        c = _to_float(kabuka_span.get_text(" ", strip=True))
+      for tr in soup.find_all("tr"):
+        th, td = tr.find("th"), tr.find("td")
+        if not th or not td:
+          continue
+        lbl = unicodedata.normalize("NFKC", th.get_text(" ", strip=True)).replace(" ", "")
+        if any(ng in lbl for ng in ng_labels):
+          continue
+        td_txt = td.get_text(" ", strip=True)
+        if lbl == "始値" and o is None:
+          o = _to_float(td_txt)
+        elif lbl == "高値" and h is None:
+          h = _to_float(td_txt)
+        elif lbl == "安値" and l is None:
+          l = _to_float(td_txt)
+        elif lbl in ("終値", "現在値") and c is None:
+          c = _to_float(td_txt)
+        elif lbl in ("出来高", "売買高") and v is None:
+          v = _to_volume(td_txt)
+      page_txt = unicodedata.normalize("NFKC", soup.get_text(" ", strip=True))
+      if d_obj is None:
+        m_d = re.search(r"(?:終値|現在値|株価).{0,30}?([0-9]{4}[年/-][0-9]{1,2}[月/-][0-9]{1,2}|[0-9]{2}/[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}/[0-9]{1,2})", page_txt[:2000])
+        if m_d:
+          d_obj = _parse_jp_date(m_d.group(1))
+      if o is None:
+        m_o = re.search(r"(?<!前日)始値\s*([0-9,]+(?:\.[0-9]+)?)", page_txt)
+        o = _to_float(m_o.group(1)) if m_o else None
+      if h is None:
+        m_h = re.search(r"(?<!年初来)(?<!上場来)(?<!52週)高値\s*([0-9,]+(?:\.[0-9]+)?)", page_txt)
+        h = _to_float(m_h.group(1)) if m_h else None
+      if l is None:
+        m_l = re.search(r"(?<!年初来)(?<!上場来)(?<!52週)安値\s*([0-9,]+(?:\.[0-9]+)?)", page_txt)
+        l = _to_float(m_l.group(1)) if m_l else None
+      if c is None:
+        m_c = re.search(r"(?<!前日)(?:終値|現在値)\s*([0-9,]+(?:\.[0-9]+)?)", page_txt)
+        c = _to_float(m_c.group(1)) if m_c else None
+      if v is None:
+        m_v = re.search(r"(?:出来高|売買高)\s*([0-9,]+(?:\.[0-9]+)?\s*(?:万株|千株|株))", page_txt)
+        v = _to_volume(m_v.group(1)) if m_v else None
+      res_kb = _build_valid_result(d_obj, o, h, l, c, v, "株探")
+      if res_kb:
+        st.session_state[cache_key] = (res_kb, time.time())
+        return res_kb
+  except Exception:
+    pass
+
+  # 2. Yahoo!ファイナンス日本版 (finance.yahoo.co.jp)
+  try:
+    yh_html = _http_get_html(f"https://finance.yahoo.co.jp/quote/{code4}.T", timeout=8)
+    if yh_html:
+      soup = BeautifulSoup(yh_html, "html.parser")
+      d_obj, o, h, l, c, v = None, None, None, None, None, None
+      for dt_tag in soup.find_all("dt"):
+        dd_tag = dt_tag.find_next_sibling("dd")
+        if not dd_tag:
+          continue
+        lbl = unicodedata.normalize("NFKC", dt_tag.get_text(" ", strip=True)).replace(" ", "")
+        if any(ng in lbl for ng in ng_labels):
+          continue
+        dd_txt = dd_tag.get_text(" ", strip=True)
+        if lbl == "始値" and o is None:
+          o = _to_float(dd_txt)
+        elif lbl == "高値" and h is None:
+          h = _to_float(dd_txt)
+        elif lbl == "安値" and l is None:
+          l = _to_float(dd_txt)
+        elif lbl in ("終値", "現在値", "取引値") and c is None:
+          c = _to_float(dd_txt)
+        elif lbl in ("出来高", "売買高") and v is None:
+          v = _to_volume(dd_txt)
+      for t_tag in soup.find_all("time")[:4]:
+        d_obj = _parse_jp_date(t_tag.get("datetime", "")) or _parse_jp_date(t_tag.get_text(" ", strip=True))
+        if d_obj:
+          break
+      for key_name, var_name in [("openPrice", "o"), ("highPrice", "h"), ("lowPrice", "l"), ("price", "c"), ("volume", "v")]:
+        m_j = re.search(rf'"{key_name}"\s*:\s*"?([0-9,]+(?:\.[0-9]+)?)"?', yh_html)
+        if m_j:
+          val_j = _to_float(m_j.group(1))
+          if var_name == "o" and o is None:
+            o = val_j
+          elif var_name == "h" and h is None:
+            h = val_j
+          elif var_name == "l" and l is None:
+            l = val_j
+          elif var_name == "c" and c is None:
+            c = val_j
+          elif var_name == "v" and v is None:
+            v = val_j
+      if d_obj is None:
+        m_jd = re.search(r'"(?:priceDate|lastUpdate|dateTime)"\s*:\s*"([^"]+)"', yh_html)
+        if m_jd:
+          d_obj = _parse_jp_date(m_jd.group(1))
+      full_txt = unicodedata.normalize("NFKC", soup.get_text(" ", strip=True))
+      if d_obj is None:
+        m_yd = re.search(r"(?:リアルタイム株価|終値|15:30|取引値).{0,25}?([0-9]{4}/[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}/[0-9]{1,2})", full_txt[:1800]) or re.search(r"([0-9]{1,2}/[0-9]{1,2})\s*(?:15:30|15:25|終値)", full_txt[:1800])
+        if m_yd:
+          d_obj = _parse_jp_date(m_yd.group(1))
+      if o is None:
+        m_o = re.search(r"(?<!前日)始値\s*([0-9,]+(?:\.[0-9]+)?)", full_txt)
+        o = _to_float(m_o.group(1)) if m_o else None
+      if h is None:
+        m_h = re.search(r"(?<!年初来)(?<!上場来)(?<!52週)高値\s*([0-9,]+(?:\.[0-9]+)?)", full_txt)
+        h = _to_float(m_h.group(1)) if m_h else None
+      if l is None:
+        m_l = re.search(r"(?<!年初来)(?<!上場来)(?<!52週)安値\s*([0-9,]+(?:\.[0-9]+)?)", full_txt)
+        l = _to_float(m_l.group(1)) if m_l else None
+      if c is None:
+        m_c = re.search(r"([0-9,]+(?:\.[0-9]+)?)\s*円?\s*前日比", full_txt[:1500]) or re.search(r"(?<!前日)(?:終値|現在値)\s*([0-9,]+(?:\.[0-9]+)?)", full_txt[:2000])
+        c = _to_float(m_c.group(1)) if m_c else None
+      if v is None:
+        m_v = re.search(r"(?:出来高|売買高)\s*([0-9,]+(?:\.[0-9]+)?\s*(?:万株|千株|株))", full_txt)
+        v = _to_volume(m_v.group(1)) if m_v else None
+      res_yh = _build_valid_result(d_obj, o, h, l, c, v, "Yahoo!ファイナンス日本版")
+      if res_yh:
+        st.session_state[cache_key] = (res_yh, time.time())
+        return res_yh
+  except Exception:
+    pass
+
+  return {}
 
 
 def _estimate_next_earnings_period(announce_date_str: str) -> str:

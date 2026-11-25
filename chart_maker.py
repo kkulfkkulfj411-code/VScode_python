@@ -1,15 +1,19 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.2 高密度スリム版)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.3 高密度スリム版)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #   右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
 #   マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部36%余白確保(凡例重なり完全防止) /
 #   改定案A（Panel2: VVIX×SKEW / Panel3: MOVE×HYG）カテゴリー統一配置 /
 #   VIX・VVIX・MOVE・SKEW 252日80%・90%動的基準線（暖寒色・4種カスタム線種分離＋極薄帯） /
 #   Panel5 日経平均SMA25(全期間算出・左端欠損防止・乖離率表記)＋TOPIX正規化対応 / 例外時Figure解放保護 /
-#   個別3チャート(週足・日足・1時間足)＆マクロ統合チャートの日本語2段タイトル化(下段SMA凡例)・生成日時＆基準日自動印字
+#   個別3チャート(週足・日足・1時間足)＆マクロ統合チャートの日本語2段タイトル化・生成日時＆基準日自動印字 /
+#   [Rev.6.3] 改修①: add_indicatorsのdf['MACD']=df['MACD_Hist']誤代入廃止(Line/Signal/Hist明示参照へ統一) /
+#             改修④: Panel5のTOPIX対日経60日差をhistories["_jp_rel_meta"]の起点・単純騰落率差(sp60)へ完全同期 /
+#             改修⑧: 個別チャート2段タイトル下段へ BB20±2σ(灰/紫) 凡例を追記
 # ==============================================================================
 from datetime import datetime, timedelta, timezone
-import os, re
+import os
+import re
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
@@ -45,10 +49,10 @@ def add_indicators(df):
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     df['Vol_SMA20'] = ta.trend.sma_indicator(df['Volume'].astype(float), window=20)
 
+    # [改修①] 標準EMA(12,26,9)の3列を明示出力し、旧MACD=MACD_Histの誤代入を廃止
     df['MACD_Line'] = ta.trend.macd(df['Close'])
     df['MACD_Signal'] = ta.trend.macd_signal(df['Close'])
     df['MACD_Hist'] = ta.trend.macd_diff(df['Close'])
-    df['MACD'] = df['MACD_Hist']
     df['ATR'] = ta.volatility.average_true_range(high=df['High'], low=df['Low'], close=df['Close'], window=14) if len(df) >= 14 else pd.NA
     return df
 
@@ -104,11 +108,13 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             aps.append(mpf.make_addplot(df_plot[col], color=color, width=1.2, secondary_y=False))
             legend_texts.append(lbl)
 
-    full_title = f"{title_line1}\n[{' / '.join(legend_texts)}]" if legend_texts else title_line1
-
+    # [改修⑧] ボリンジャーバンド描画時は下段タイトルへ BB20±2σ(灰/紫) 凡例を追記
     if 'BB_UP' in df_plot.columns and df_plot['BB_UP'].notna().any():
         for col, color in [('BB_UP', 'gray'), ('BB_MID', 'purple'), ('BB_LOW', 'gray')]:
             aps.append(mpf.make_addplot(df_plot[col], color=color, width=0.8, alpha=0.6, secondary_y=False))
+        legend_texts.append('BB20±2σ(灰/紫)')
+
+    full_title = f"{title_line1}\n[{' / '.join(legend_texts)}]" if legend_texts else title_line1
 
     panel_ratios, panels_count = [8], 0
 
@@ -307,6 +313,7 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
         fig.subplots_adjust(hspace=0.10)
 
         thresholds_meta = macro_df_dict.get('_thresholds', {})
+        jp_rel_meta = macro_df_dict.get('_jp_rel_meta') or {}
         hard_caps_default = {'^VIX': 30.0, '^VVIX': 130.0, '^SKEW': 162.0, '^MOVE': 135.0}
 
         common_start_date, common_end_date = None, None
@@ -321,7 +328,7 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
         all_last_dates = [
             v['Close'].dropna().index[-1]
             for k, v in macro_df_dict.items()
-            if k != '_thresholds' and isinstance(v, pd.DataFrame) and not v.empty and 'Close' in v.columns and not v['Close'].dropna().empty
+            if not str(k).startswith('_') and isinstance(v, pd.DataFrame) and not v.empty and 'Close' in v.columns and not v['Close'].dropna().empty
         ]
         if all_last_dates:
             common_end_date = max(all_last_dates)
@@ -463,32 +470,47 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
             ax5.plot(n225_c.index, n225_c.values, color='#222222', lw=1.6, label=f'日経平均株価 ({int(round(n225_c.iloc[-1]))}円)')
             # 切り出し前の全期間データから25日移動平均線を算出し、左端24日分の欠損を防止
             n225_df_raw = macro_df_dict.get('^N225')
-            if isinstance(n225_df_raw, pd.DataFrame) and 'Close' in n225_df_raw.columns:
-                n225_all_c = n225_df_raw['Close'].dropna()
-                if len(n225_all_c) >= 25:
-                    n225_sma25 = n225_all_c.rolling(25).mean().reindex(n225_c.index).dropna()
-                    if not n225_sma25.empty:
-                        last_sma25 = float(n225_sma25.iloc[-1])
-                        dev_pct = ((float(n225_c.iloc[-1]) - last_sma25) / last_sma25) * 100.0
-                        ax5.plot(
-                            n225_sma25.index, n225_sma25.values, color='#6a3d9a', lw=1.15, ls='--', alpha=0.85,
-                            label=f'日経SMA25 ({int(round(last_sma25))}円 | 乖離:{dev_pct:+.1f}%)',
-                        )
-            # macro_df_dictの1306.T(TOPIX連動ETF)を60日起点で左軸スケールへ正規化描画
-            topix_c, _, _, _ = _prep_series('1306.T')
-            if topix_c.empty:
-                topix_c, _, _, _ = _prep_series('^TOPX')
-            if not topix_c.empty:
-                common_t_idx = n225_c.index.intersection(topix_c.index)
-                if len(common_t_idx) >= 5:
-                    base_n225, base_topix = float(n225_c.loc[common_t_idx[0]]), float(topix_c.loc[common_t_idx[0]])
-                    if base_topix > 0:
-                        topix_norm = topix_c.loc[common_t_idx] * (base_n225 / base_topix)
-                        rel_diff_pct = (float(topix_norm.iloc[-1]) / float(n225_c.loc[common_t_idx[-1]]) - 1.0) * 100.0
-                        ax5.plot(
-                            topix_norm.index, topix_norm.values, color='#0072b2', lw=1.2, ls='-.', alpha=0.85,
-                            label=f'TOPIX相対軌道 (対日経60日差:{rel_diff_pct:+.1f}%)',
-                        )
+            n225_all_c = n225_df_raw['Close'].dropna() if (isinstance(n225_df_raw, pd.DataFrame) and 'Close' in n225_df_raw.columns) else pd.Series(dtype=float)
+            if len(n225_all_c) >= 25:
+                n225_sma25 = n225_all_c.rolling(25).mean().reindex(n225_c.index).dropna()
+                if not n225_sma25.empty:
+                    last_sma25 = float(n225_sma25.iloc[-1])
+                    dev_pct = ((float(n225_c.iloc[-1]) - last_sma25) / last_sma25) * 100.0
+                    ax5.plot(
+                        n225_sma25.index, n225_sma25.values, color='#6a3d9a', lw=1.15, ls='--', alpha=0.85,
+                        label=f'日経SMA25 ({int(round(last_sma25))}円 | 乖離:{dev_pct:+.1f}%)',
+                    )
+            # [改修④] histories["_jp_rel_meta"]の起点・sp60を参照しテキスト出力と100%同期
+            topix_df_raw = macro_df_dict.get('1306.T')
+            if not isinstance(topix_df_raw, pd.DataFrame) or topix_df_raw.empty or 'Close' not in topix_df_raw.columns:
+                topix_df_raw = macro_df_dict.get('^TOPX')
+            topix_all_c = topix_df_raw['Close'].dropna() if (isinstance(topix_df_raw, pd.DataFrame) and 'Close' in topix_df_raw.columns) else pd.Series(dtype=float)
+            if not n225_all_c.empty and not topix_all_c.empty:
+                common_jp_all = n225_all_c.index.intersection(topix_all_c.index).sort_values()
+                if len(common_jp_all) >= 5:
+                    meta_start = jp_rel_meta.get('start_date')
+                    meta_sp60 = jp_rel_meta.get('sp60')
+                    if meta_start is not None:
+                        common_t_idx = common_jp_all[common_jp_all >= pd.Timestamp(meta_start)]
+                    else:
+                        days_span = min(tail_days - 1, len(common_jp_all) - 1)
+                        common_t_idx = common_jp_all[-(days_span + 1):]
+                    if len(common_t_idx) >= 2:
+                        base_n225 = float(n225_all_c.loc[common_t_idx[0]])
+                        base_topix = float(topix_all_c.loc[common_t_idx[0]])
+                        if base_n225 > 0 and base_topix > 0:
+                            topix_norm = topix_all_c.loc[common_t_idx] * (base_n225 / base_topix)
+                            if meta_sp60 is not None and pd.notna(meta_sp60):
+                                sp60_disp = float(meta_sp60)
+                            else:
+                                sp60_disp = (
+                                    (float(topix_all_c.loc[common_t_idx[-1]]) / base_topix - 1.0)
+                                    - (float(n225_all_c.loc[common_t_idx[-1]]) / base_n225 - 1.0)
+                                ) * 100.0
+                            ax5.plot(
+                                topix_norm.index, topix_norm.values, color='#0072b2', lw=1.2, ls='-.', alpha=0.85,
+                                label=f'TOPIX相対軌道 (対日経60日差:{sp60_disp:+.2f}%)',
+                            )
         # 3行凡例ボックスと期間前半の高値プロット線が重ならないようtop_margin=0.36を確保
         _style_macro_axis(ax5, 'Nikkei 225', '#222222', 'upper left', top_margin=0.36)
 
