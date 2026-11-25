@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.4 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.5 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
@@ -7,9 +7,8 @@
 #            マクロ13指標化 ＋ CBOE公式CDN CSVフォールバック(VIX3M等の取得失敗完全防止) /
 #            世界情勢・日米金融政策・日本の国策RSS 4カテゴリ独立取得＆出典明記・ゴシップ＆ETF/適時開示ノイズ除外 /
 #            上場市場抽出 ＆ JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定 /
-#            [Rev.9.4] JPX公式 topixweight_j.csv のNFKC正規化＆ヘッダー自動検出パース、
-#                      取得失敗時の空辞書キャッシュ防止(成功時のみsession_state保存＆キャッシュクリア連動)、
-#                      および国策RSSへの個別銘柄適時開示混入防止フィルタを追加
+#            [Rev.9.5] EDINET DB APIのコールドスタートReadTimeout対策として自動リトライ＆timeout=(5,15)を導入、
+#                      およびAPI状態監視で通信エラー時(ok=False)に1時間キャッシュ固定される問題を解消(60秒自動再試行)
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -82,6 +81,22 @@ def _http_get_html(url: str, timeout: int = 8) -> str:
   except Exception:
     pass
   return ""
+
+
+def _request_edinetdb(url: str, api_key: str, params: dict = None, max_attempts: int = 2) -> requests.Response:
+  """EDINET DB API呼び出し共通ヘルパー（コールドスタートによるReadTimeout対策としてリトライ＆読込15秒を確保）。"""
+  headers = {"X-API-Key": api_key, "User-Agent": USER_AGENT, "Accept": "application/json"}
+  last_err = None
+  for attempt in range(max_attempts):
+    try:
+      res = requests.get(url, params=params, headers=headers, timeout=(5, 15))
+      if res.status_code not in [502, 503, 504] or attempt == max_attempts - 1:
+        return res
+    except Exception as e:
+      last_err = e
+    if attempt < max_attempts - 1:
+      time.sleep(1.0)
+  raise last_err
 
 
 def get_dynamic_jp_holidays(year: int) -> set:
@@ -192,10 +207,7 @@ def _resolve_edinet_code(stock_code_4digit: str, edb_api_key: str = "") -> str:
   code_str = str(stock_code_4digit).strip().upper()
   if edb_api_key:
     try:
-      res = requests.get(
-          "https://edinetdb.jp/v1/search", params={"q": code_str},
-          headers={"X-API-Key": edb_api_key}, timeout=8,
-      )
+      res = _request_edinetdb("https://edinetdb.jp/v1/search", edb_api_key, params={"q": code_str}, max_attempts=2)
       if res.status_code == 200:
         data = res.json().get("data", [])
         if isinstance(data, list) and data:
@@ -604,7 +616,7 @@ def _run_edinet_connectivity_test(edinet_key: str, key_type: str) -> dict:
   if key_type == "edinetdb":
     sname = "EDINET DB API (edinetdb.jp)"
     try:
-      res = requests.get("https://edinetdb.jp/v1/companies/E02144", headers={"X-API-Key": edinet_key}, timeout=10)
+      res = _request_edinetdb("https://edinetdb.jp/v1/companies/E02144", edinet_key, max_attempts=2)
       if res.status_code == 200:
         return _st(True, "edinetdb", sname, "🟢 EDINET DB API (edinetdb.jp) 正常接続確認済 (HTTP 200)", "現在 `edb_` 始まりのEDINET DBキーで接続中です。有報XBRLベースの確定財務時系列・信用スコアを自動取得します。")
       if res.status_code in [401, 403]:
@@ -613,7 +625,7 @@ def _run_edinet_connectivity_test(edinet_key: str, key_type: str) -> dict:
         return _st(False, "edinetdb", sname, "🟠 EDINET DB API レートリミット到達 (HTTP 429)", "EDINET DB (Freeプラン: 1日100リクエスト上限) の制限に達しています。")
       return _st(False, "edinetdb", sname, f"🟠 EDINET DB API 応答異常 (HTTP {res.status_code})", "EDINET DBサーバー側の一時的な障害または仕様変更の可能性があります。")
     except Exception as e:
-      return _st(False, "edinetdb", sname, f"🔴 EDINET DB API 通信エラー: {e}", "ネットワーク接続または edinetdb.jp の稼働状況を確認してください。")
+      return _st(False, "edinetdb", sname, f"🔴 EDINET DB API 通信エラー: {e}", "ネットワーク接続または edinetdb.jp の稼働状況（コールドスタート遅延等）を確認してください。")
 
   sname = "金融庁公式 EDINET API v2"
   today_str = datetime.datetime.now(JST).strftime("%Y-%m-%d")
@@ -636,7 +648,8 @@ def check_edinet_api_status(force_refresh: bool = False) -> dict:
   edinet_key, key_type = _get_edinet_key_and_type()
   if not force_refresh and cache_key in st.session_state:
     cached_res, cached_ts, cached_key_hash = st.session_state[cache_key]
-    if time.time() - cached_ts < 3600 and cached_key_hash == hash(edinet_key):
+    ttl_sec = 3600 if cached_res.get("ok", False) else 60
+    if time.time() - cached_ts < ttl_sec and cached_key_hash == hash(edinet_key):
       return cached_res
   status_dict = _run_edinet_connectivity_test(edinet_key, key_type)
   st.session_state[cache_key] = (status_dict, time.time(), hash(edinet_key))
@@ -650,14 +663,14 @@ def verify_edinet_api_key() -> tuple:
 
 
 def _fetch_edinetdb_company_summary(stock_code_4digit: str, edinet_code: str, api_key: str) -> tuple:
-  headers, base_url = {"X-API-Key": api_key}, "https://edinetdb.jp/v1"
+  base_url = "https://edinetdb.jp/v1"
   edinet_code = edinet_code or _resolve_edinet_code(stock_code_4digit, edb_api_key=api_key)
   if not edinet_code:
     return "EDINETコードリストおよびEDINET DB検索に該当銘柄が見つかりませんでした。", []
 
   lines = [f"※接続ソース: EDINET DB API (`edinetdb.jp` / EDINETコード: {edinet_code})"]
   try:
-    comp_res = requests.get(f"{base_url}/companies/{edinet_code}", headers=headers, timeout=10)
+    comp_res = _request_edinetdb(f"{base_url}/companies/{edinet_code}", api_key, max_attempts=2)
     if comp_res.status_code in [401, 403]:
       return f"EDINET DB API 認証エラー (HTTP {comp_res.status_code} — Secretsのキーを確認してください)", []
     if comp_res.status_code == 429:
@@ -674,7 +687,7 @@ def _fetch_edinetdb_company_summary(stock_code_4digit: str, edinet_code: str, ap
     lines.append(f"・企業概要取得エラー: {e}")
 
   try:
-    fin_res = requests.get(f"{base_url}/companies/{edinet_code}/financials", params={"years": 3}, headers=headers, timeout=10)
+    fin_res = _request_edinetdb(f"{base_url}/companies/{edinet_code}/financials", api_key, params={"years": 3}, max_attempts=2)
     if fin_res.status_code == 200:
       f_json = fin_res.json()
       f_list = f_json.get("data", []) if isinstance(f_json, dict) else []
