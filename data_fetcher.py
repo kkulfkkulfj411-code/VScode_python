@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.7 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.8 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
@@ -14,7 +14,11 @@
 #                      改修④: TOPIX対日経60日差起点同期用 histories["_jp_rel_meta"] 格納 /
 #                      改修⑨: _judge_dynamic_regimeにmax_5d_h追加＆絶対警戒圏ピークアウト収縮判定付記 /
 #            [Rev.9.7] バグ修正②: VIX/VIX3M比をcommon_idx(同一営業日基準)算出へ統一し、
-#                      米国休場日等の日付ズレ発生時は共通営業日・両最新日の注記を自動付記
+#                      米国休場日等の日付ズレ発生時は共通営業日・両最新日の注記を自動付記 /
+#            [Rev.9.8] 重大バグ修正: 時価総額「兆/億/百万」統一パーサ導入(大型株の誤判定解消) /
+#                      深夜空振り対策: get_jp_latest_daily_ohlcvへ株探＆Yahoo時系列テーブル同一行抽出・
+#                      JSONブロック限定抽出を追加 / get_japanese_name末尾中黒トリム修正 /
+#                      _fetch_oneの市場タイムゾーン基準平日遅延判定化(土日・月曜朝の不要通信抑止)
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -103,6 +107,64 @@ def _request_edinetdb(url: str, api_key: str, params: dict = None, max_attempts:
     if attempt < max_attempts - 1:
       time.sleep(1.0)
   raise last_err
+
+
+def _parse_market_cap_to_oku(raw_str: str):
+  """時価総額文字列（兆円/億円/百万円/万円/数値のみ）を億円単位のfloatへ統一変換する。"""
+  if not raw_str:
+    return None
+  s = unicodedata.normalize("NFKC", str(raw_str)).replace(",", "").replace(" ", "").strip()
+  if not s or s in ("N/A", "-", "---", "－", "―"):
+    return None
+  m_cho = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*兆(?:\s*([0-9]+(?:\.[0-9]+)?)\s*億?)?", s)
+  if m_cho:
+    try:
+      cho_v = float(m_cho.group(1)) * 10000.0
+      oku_v = float(m_cho.group(2)) if m_cho.group(2) else 0.0
+      return cho_v + oku_v
+    except Exception:
+      return None
+  m_hyakuman = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*百万円?", s)
+  if m_hyakuman:
+    try:
+      return float(m_hyakuman.group(1)) / 100.0
+    except Exception:
+      return None
+  m_oku = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*億円?", s)
+  if m_oku:
+    try:
+      return float(m_oku.group(1))
+    except Exception:
+      return None
+  m_man = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*万円?", s)
+  if m_man:
+    try:
+      return float(m_man.group(1)) / 10000.0
+    except Exception:
+      return None
+  m_num = re.search(r"([0-9]+(?:\.[0-9]+)?)", s)
+  if m_num:
+    try:
+      return float(m_num.group(1))
+    except Exception:
+      return None
+  return None
+
+
+def _calc_market_weekday_lag(last_dt: date, target_tz: str, cutoff_time: dt_time) -> int:
+  """対象市場タイムゾーンと基準時刻に基づき、直近営業日想定日に対する平日遅延日数を算出する。"""
+  try:
+    now_mkt = pd.Timestamp.now(tz=target_tz)
+  except Exception:
+    now_mkt = pd.Timestamp.now(tz=JST)
+  ref_d = now_mkt.date()
+  if ref_d.weekday() < 5 and now_mkt.time() < cutoff_time:
+    ref_d -= timedelta(days=1)
+  while ref_d.weekday() >= 5:
+    ref_d -= timedelta(days=1)
+  if ref_d <= last_dt:
+    return 0
+  return sum(1 for i in range(1, (ref_d - last_dt).days + 1) if (last_dt + timedelta(days=i)).weekday() < 5)
 
 
 def get_dynamic_jp_holidays(year: int) -> set:
@@ -376,15 +438,16 @@ def get_macro_data_and_history():
         break
 
     if sym in CBOE_CSV_URLS:
-      days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days if not df.empty else 999
-      if df.empty or len(df) < 60 or days_lag >= 3:
+      wd_lag = _calc_market_weekday_lag(df.index[-1].date(), target_tz, dt_time(17, 0)) if not df.empty else 999
+      if df.empty or len(df) < 60 or wd_lag >= 1:
         cboe_df = _fetch_cboe_csv_fallback(sym)
         if not cboe_df.empty:
           merged = cboe_df if df.empty else pd.concat([df, cboe_df])
           df = merged[~merged.index.duplicated(keep="last")].sort_index()
     elif not df.empty:
-      days_lag = (datetime.datetime.now(JST).date() - df.index[-1].date()).days
-      if sym in ["1306.T", "^N225", "USDJPY=X"] or days_lag >= 2:
+      open_cut = dt_time(9, 0) if target_tz == "Asia/Tokyo" else dt_time(9, 30)
+      wd_lag = _calc_market_weekday_lag(df.index[-1].date(), target_tz, open_cut)
+      if sym in ["1306.T", "^N225", "USDJPY=X"] or wd_lag >= 1:
         df = _patch_latest_from_intraday(used_ticker, df, target_tz)
     return sym, df
 
@@ -897,16 +960,19 @@ def get_news(company_name, is_jp, edinet_reasons=None):
 
 @st.cache_data(ttl=3600)
 def get_japanese_name(stock_code):
+  trim_chars = " \t\r\n\u3000・･\\-‐－—–"
   match_row = _match_edinet_row(stock_code)
   if not match_row.empty:
     raw_name = str(match_row["提出者名"].values[0])
+    cleaned = raw_name
     for rm in ["株式会社", "ホールディングス", "グループ本社", "グループ"]:
-      raw_name = raw_name.replace(rm, "")
-    return raw_name.strip()
+      cleaned = cleaned.replace(rm, "")
+    cleaned = re.sub(r"[・･]{2,}", "・", cleaned).strip(trim_chars)
+    return cleaned or raw_name.strip()
   try:
     m = re.search(r"<title>(.*?)【", _http_get_html(f"https://kabutan.jp/stock/?code={stock_code}", timeout=5))
     if m:
-      return m.group(1).strip()
+      return m.group(1).strip(trim_chars)
   except Exception:
     pass
   return None
@@ -933,7 +999,7 @@ def get_us_stock_name(stock_code):
 
 
 def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
-  """[改修③] 日本株の当日確定OHLCVと日付を株探→Yahoo!ファイナンス日本版HTMLの順で抽出する（失敗時 {}）。"""
+  """[Rev.9.8] 日本株の最新確定OHLCVと日付を、株探時系列→Yahoo時系列→株探トップ→Yahooトップの順で抽出する（失敗時 {}）。"""
   code4 = str(stock_code or "").strip().upper().replace(".T", "")
   if not code4:
     return {}
@@ -945,7 +1011,7 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
       return cached_val
 
   today_jst = datetime.datetime.now(JST).date()
-  ng_labels = ("前日", "年初来", "上場来", "52週", "ストップ", "売買代金", "単元", "時価総額")
+  ng_labels = ("前日", "年初来", "上場来", "52週", "ストップ", "売買代金", "単元", "時価総額", "調整後")
 
   def _to_float(val_str: str):
     if not val_str:
@@ -984,7 +1050,7 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
         return date(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
       except ValueError:
         return None
-    m_yy = re.search(r"(?<![0-9])([0-9]{2})/([0-9]{1,2})/([0-9]{1,2})(?![0-9])", s)
+    m_yy = re.search(r"(?<![0-9])([0-9]{2})[-/年]([0-9]{1,2})[-/月]([0-9]{1,2})(?![0-9])", s)
     if m_yy:
       try:
         return date(2000 + int(m_yy.group(1)), int(m_yy.group(2)), int(m_yy.group(3)))
@@ -1017,14 +1083,133 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
       return {}
     return {"date": d_obj, "Open": o, "High": h, "Low": l, "Close": c, "Volume": v, "source": src}
 
-  # 1. 株探 (kabutan.jp)
+  def _extract_from_history_tables(soup: BeautifulSoup, src_name: str) -> dict:
+    """日足時系列テーブルから列見出しを動的解決し、同一<tr>行の日付＋OHLCVを抽出して最新日を返す。"""
+    best_res = {}
+    for tbl in soup.find_all("table"):
+      rows = tbl.find_all("tr")
+      if len(rows) < 2:
+        continue
+      thead = tbl.find("thead")
+      hdr_row = thead.find("tr") if (thead and thead.find("tr")) else rows[0]
+      hdr_cells = [unicodedata.normalize("NFKC", c.get_text(" ", strip=True)).replace(" ", "") for c in hdr_row.find_all(["th", "td"])]
+      if len(hdr_cells) < 6:
+        continue
+      idx_map = {}
+      for idx, hc in enumerate(hdr_cells):
+        if any(ng in hc for ng in ng_labels):
+          continue
+        if "日付" in hc and "date" not in idx_map:
+          idx_map["date"] = idx
+        elif hc.startswith("始値") and "o" not in idx_map:
+          idx_map["o"] = idx
+        elif hc.startswith("高値") and "h" not in idx_map:
+          idx_map["h"] = idx
+        elif hc.startswith("安値") and "l" not in idx_map:
+          idx_map["l"] = idx
+        elif hc.startswith("終値") and "c" not in idx_map:
+          idx_map["c"] = idx
+        elif any(k in hc for k in ("出来高", "売買高")) and "v" not in idx_map:
+          idx_map["v"] = idx
+      if len(idx_map) < 6:
+        continue
+      max_idx = max(idx_map.values())
+      tbody = tbl.find("tbody")
+      data_rows = tbody.find_all("tr") if tbody else rows[1:]
+      for tr in data_rows:
+        if tr is hdr_row:
+          continue
+        cells = tr.find_all(["th", "td"])
+        if len(cells) <= max_idx:
+          continue
+        d_cell = cells[idx_map["date"]]
+        t_in = d_cell.find("time")
+        d_obj = (_parse_jp_date(t_in.get("datetime", "")) if t_in else None) or _parse_jp_date(d_cell.get_text(" ", strip=True))
+        cand = _build_valid_result(
+            d_obj,
+            _to_float(cells[idx_map["o"]].get_text(" ", strip=True)),
+            _to_float(cells[idx_map["h"]].get_text(" ", strip=True)),
+            _to_float(cells[idx_map["l"]].get_text(" ", strip=True)),
+            _to_float(cells[idx_map["c"]].get_text(" ", strip=True)),
+            _to_volume(cells[idx_map["v"]].get_text(" ", strip=True)),
+            src_name,
+        )
+        if cand and (not best_res or cand["date"] > best_res["date"]):
+          best_res = cand
+    return best_res
+
+  def _extract_from_scoped_json(html_text: str, src_name: str) -> dict:
+    """同一JSONオブジェクト内に日付・OHLCVが全て揃うブロックのみから最新日を抽出する（別銘柄混入防止）。"""
+    best_res = {}
+    for m_blk in re.finditer(r"\{[^{}]{20,700}\}", html_text):
+      blk = m_blk.group(0)
+      if not all(k in blk for k in ('"openPrice"', '"highPrice"', '"lowPrice"', '"volume"')):
+        continue
+      if '"closePrice"' not in blk and '"price"' not in blk:
+        continue
+
+      def _jget(keys):
+        for k in keys:
+          mj = re.search(rf'"{k}"\s*:\s*"?([0-9,]+(?:\.[0-9]+)?)"?', blk)
+          if mj:
+            return _to_float(mj.group(1))
+        return None
+
+      d_obj = None
+      for dk in ("date", "baseDate", "priceDate", "lastUpdate", "dateTime"):
+        md = re.search(rf'"{dk}"\s*:\s*"([^"]+)"', blk)
+        if md:
+          d_obj = _parse_jp_date(md.group(1))
+          if d_obj:
+            break
+      cand = _build_valid_result(
+          d_obj,
+          _jget(("openPrice",)),
+          _jget(("highPrice",)),
+          _jget(("lowPrice",)),
+          _jget(("closePrice", "price")),
+          _jget(("volume",)),
+          src_name,
+      )
+      if cand and (not best_res or cand["date"] > best_res["date"]):
+        best_res = cand
+    return best_res
+
+  # 1. 株探 時系列テーブル (kabutan.jp/stock/kabuka) — 深夜リセットの影響を受けにくい確定日足テーブル優先
+  try:
+    kb_hist_html = _http_get_html(f"https://kabutan.jp/stock/kabuka?code={code4}", timeout=8)
+    if kb_hist_html:
+      res_kb_h = _extract_from_history_tables(BeautifulSoup(kb_hist_html, "html.parser"), "株探時系列")
+      if res_kb_h:
+        st.session_state[cache_key] = (res_kb_h, time.time())
+        return res_kb_h
+  except Exception:
+    pass
+
+  # 2. Yahoo!ファイナンス日本版 時系列ページ (finance.yahoo.co.jp/quote/{code4}.T/history)
+  try:
+    yh_hist_html = _http_get_html(f"https://finance.yahoo.co.jp/quote/{code4}.T/history", timeout=8)
+    if yh_hist_html:
+      res_yh_h = (
+          _extract_from_history_tables(BeautifulSoup(yh_hist_html, "html.parser"), "Yahoo!時系列")
+          or _extract_from_scoped_json(yh_hist_html, "Yahoo!時系列")
+      )
+      if res_yh_h:
+        st.session_state[cache_key] = (res_yh_h, time.time())
+        return res_yh_h
+  except Exception:
+    pass
+
+  # 3. 株探 個別トップ (kabutan.jp/stock/?code=) — リアルタイム枠フォールバック
   try:
     kb_html = _http_get_html(f"https://kabutan.jp/stock/?code={code4}", timeout=8)
     if kb_html:
       soup = BeautifulSoup(kb_html, "html.parser")
       d_obj, o, h, l, c, v = None, None, None, None, None, None
       info_i1 = soup.find("div", id="stockinfo_i1")
-      for t_tag in (info_i1.find_all("time") if info_i1 else []) + soup.find_all("time")[:4]:
+      info_i2 = soup.find("div", id="stockinfo_i2")
+      scoped_times = (info_i1.find_all("time") if info_i1 else []) + (info_i2.find_all("time") if info_i2 else [])
+      for t_tag in scoped_times:
         d_obj = _parse_jp_date(t_tag.get("datetime", "")) or _parse_jp_date(t_tag.get_text(" ", strip=True))
         if d_obj:
           break
@@ -1076,10 +1261,14 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
   except Exception:
     pass
 
-  # 2. Yahoo!ファイナンス日本版 (finance.yahoo.co.jp)
+  # 4. Yahoo!ファイナンス日本版 個別トップ (finance.yahoo.co.jp/quote/{code4}.T)
   try:
     yh_html = _http_get_html(f"https://finance.yahoo.co.jp/quote/{code4}.T", timeout=8)
     if yh_html:
+      res_yh_json = _extract_from_scoped_json(yh_html, "Yahoo!ファイナンス日本版")
+      if res_yh_json:
+        st.session_state[cache_key] = (res_yh_json, time.time())
+        return res_yh_json
       soup = BeautifulSoup(yh_html, "html.parser")
       d_obj, o, h, l, c, v = None, None, None, None, None, None
       for dt_tag in soup.find_all("dt"):
@@ -1100,33 +1289,10 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
           c = _to_float(dd_txt)
         elif lbl in ("出来高", "売買高") and v is None:
           v = _to_volume(dd_txt)
-      for t_tag in soup.find_all("time")[:4]:
-        d_obj = _parse_jp_date(t_tag.get("datetime", "")) or _parse_jp_date(t_tag.get_text(" ", strip=True))
-        if d_obj:
-          break
-      for key_name, var_name in [("openPrice", "o"), ("highPrice", "h"), ("lowPrice", "l"), ("price", "c"), ("volume", "v")]:
-        m_j = re.search(rf'"{key_name}"\s*:\s*"?([0-9,]+(?:\.[0-9]+)?)"?', yh_html)
-        if m_j:
-          val_j = _to_float(m_j.group(1))
-          if var_name == "o" and o is None:
-            o = val_j
-          elif var_name == "h" and h is None:
-            h = val_j
-          elif var_name == "l" and l is None:
-            l = val_j
-          elif var_name == "c" and c is None:
-            c = val_j
-          elif var_name == "v" and v is None:
-            v = val_j
-      if d_obj is None:
-        m_jd = re.search(r'"(?:priceDate|lastUpdate|dateTime)"\s*:\s*"([^"]+)"', yh_html)
-        if m_jd:
-          d_obj = _parse_jp_date(m_jd.group(1))
       full_txt = unicodedata.normalize("NFKC", soup.get_text(" ", strip=True))
-      if d_obj is None:
-        m_yd = re.search(r"(?:リアルタイム株価|終値|15:30|取引値).{0,25}?([0-9]{4}/[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}/[0-9]{1,2})", full_txt[:1800]) or re.search(r"([0-9]{1,2}/[0-9]{1,2})\s*(?:15:30|15:25|終値)", full_txt[:1800])
-        if m_yd:
-          d_obj = _parse_jp_date(m_yd.group(1))
+      m_yd = re.search(r"(?:リアルタイム株価|終値|15:30|取引値).{0,25}?([0-9]{4}/[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}/[0-9]{1,2})", full_txt[:1800]) or re.search(r"([0-9]{1,2}/[0-9]{1,2})\s*(?:15:30|15:25|終値)", full_txt[:1800])
+      if m_yd:
+        d_obj = _parse_jp_date(m_yd.group(1))
       if o is None:
         m_o = re.search(r"(?<!前日)始値\s*([0-9,]+(?:\.[0-9]+)?)", full_txt)
         o = _to_float(m_o.group(1)) if m_o else None
@@ -1273,14 +1439,7 @@ def evaluate_topix_passive_status(market_seg: str, market_cap_str: str, stock_co
       seg_norm = "東証スタンダード"
   seg_label = seg_norm if seg_norm else (market_seg if market_seg and market_seg != "N/A" else "東証上場(詳細区分要確認)")
 
-  mcap_oku = None
-  if market_cap_str and market_cap_str != "N/A":
-    m = re.search(r"([0-9,]+(?:\.[0-9]+)?)", str(market_cap_str))
-    if m:
-      try:
-        mcap_oku = float(m.group(1).replace(",", ""))
-      except Exception:
-        mcap_oku = None
+  mcap_oku = _parse_market_cap_to_oku(market_cap_str)
   mcap_txt = f"時価総額{mcap_oku:,.1f}億円" if mcap_oku is not None else "時価総額N/A"
   prefix = f"上場市場: {seg_label} | TOPIXパッシブ需給区分: "
 
@@ -1366,6 +1525,7 @@ def get_japanese_fundamentals(stock_code):
       return cached_val
 
   result = {"per": "N/A", "pbr": "N/A", "div": "N/A", "margin": "N/A", "market_cap": "N/A", "earnings_date": "要検索確認", "market_segment": "N/A"}
+  mcap_unit_pat = r"([0-9,]+(?:\.[0-9]+)?\s*兆(?:\s*[0-9,]+(?:\.[0-9]+)?\s*億)?円?|[0-9,]+(?:\.[0-9]+)?\s*(?:億|百万)円)"
 
   def _clean_num(raw_str):
     if not raw_str:
@@ -1379,6 +1539,10 @@ def get_japanese_fundamentals(stock_code):
   def _extract_regex(pattern, text):
     m = re.search(pattern, text)
     return m.group(1).replace(",", "") if (m and m.group(1) not in ["---", "－", "―"]) else None
+
+  def _fmt_mcap_oku(raw_mcap_str: str):
+    v_oku = _parse_market_cap_to_oku(raw_mcap_str)
+    return f"{round(v_oku, 1):,}" if (v_oku is not None and v_oku > 0) else None
 
   # 1. 株探 (kabutan.jp)
   try:
@@ -1402,12 +1566,16 @@ def get_japanese_fundamentals(stock_code):
           result["pbr"] = pbr_v if pbr_v != "－" else "N/A"
           result["div"] = div_v if div_v != "－" else "N/A"
           result["margin"] = mrg_v if mrg_v != "－" else "N/A"
-        if len(tds) >= 5 and "億円" in tds[4]:
-          result["market_cap"] = tds[4].replace("億円", "").strip()
+        if len(tds) >= 5 and any(u in tds[4] for u in ("兆", "億", "百万")):
+          mc_fmt = _fmt_mcap_oku(tds[4])
+          if mc_fmt:
+            result["market_cap"] = mc_fmt
       if result["market_cap"] == "N/A":
-        m_mc = re.search(r"時価総額\s*([0-9,]+(?:\.[0-9]+)?)\s*億円", page_txt)
+        m_mc = re.search(rf"時価総額\s*{mcap_unit_pat}", page_txt)
         if m_mc:
-          result["market_cap"] = m_mc.group(1)
+          mc_fmt = _fmt_mcap_oku(m_mc.group(1))
+          if mc_fmt:
+            result["market_cap"] = mc_fmt
       earn_m = re.search(r"決算発表予定日[^0-9]*?([0-9]{4}年[0-9]{1,2}月[0-9]{1,2}日|[0-9]{4}/[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}月[0-9]{1,2}日)", page_txt)
       if earn_m:
         result["earnings_date"] = f"{earn_m.group(1)}頃(予定)"
@@ -1440,9 +1608,11 @@ def get_japanese_fundamentals(stock_code):
         if result["div"] == "N/A":
           result["div"] = _extract_regex(r"配当利回り\s*（会社予想）.{0,25}?([0-9,]+(?:\.[0-9]+)?|---|－|―)\s*%", full_txt) or "N/A"
         if result["market_cap"] == "N/A":
-          v = _extract_regex(r"時価総額.{0,25}?([0-9,]+)\s*百万円", full_txt)
-          if v:
-            result["market_cap"] = f"{round(float(v) / 100, 1):,}"
+          m_mc = re.search(rf"時価総額.{{0,25}}?{mcap_unit_pat}", full_txt)
+          if m_mc:
+            mc_fmt = _fmt_mcap_oku(m_mc.group(1))
+            if mc_fmt:
+              result["market_cap"] = mc_fmt
         if result["earnings_date"] == "要検索確認":
           m_yh_sum = re.search(r"([0-9]{4}/[0-9]{1,2}/[0-9]{1,2})\s*発表分.{0,40}?([0-9]{4}年[0-9]{1,2}月期\s*(?:第[1-4１-４]四半期|中間期|通期)?)", full_txt)
           if m_yh_sum:
@@ -1457,10 +1627,10 @@ def get_japanese_fundamentals(stock_code):
 
   # 3. 日経電子版 ＆ 4. みんかぶ
   fallback_sources = [
-      (f"https://www.nikkei.com/nkd/company/?scode={stock_code}", r"予想PER.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"PBR(?:（実績）)?.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"予想配当利回り.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]", r"時価総額.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*億円", False),
-      (f"https://minkabu.jp/stock/{stock_code}", r"PER\s*(?:\(調整後\))?.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"PBR.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"配当利回り.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]", r"時価総額.{0,20}?([0-9,]+)\s*百万円", True),
+      (f"https://www.nikkei.com/nkd/company/?scode={stock_code}", r"予想PER.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"PBR(?:（実績）)?.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"予想配当利回り.{0,25}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]", rf"時価総額.{{0,25}}?{mcap_unit_pat}"),
+      (f"https://minkabu.jp/stock/{stock_code}", r"PER\s*(?:\(調整後\))?.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"PBR.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*倍", r"配当利回り.{0,20}?([0-9,]+(?:\.[0-9]+)?)\s*[％%]", rf"時価総額.{{0,20}}?{mcap_unit_pat}"),
   ]
-  for url, p_per, p_pbr, p_div, p_mc, is_million in fallback_sources:
+  for url, p_per, p_pbr, p_div, p_mc in fallback_sources:
     if not any(result[k] == "N/A" for k in ["per", "pbr", "div", "market_cap", "market_segment"]):
       break
     try:
@@ -1479,9 +1649,11 @@ def get_japanese_fundamentals(stock_code):
       if result["div"] == "N/A":
         result["div"] = _extract_regex(p_div, sub_txt) or "N/A"
       if result["market_cap"] == "N/A":
-        v_mc = _extract_regex(p_mc, sub_txt)
-        if v_mc:
-          result["market_cap"] = f"{round(float(v_mc) / 100, 1):,}" if is_million else v_mc
+        m_mc = re.search(p_mc, sub_txt)
+        if m_mc:
+          mc_fmt = _fmt_mcap_oku(m_mc.group(1))
+          if mc_fmt:
+            result["market_cap"] = mc_fmt
     except Exception:
       pass
 

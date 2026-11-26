@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.3 高密度スリム版)
+# AI株式分析データジェネレーター - chart_maker.py (完全版 v2026.11 Rev.6.4 高密度スリム版)
 # 実装済仕様：ピボット高安値ラベル全域描画（左右端の最高・最安値保護＋格納処理完備） /
 #   右Y軸Price表記除去 / 日足X軸左端の月ラベル重なり防止 /
 #   マクロ5段チャート共通開始日X軸同期・3行凡例パネル上部36%余白確保(凡例重なり完全防止) /
@@ -9,7 +9,11 @@
 #   個別3チャート(週足・日足・1時間足)＆マクロ統合チャートの日本語2段タイトル化・生成日時＆基準日自動印字 /
 #   [Rev.6.3] 改修①: add_indicatorsのdf['MACD']=df['MACD_Hist']誤代入廃止(Line/Signal/Hist明示参照へ統一) /
 #             改修④: Panel5のTOPIX対日経60日差をhistories["_jp_rel_meta"]の起点・単純騰落率差(sp60)へ完全同期 /
-#             改修⑧: 個別チャート2段タイトル下段へ BB20±2σ(灰/紫) 凡例を追記
+#             改修⑧: 個別チャート2段タイトル下段へ BB20±2σ(灰/紫) 凡例を追記 /
+#   [Rev.6.4] マクロ基準日を株式・現物指数ベースへ統一(為替先行時は為替日を付記・X軸は全指標最大日維持) /
+#             Panel1 VIX/VIX3M比のsort_values明示＆ゼロ除算・inf除外ガード追加 /
+#             左右端ピボット高安値ラベルのha自動切替(現在値黒ボックス衝突防止) /
+#             マクロ凡例の瞬間高値・最高へ表示期間({tail_days}D)を明記
 # ==============================================================================
 from datetime import datetime, timedelta, timezone
 import os
@@ -138,7 +142,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
     if has_macd:
         panels_count += 1
         panel_ratios.append(1.2)
-        colors = ['green' if val >= 0 else 'red' for val in df_plot['MACD_Hist']]
+        colors = ['green' if (pd.notna(val) and val >= 0) else 'red' for val in df_plot['MACD_Hist']]
         aps.append(mpf.make_addplot(df_plot['MACD_Hist'], type='bar', color=colors, panel=panels_count, alpha=0.5, secondary_y=False))
         aps.append(mpf.make_addplot(df_plot['MACD_Line'], color='blue', width=1.1, panel=panels_count, secondary_y=False))
         aps.append(mpf.make_addplot(df_plot['MACD_Signal'], color='orange', width=1.1, panel=panels_count, secondary_y=False))
@@ -209,7 +213,7 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
             _add_panel_tag(ax_macd, 'MACD')
             current_panel_idx += 2
 
-        # ピボット高安値ラベルの算出と描画（左右端の期間最高値・最安値も保護）
+        # ピボット高安値ラベルの算出と描画（左右端の期間最高値・最安値保護＋端衝突防止）
         window_size = 10 if timeframe_type == 'weekly' else (8 if timeframe_type == 'daily' else 20)
         right_confirm = 2
         min_dist = max(int(len(df_plot) * 0.10), 6)
@@ -240,12 +244,18 @@ def generate_safe_chart_image(df_full, filename, title, tail_count, timeframe_ty
                     lows.append((i, val_l))
 
         current_ylim = ax_main.get_ylim()
-        offset = (current_ylim[1] - current_ylim[0]) * 0.025
+        offset = max(current_ylim[1] - current_ylim[0], 1e-6) * 0.025
         ax_main.set_ylim(current_ylim[0] - offset * 1.5, current_ylim[1] + offset * 1.5)
 
         for pts, dy, va_pos, col_name in [(highs, offset, 'bottom', 'green'), (lows, -offset, 'top', 'red')]:
             for idx, val in pts:
-                ax_main.text(idx, val + dy, _format_chart_price(val, is_jp), ha='center', va=va_pos, color=col_name, fontsize=8, fontweight='bold', zorder=9)
+                if n_bars > 3 and idx >= n_bars - 3:
+                    ha_align, x_pos = 'right', max(0.0, idx - 0.15)
+                elif n_bars > 3 and idx <= 1:
+                    ha_align, x_pos = 'left', idx + 0.15
+                else:
+                    ha_align, x_pos = 'center', idx
+                ax_main.text(x_pos, val + dy, _format_chart_price(val, is_jp), ha=ha_align, va=va_pos, color=col_name, fontsize=8, fontweight='bold', zorder=9)
 
         tick_indices, tick_labels = [], []
         if timeframe_type == 'weekly':
@@ -325,13 +335,27 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
                     common_start_date, common_end_date = ref_c.tail(tail_days).index[0], ref_c.index[-1]
                     break
 
+        # [Rev.6.4] X軸右端は全指標最大日を維持しつつ、タイトル基準日は株式・現物指数ベースへ統一
+        equity_ref_keys = ['^N225', '1306.T', '^VIX', '^VIX3M', '^VVIX', '^SKEW', '^MOVE', 'HYG', '^SOX', '^TNX']
+        equity_last_dates = [
+            macro_df_dict[k]['Close'].dropna().index[-1]
+            for k in equity_ref_keys
+            if isinstance(macro_df_dict.get(k), pd.DataFrame) and not macro_df_dict[k].empty and 'Close' in macro_df_dict[k].columns and not macro_df_dict[k]['Close'].dropna().empty
+        ]
         all_last_dates = [
             v['Close'].dropna().index[-1]
             for k, v in macro_df_dict.items()
             if not str(k).startswith('_') and isinstance(v, pd.DataFrame) and not v.empty and 'Close' in v.columns and not v['Close'].dropna().empty
         ]
-        if all_last_dates:
-            common_end_date = max(all_last_dates)
+        plot_end_date = max(all_last_dates) if all_last_dates else common_end_date
+        base_end_date = max(equity_last_dates) if equity_last_dates else plot_end_date
+
+        fx_note = ''
+        fx_df = macro_df_dict.get('USDJPY=X')
+        if isinstance(fx_df, pd.DataFrame) and not fx_df.empty and 'Close' in fx_df.columns and not fx_df['Close'].dropna().empty and base_end_date is not None:
+            fx_last = fx_df['Close'].dropna().index[-1]
+            if fx_last > base_end_date and hasattr(fx_last, 'strftime'):
+                fx_note = f' / 為替:{fx_last.strftime("%m/%d")}'
 
         def _prep_series(key):
             df = macro_df_dict.get(key)
@@ -374,9 +398,11 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
             ax.set_ylabel(ylabel_txt, color=color_code, fontsize=9 if is_bold else 8.5, fontweight='bold' if is_bold else 'normal')
             if color_code != 'black':
                 ax.tick_params(axis='y', labelcolor=color_code, labelsize=8.5 if is_bold else 8)
-            leg = ax.legend(loc=loc_str, fontsize=7.8, framealpha=0.88, labelspacing=0.25, borderpad=0.3, handlelength=1.8)
-            if leg:
-                leg.set_zorder(20)
+            handles, _ = ax.get_legend_handles_labels()
+            if handles:
+                leg = ax.legend(loc=loc_str, fontsize=7.8, framealpha=0.88, labelspacing=0.25, borderpad=0.3, handlelength=1.8)
+                if leg:
+                    leg.set_zorder(20)
 
         # Panel 1: VIX & VIX3M (左軸) + VIX/VIX3M比 (右軸)
         ax1 = axes[0]
@@ -384,16 +410,17 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
         vix3m_c, _, _, _ = _prep_series('^VIX3M')
         if not vix_c.empty:
             ax1.plot(vix_c.index, vix_c.values, color='#d62728', lw=1.6, label=f'VIX (終値: {vix_c.iloc[-1]:.2f}{_fmt_th_label(vix_warn, vix_alert)})')
-            ax1.plot(vix_h.index, vix_h.values, color='#d62728', lw=0.8, ls=':', alpha=0.6, label=f'VIX (瞬間高値: {vix_h.max():.2f})')
+            ax1.plot(vix_h.index, vix_h.values, color='#d62728', lw=0.8, ls=':', alpha=0.6, label=f'VIX ({tail_days}D瞬間高値: {vix_h.max():.2f})')
             _draw_th_bands(ax1, vix_warn, vix_alert, '#ff7f0e', '#d62728', span_c='#d62728', span_al=0.05)
         if not vix3m_c.empty:
             ax1.plot(vix3m_c.index, vix3m_c.values, color='#1f77b4', lw=1.2, ls='--', label=f'VIX3M ({vix3m_c.iloc[-1]:.2f})')
         _style_macro_axis(ax1, 'VIX / VIX3M', 'black', 'upper left', top_margin=0.36)
 
         if not vix_c.empty and not vix3m_c.empty:
-            common_idx = vix_c.index.intersection(vix3m_c.index)
+            common_idx = vix_c.index.intersection(vix3m_c.index).sort_values()
             if len(common_idx) > 0:
-                ratio_s = (vix_c.loc[common_idx] / vix3m_c.loc[common_idx]).dropna()
+                denom = vix3m_c.loc[common_idx].where(vix3m_c.loc[common_idx] > 0)
+                ratio_s = (vix_c.loc[common_idx] / denom).replace([np.inf, -np.inf], np.nan).dropna()
                 if not ratio_s.empty:
                     ax1_r = ax1.twinx()
                     ax1_r.plot(ratio_s.index, ratio_s.values, color='purple', lw=1.1, alpha=0.75, label=f'VIX/VIX3M比 ({ratio_s.iloc[-1]:.2f})')
@@ -401,9 +428,9 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
                     _style_macro_axis(ax1_r, 'Term Ratio', 'purple', 'upper right', is_bold=False, top_margin=0.36)
 
         now_jst_str = datetime.now(timezone(timedelta(hours=9))).strftime('%Y/%m/%d %H:%M')
-        end_dt_str = common_end_date.strftime('%Y-%m-%d') if common_end_date is not None and hasattr(common_end_date, 'strftime') else 'N/A'
+        end_dt_str = base_end_date.strftime('%Y-%m-%d') if base_end_date is not None and hasattr(base_end_date, 'strftime') else 'N/A'
         ax1.set_title(
-            f'グローバルマクロ＆ボラティリティ統合チャート [{now_jst_str}生成 / 基準:{end_dt_str}]\n'
+            f'グローバルマクロ＆ボラティリティ統合チャート [{now_jst_str}生成 / 基準:{end_dt_str}{fx_note}]\n'
             f'[直近{tail_days}営業日・X軸完全同期 / 破線・薄帯は過去252日動的補正80%・90%基準]',
             fontsize=10.5, fontweight='bold', pad=10, linespacing=1.35,
         )
@@ -415,7 +442,7 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
         if not vvix_c.empty:
             ax2.plot(
                 vvix_c.index, vvix_c.values, color='#ff7f0e', lw=1.6,
-                label=f'VVIX (終値: {vvix_c.iloc[-1]:.1f} / 最高: {vvix_h.max():.1f}{_fmt_th_label(vvix_warn, vvix_alert)})',
+                label=f'VVIX (終値: {vvix_c.iloc[-1]:.1f} / {tail_days}D高値: {vvix_h.max():.1f}{_fmt_th_label(vvix_warn, vvix_alert)})',
             )
             ax2.plot(vvix_h.index, vvix_h.values, color='#ff7f0e', lw=0.7, ls=':', alpha=0.55)
             # 4本の基準線が同一Y座標で重なっても判別できるよう4種の異なるカスタム破線パターンを適用
@@ -438,7 +465,7 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
         if not move_c.empty:
             ax3.plot(
                 move_c.index, move_c.values, color='#2ca02c', lw=1.5,
-                label=f'MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / 最高: {move_h.max():.1f}{_fmt_th_label(move_warn, move_alert)})',
+                label=f'MOVE 米国債Vol (終値: {move_c.iloc[-1]:.1f} / {tail_days}D高値: {move_h.max():.1f}{_fmt_th_label(move_warn, move_alert)})',
             )
             ax3.plot(move_h.index, move_h.values, color='#2ca02c', lw=0.7, ls=':', alpha=0.55)
             _draw_th_bands(ax3, move_warn, move_alert, '#2ca02c', '#1b611b', ls_w='--', ls_a=':', lw_w=0.85, lw_a=1.0, al_w=0.7, al_a=0.85)
@@ -459,7 +486,7 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
 
         if not tnx_c.empty:
             ax4_r = ax4.twinx()
-            ax4_r.plot(tnx_c.index, tnx_c.values, color='#e377c2', lw=1.5, label=f'米10年債利回り ({tnx_c.iloc[-1]:.2f}% / 最高: {tnx_h.max():.2f}%)')
+            ax4_r.plot(tnx_c.index, tnx_c.values, color='#e377c2', lw=1.5, label=f'米10年債利回り ({tnx_c.iloc[-1]:.2f}% / {tail_days}D高値: {tnx_h.max():.2f}%)')
             _style_macro_axis(ax4_r, 'US 10Y (%)', '#c51b8a', 'upper right', top_margin=0.22)
 
         # Panel 5: 日経平均株価 & SMA25・TOPIX相対軌道 (左軸) + ドル円 (右軸)
@@ -518,12 +545,12 @@ def generate_macro_chart_image(macro_df_dict, filename='temp_macro.png', tail_da
             ax5_r = ax5.twinx()
             ax5_r.plot(
                 usdjpy_c.index, usdjpy_c.values, color='#2ca02c', lw=1.5,
-                label=f'ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / 最高: {usdjpy_h.max():.2f}円)',
+                label=f'ドル円 USD/JPY ({usdjpy_c.iloc[-1]:.2f}円 / {tail_days}D高値: {usdjpy_h.max():.2f}円)',
             )
             _style_macro_axis(ax5_r, 'USD/JPY', '#2ca02c', 'upper right', top_margin=0.36)
 
-        if common_start_date is not None and common_end_date is not None:
-            x_pad_left, x_pad_right = common_start_date - pd.Timedelta(days=1), common_end_date + pd.Timedelta(days=1)
+        if common_start_date is not None and plot_end_date is not None:
+            x_pad_left, x_pad_right = common_start_date - pd.Timedelta(days=1), plot_end_date + pd.Timedelta(days=1)
             for ax in axes:
                 ax.set_xlim(x_pad_left, x_pad_right)
 

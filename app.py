@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.9 高密度スリム版)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.11 高密度スリム版)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna＆分割未調整ヒゲ自動除去 /
 #   期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #   日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 / fast_info & Dividends最終補完 /
@@ -9,17 +9,14 @@
 #   勝率・第1抵抗線手前利確(1.2〜3.0ATR・ブレイクアウト逆指値独立RR検証・青天井例外付)・約定実現性(1.2ATR以内)最優先 /
 #   損切り1.0〜1.6ATR(0.8ATR未満禁止)・高勝率時RR1:1.1以上(標準1:1.2以上、1:1.0未満強制見送り)・15営業日超OCO延長 /
 #   上場市場抽出＆JPX公式TOPIXウエイトCSV自動追尾によるパッシブ需給区分5段階定量判定 /
-#   週足・日足・1時間足＋15分足クロスリペア＆全営業日四本値双方向完全同期 /
+#   週足・日足・1時間足＋15分足クロスリペア＆全営業日・直近2年全週OHLC完全同期 /
 #   分析基準日時刻印・見出し末尾日付・SBIメモ先頭日付・ZIP日付付与・個別チャート日本語タイトル化 /
-#   [Rev.9.8] 改修①: 最新MACD(線/Sig/Hist)全表記＆直近10日表MACD(線/Hist)化 /
-#             改修③: 日本株確定足合成・出来高異常低下時のget_jp_latest_daily_ohlcv上書き補正＆補完不能警告刻印 /
-#             改修⑤: 資金500万円・許容損失基準(理想1%=5万円/上限2%=10万円)適合判定＆推奨株数指示追加 /
-#             改修⑥: 青天井ブレイクアウト局面(2.0〜3.0ATR/ボックス倍返し＋OCO延長)例外規定明記 /
-#             改修⑦: 15営業日イベント2段階切り分け(5営業日内決算・中銀＝見送り／6〜15営業日先月次指標＝撤退管理) /
-#             改修⑧: 日足ATR(14)欄へ60日平均比(X.XX倍)併記
-#   [Rev.9.9] バグ修正①: _extract_yf_earnings_dateの空リスト[]/NaT誤出力を防止 /
-#             スキルRev.15同期: chat_promptへ水平抵抗線・上向きMA上抜け逆指値買いの独立RR検証および
-#             下降MA・薄商い・VIXバックワーデーション時のアラート待機ルールを明文化反映
+#   [Rev.9.8] 改修①③⑤⑥⑦⑧完全統合 /
+#   [Rev.9.9] バグ修正①(_extract_yf_earnings_date空リスト/NaT除外)＆スキルRev.15同期(chat_prompt) /
+#   [Rev.9.10] Step 4再編(Step 4A→Step 5→Step 6): 日足⇔1時間足同期後の確定日足から
+#              直近2年分の全週OHLC(Open含む)を週足へ一括同期(先頭不完全週除外・合成週出来高保護・未生成当週補完) /
+#   [Rev.9.11] 相互作用バグ修正: Step 3.5確定OHLCV上書き成功日のStep 4A巻戻しスキップ＆Step 5確定高安値優先化 /
+#              dividendYield単位正規化ガード追加 / 米国株MACD表示の小数2桁化
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io, os, re, unicodedata, zipfile
@@ -220,13 +217,17 @@ def repair_and_sync_multi_timeframe_ohlcv(
     is_jp: bool = True, use_repair: bool = False, stock_code: str = "",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     """
-    【週足・日足・1時間足の3時間軸クロスリペア＆双方向完全同期エンジン（改修③対応）】
+    【週足・日足・1時間足の3時間軸クロスリペア＆双方向完全同期エンジン（Rev.9.11 確定OHLCV保護対応）】
     1) 日足(2y)の最新営業日欠落に対し、短期日足(5d/1mo)からの補完を試行。
     2) 1時間足の歯抜け（Volume=0 かつ O=H=L=C の横線ダミー足）を15分足/5分足からリサンプリング修復。
     3) 日足に欠落している営業日を1時間足から合成・追加後、日本株確定足の合成時または出来高異常低下時に
        get_jp_latest_daily_ohlcv で当日確定OHLCVを上書き補正（補完不能な合成足のみ警告文字列を返却）。
-    4) 週足の確定終値・高安値と最新日足・1時間足を同期（前日終値への巻戻しガード付・合成足もチェック対象）。
-    5) 全共通営業日において、分割未調整スパイクの逆流を防止しつつ日足と1時間足の四本値を双方向で完全一致させる。
+    4A) 週足の最新確定終値と最新日足終値の微小差(1.5%未満)を前日終値巻戻しガード付きで日足へ救済反映
+       （Step 3.5確定上書き成功日はスキップ）。
+    5) 全共通営業日において、分割未調整スパイクの逆流を防止しつつ日足と1時間足の四本値を双方向で完全一致させる
+       （Step 3.5確定上書き成功日は日足確定高安値を優先）。
+    6) 完全確定した日足(直近2年分)から月曜起算で全週のOHLC(Open含む)を週足へ一括同期する
+       （2年境界の先頭不完全週は除外、合成日含む週・未確定当週の出来高はmax保護、当週未生成時は行追加）。
     """
     target_tz = "Asia/Tokyo" if is_jp else "America/New_York"
     df_w, df_d, df_h = _clean_ohlcv_df(df_w), _clean_ohlcv_df(df_d), _clean_ohlcv_df(df_h)
@@ -323,6 +324,7 @@ def repair_and_sync_multi_timeframe_ohlcv(
 
     # --- Step 3.5 [改修③]: 日本株確定足の合成時・出来高異常低下時に株探/Yahoo日本から確定OHLCV上書き補正 ---
     synth_warning_str = ""
+    jp_ohlcv_verified_date = None
     if not df_d.empty:
         last_d_ts = df_d.index[-1]
         last_d_date = last_d_ts.date()
@@ -340,48 +342,36 @@ def repair_and_sync_multi_timeframe_ohlcv(
                 for col in ["Open", "High", "Low", "Close", "Volume"]:
                     df_d.loc[last_d_ts, col] = float(jp_ohlcv[col])
                 synthesized_dates.discard(last_d_date)
-                is_last_synthesized = False
+                jp_ohlcv_verified_date = last_d_date
             elif is_last_synthesized:
                 synth_warning_str = " [※1時間足合成・出来高/終値不完全の可能性]"
         elif is_last_synthesized and not is_intraday:
             synth_warning_str = " [※1時間足合成・出来高/終値不完全の可能性]"
 
-    # --- Step 4: 週足(df_w)との大引け確定値双方向同期（合成足も前日巻戻しガード付きでチェック） ---
+    # --- Step 4A [Rev.9.11]: 週足最新確定終値による微小差救済（確定上書き成功日はスキップ・前日巻戻しガード強化） ---
     if not df_d.empty and not df_w.empty:
         last_d_ts = df_d.index[-1]
         last_d_date = last_d_ts.date()
         is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
-        is_last_synthesized = last_d_date in synthesized_dates
         last_week_monday = last_d_date - timedelta(days=last_d_date.weekday())
         w_last_ts = df_w.index[-1]
 
-        if w_last_ts.date() >= last_week_monday:
+        if last_d_date != jp_ohlcv_verified_date and w_last_ts.date() >= last_week_monday:
             w_close = float(df_w.loc[w_last_ts, "Close"])
-            w_high = float(df_w.loc[w_last_ts, "High"])
-            w_low = float(df_w.loc[w_last_ts, "Low"])
-
+            d_close = float(df_d.loc[last_d_ts, "Close"])
             prev_d_close = float(df_d["Close"].iloc[-2]) if len(df_d) >= 2 else None
             is_w_stale_prev = (
-                is_last_synthesized
-                and prev_d_close is not None
+                prev_d_close is not None
+                and not np.isclose(d_close, prev_d_close, rtol=1e-6, atol=1e-6)
                 and np.isclose(w_close, prev_d_close, rtol=1e-6, atol=1e-6)
             )
             if not is_intraday and w_close > 0 and not is_w_stale_prev:
-                d_close = float(df_d.loc[last_d_ts, "Close"])
                 if not np.isclose(d_close, w_close) and abs(d_close - w_close) / max(w_close, 1.0) < 0.015:
                     df_d.loc[last_d_ts, "Close"] = w_close
                     df_d.loc[last_d_ts, "High"] = max(float(df_d.loc[last_d_ts, "High"]), w_close)
                     df_d.loc[last_d_ts, "Low"] = min(float(df_d.loc[last_d_ts, "Low"]), w_close)
 
-            week_mask = df_d.index.date >= last_week_monday
-            if week_mask.any():
-                week_sub = df_d.loc[week_mask]
-                w_sub_max, w_sub_min = float(week_sub["High"].max()), float(week_sub["Low"].min())
-                df_w.loc[w_last_ts, "High"] = w_sub_max if w_high > w_sub_max * 1.22 else max(w_high, w_sub_max)
-                df_w.loc[w_last_ts, "Low"] = w_sub_min if w_low < w_sub_min * 0.80 else min(w_low, w_sub_min)
-                df_w.loc[w_last_ts, "Close"] = float(week_sub["Close"].iloc[-1])
-
-    # --- Step 5: 全共通営業日における 日足(df_d) ⇔ 1時間足(df_h) の双方向四本値同期（異常値逆流ブロック付） ---
+    # --- Step 5: 全共通営業日における 日足(df_d) ⇔ 1時間足(df_h) の双方向四本値同期（確定上書き優先＆異常値逆流ブロック） ---
     if not df_d.empty and not df_h.empty:
         d_date_to_ts = {ts.date(): ts for ts in df_d.index}
         last_d_ts = df_d.index[-1]
@@ -400,22 +390,29 @@ def repair_and_sync_multi_timeframe_ohlcv(
             h_max_ts, h_min_ts = grp["High"].idxmax(), grp["Low"].idxmin()
             h_high, h_low, h_vol_sum = float(grp["High"].max()), float(grp["Low"].min()), float(grp["Volume"].sum())
 
-            # 一方の時間軸のみ実体上限から+22%超突出している場合は分割未調整ノイズとみなし正常側を採用
-            if d_high > d_body_top * 1.22 and h_high <= d_body_top * 1.22:
-                true_high = max(h_high, d_body_top)
-            elif h_high > d_body_top * 1.22 and d_high <= d_body_top * 1.22:
+            if h_date == jp_ohlcv_verified_date:
+                # 株探/Yahoo時系列から確定OHLCV取得済の日は確定日足高安値を正として1時間足を整合
                 true_high = max(d_high, d_body_top)
-                df_h.loc[grp.index, "High"] = np.minimum(df_h.loc[grp.index, "High"], true_high)
-            else:
-                true_high = max(d_high, h_high, d_body_top)
-
-            if d_low < d_body_bot * 0.80 and h_low >= d_body_bot * 0.80:
-                true_low = min(h_low, d_body_bot)
-            elif h_low < d_body_bot * 0.80 and d_low >= d_body_bot * 0.80:
                 true_low = min(d_low, d_body_bot)
+                df_h.loc[grp.index, "High"] = np.minimum(df_h.loc[grp.index, "High"], true_high)
                 df_h.loc[grp.index, "Low"] = np.maximum(df_h.loc[grp.index, "Low"], true_low)
             else:
-                true_low = min(d_low, h_low, d_body_bot)
+                # 一方の時間軸のみ実体上限から+22%超突出している場合は分割未調整ノイズとみなし正常側を採用
+                if d_high > d_body_top * 1.22 and h_high <= d_body_top * 1.22:
+                    true_high = max(h_high, d_body_top)
+                elif h_high > d_body_top * 1.22 and d_high <= d_body_top * 1.22:
+                    true_high = max(d_high, d_body_top)
+                    df_h.loc[grp.index, "High"] = np.minimum(df_h.loc[grp.index, "High"], true_high)
+                else:
+                    true_high = max(d_high, h_high, d_body_top)
+
+                if d_low < d_body_bot * 0.80 and h_low >= d_body_bot * 0.80:
+                    true_low = min(h_low, d_body_bot)
+                elif h_low < d_body_bot * 0.80 and d_low >= d_body_bot * 0.80:
+                    true_low = min(d_low, d_body_bot)
+                    df_h.loc[grp.index, "Low"] = np.maximum(df_h.loc[grp.index, "Low"], true_low)
+                else:
+                    true_low = min(d_low, h_low, d_body_bot)
 
             df_d.loc[d_ts, "High"] = true_high
             df_d.loc[d_ts, "Low"] = true_low
@@ -441,6 +438,57 @@ def repair_and_sync_multi_timeframe_ohlcv(
 
             if d_vol <= 0 and h_vol_sum > 0:
                 df_d.loc[d_ts, "Volume"] = h_vol_sum
+
+    # --- Step 6 [Rev.9.10]: 確定した日足(直近2年分)から週足(df_w)へ全週OHLC(Open含む)一括同期 ---
+    if not df_d.empty and not df_w.empty:
+        is_intraday = _is_intraday_unconfirmed(df_d, is_jp)
+        w_monday_map = {}
+        for w_ts in df_w.index:
+            w_mon = w_ts.date() - timedelta(days=w_ts.date().weekday())
+            w_monday_map[w_mon] = w_ts
+        first_w_monday = min(w_monday_map.keys())
+
+        d_mondays = pd.Series([ts.date() - timedelta(days=ts.date().weekday()) for ts in df_d.index], index=df_d.index)
+        first_d_monday, latest_d_monday = d_mondays.iloc[0], d_mondays.iloc[-1]
+        new_w_rows = []
+
+        for d_mon, grp in df_d.groupby(d_mondays):
+            if grp.empty:
+                continue
+            # 2年切り出し境界の先頭1週（df_w先頭より新しい不完全週）はOpen/High/Low破壊を防ぐため除外
+            if d_mon == first_d_monday and d_mon > first_w_monday:
+                continue
+
+            w_open = float(grp["Open"].iloc[0])
+            w_high = float(grp["High"].max())
+            w_low = float(grp["Low"].min())
+            w_close = float(grp["Close"].iloc[-1])
+            w_vol_sum = float(grp["Volume"].sum())
+            has_synth_in_week = any(ts.date() in synthesized_dates for ts in grp.index)
+            is_curr_week = (d_mon == latest_d_monday)
+
+            if d_mon in w_monday_map:
+                w_ts = w_monday_map[d_mon]
+                df_w.loc[w_ts, "Open"] = w_open
+                df_w.loc[w_ts, "High"] = w_high
+                df_w.loc[w_ts, "Low"] = w_low
+                df_w.loc[w_ts, "Close"] = w_close
+                existing_vol = float(df_w.loc[w_ts, "Volume"]) if pd.notna(df_w.loc[w_ts, "Volume"]) else 0.0
+                if has_synth_in_week or (is_curr_week and is_intraday):
+                    df_w.loc[w_ts, "Volume"] = max(existing_vol, w_vol_sum)
+                elif w_vol_sum > 0:
+                    df_w.loc[w_ts, "Volume"] = w_vol_sum
+            elif is_curr_week:
+                row_w = {"Open": w_open, "High": w_high, "Low": w_low, "Close": w_close, "Volume": w_vol_sum}
+                for col in df_w.columns:
+                    if col not in row_w:
+                        row_w[col] = 0.0
+                new_w_rows.append((pd.Timestamp(d_mon), row_w))
+
+        if new_w_rows:
+            add_w_df = pd.DataFrame([r[1] for r in new_w_rows], index=[r[0] for r in new_w_rows])
+            df_w = pd.concat([df_w, add_w_df[df_w.columns]]).sort_index()
+            df_w = df_w[~df_w.index.duplicated(keep="last")]
 
     return _clean_ohlcv_df(df_w), _clean_ohlcv_df(df_d), _clean_ohlcv_df(df_h), synth_warning_str
 
@@ -584,6 +632,7 @@ def build_us_extra_fundamentals(stock, info, close_price_num):
 
 def build_technical_summary_text(df_d, is_jp, is_intraday=False):
     unit = "円" if is_jp else "ドル"
+    macd_digits = 1 if is_jp else 2
     close_series = df_d["Close"]
     vol_avg20_series = df_d["Volume"].rolling(20).mean()
 
@@ -629,8 +678,8 @@ def build_technical_summary_text(df_d, is_jp, is_intraday=False):
         rsi_val = f"{round(float(row['RSI']), 1)}" if "RSI" in row and pd.notna(row["RSI"]) else "N/A"
         m_line, m_hist = row.get("MACD_Line"), row.get("MACD_Hist")
         if pd.notna(m_line) or pd.notna(m_hist):
-            ml_s = f"{round(float(m_line), 1)}" if pd.notna(m_line) else "N/A"
-            mh_s = f"{round(float(m_hist), 1)}" if pd.notna(m_hist) else "N/A"
+            ml_s = f"{float(m_line):.{macd_digits}f}" if pd.notna(m_line) else "N/A"
+            mh_s = f"{float(m_hist):.{macd_digits}f}" if pd.notna(m_hist) else "N/A"
             macd_val = f"{ml_s} / {mh_s}"
         else:
             macd_val = "N/A"
@@ -757,7 +806,7 @@ if generate_button and stock_code:
         stock, df_w, df_d, df_h = get_fresh_ticker_and_history(ticker, is_jp=is_jp, use_repair=use_repair)
         name = (get_japanese_name(stock_code) or stock_code) if is_jp else get_us_stock_name(stock_code)
 
-        # [改修③] 3時間軸＋15分足クロスリペア＆確定OHLCV上書き補正＋双方向四本値同期エンジン
+        # [改修③・Rev.9.11] 3時間軸＋15分足クロスリペア＆確定OHLCV保護＋日足⇔1時間足同期＋直近2年全週OHLC一括同期
         df_w, df_d, df_h, synth_warning_str = repair_and_sync_multi_timeframe_ohlcv(
             stock=stock, df_w=df_w, df_d=df_d, df_h=df_h,
             is_jp=is_jp, use_repair=use_repair, stock_code=stock_code,
@@ -831,8 +880,9 @@ if generate_button and stock_code:
             if pd.notna(atr_val) and close_price_num > 0 else "N/A"
         )
 
-        # [改修①] 最新MACD(線/Sig/Hist)全表記
-        _fmt_m = lambda v: f"{round(float(v), 1)}" if pd.notna(v) else "N/A"
+        # [改修①・Rev.9.11] 最新MACD(線/Sig/Hist)全表記（日本株1桁・米国株2桁）
+        macd_digits = 1 if is_jp else 2
+        _fmt_m = lambda v: f"{float(v):.{macd_digits}f}" if pd.notna(v) else "N/A"
         macd_summary_str = (
             f"{_fmt_m(latest_d.get('MACD_Line'))} / "
             f"{_fmt_m(latest_d.get('MACD_Signal'))} / "
@@ -888,7 +938,11 @@ if generate_button and stock_code:
                     div_str = f"{round((div_rate / close_price_num) * 100, 2)}%"
                 else:
                     div_y = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
-                    div_str = f"{round(div_y * 100, 2)}%" if isinstance(div_y, (int, float)) and div_y > 0 else "N/A"
+                    if isinstance(div_y, (int, float)) and div_y > 0:
+                        div_pct = div_y * 100.0 if div_y <= 0.5 else float(div_y)
+                        div_str = f"{round(div_pct, 2)}%"
+                    else:
+                        div_str = "N/A"
 
             if fund_data.get("market_cap") and fund_data["market_cap"] != "N/A":
                 market_cap_str = f"{fund_data['market_cap']}億円"
