@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.6 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.7 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
@@ -12,7 +12,9 @@
 #            [Rev.9.6] 改修②: _patch_latest_from_intradayのindex>last_d限定廃止＆全欠落日付マージ穴埋め /
 #                      改修③: 日本株当日確定OHLCV取得関数 get_jp_latest_daily_ohlcv 新規実装 /
 #                      改修④: TOPIX対日経60日差起点同期用 histories["_jp_rel_meta"] 格納 /
-#                      改修⑨: _judge_dynamic_regimeにmax_5d_h追加＆絶対警戒圏ピークアウト収縮判定付記
+#                      改修⑨: _judge_dynamic_regimeにmax_5d_h追加＆絶対警戒圏ピークアウト収縮判定付記 /
+#            [Rev.9.7] バグ修正②: VIX/VIX3M比をcommon_idx(同一営業日基準)算出へ統一し、
+#                      米国休場日等の日付ズレ発生時は共通営業日・両最新日の注記を自動付記
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -504,19 +506,34 @@ def get_macro_data_and_history():
 
   histories["_thresholds"] = dynamic_thresholds
 
+  # [Rev.9.7 バグ修正②] VIX/VIX3M比を共通営業日(common_vix)基準へ統一（米国休場日等の片側更新ズレ防止）
   vix_df, vix3m_df = histories.get("^VIX", pd.DataFrame()), histories.get("^VIX3M", pd.DataFrame())
   term_line = ""
   if not vix_df.empty and not vix3m_df.empty:
-    c_vix, c_vix3m = vix_df["Close"].iloc[-1], vix3m_df["Close"].iloc[-1]
-    if c_vix3m > 0:
-      ratio = round(c_vix / c_vix3m, 3)
-      if ratio >= 1.0:
-        term_state = "🔴バックワーデーション(1.00超：機関の直近プット買いパニック・急落警戒)"
-      elif ratio >= 0.92:
-        term_state = "🟠フラット化進行(0.92超：短期ヘッジ需要増加)"
-      else:
-        term_state = "🟢コンタンゴ(正常・平穏)"
-      term_line = f"\n・VIX期間構造レシオ (VIX/VIX3M): {ratio} → {term_state}"
+    vix_c = vix_df["Close"].dropna()
+    vix3m_c = vix3m_df["Close"].dropna()
+    common_vix = vix_c.index.intersection(vix3m_c.index).sort_values()
+    if len(common_vix) > 0:
+      latest_common_dt = common_vix[-1]
+      c_vix = float(vix_c.loc[latest_common_dt])
+      c_vix3m = float(vix3m_c.loc[latest_common_dt])
+      if pd.notna(c_vix) and pd.notna(c_vix3m) and c_vix3m > 0:
+        ratio = round(c_vix / c_vix3m, 3)
+        if ratio >= 1.0:
+          term_state = "🔴バックワーデーション(1.00超：機関の直近プット買いパニック・急落警戒)"
+        elif ratio >= 0.92:
+          term_state = "🟠フラット化進行(0.92超：短期ヘッジ需要増加)"
+        else:
+          term_state = "🟢コンタンゴ(正常・平穏)"
+        vix_last_dt, vix3m_last_dt = vix_c.index[-1], vix3m_c.index[-1]
+        date_note = ""
+        if vix_last_dt != vix3m_last_dt:
+          date_note = (
+              f" [※共通営業日 {latest_common_dt.strftime('%m/%d')} 基準: "
+              f"VIX={c_vix:.2f} / VIX3M={c_vix3m:.2f} | "
+              f"表最新日 VIX={vix_last_dt.strftime('%m/%d')}・VIX3M={vix3m_last_dt.strftime('%m/%d')}]"
+          )
+        term_line = f"\n・VIX期間構造レシオ (VIX/VIX3M): {ratio:.3f} → {term_state}{date_note}"
 
   n225_df, topix_df = histories.get("^N225", pd.DataFrame()), histories.get("1306.T", pd.DataFrame())
   jp_rel_line = ""
