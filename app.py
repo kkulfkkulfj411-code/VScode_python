@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.11 高密度スリム版)
+# AI株式分析データジェネレーター - app.py (完全版 v2026.11 Rev.9.12 高密度スリム版)
 # 実装済仕様：起動時EDINET API自動監視＆案内バナー / OHLC dropna＆分割未調整ヒゲ自動除去 /
 #   期間別高安値の到達日付記(浮動小数点安全化) / ザラ場暫定出来高＆前日確定足比併記 /
 #   日本株yfinance決算予定日併記・米国株PEG/アナリスト補完 / fast_info & Dividends最終補完 /
@@ -16,7 +16,9 @@
 #   [Rev.9.10] Step 4再編(Step 4A→Step 5→Step 6): 日足⇔1時間足同期後の確定日足から
 #              直近2年分の全週OHLC(Open含む)を週足へ一括同期(先頭不完全週除外・合成週出来高保護・未生成当週補完) /
 #   [Rev.9.11] 相互作用バグ修正: Step 3.5確定OHLCV上書き成功日のStep 4A巻戻しスキップ＆Step 5確定高安値優先化 /
-#              dividendYield単位正規化ガード追加 / 米国株MACD表示の小数2桁化
+#              dividendYield単位正規化ガード追加 / 米国株MACD表示の小数2桁化 /
+#   [Rev.9.12] スキルRev.16完全同期(VIX期間構造5段階・変化方向・超短期VIX9D/VIX＆自動逆指値買い条件細分化) /
+#              サイドバー外部調査リンクへTradingView時間足別直リンク(週/日/1h)を実装
 # ==============================================================================
 from datetime import datetime, time as dt_time, timedelta, timezone
 import io, os, re, unicodedata, zipfile
@@ -753,19 +755,25 @@ with st.sidebar:
 
     generate_button = st.button("🚀 データ収集＆画像生成スタート", type="primary", width="stretch", disabled=not bool(stock_code))
 
+    # [Rev.9.12] TradingViewリンクを週足(1W)・日足(1D)・1時間足(60)の時間足別直リンクへ拡張
     if is_jp and stock_code:
         st.caption(
             f"🔗 **外部調査**: [Yahoo](https://finance.yahoo.co.jp/quote/{stock_code}.T) ｜"
             f" [株探(開示)](https://kabutan.jp/stock/news?code={stock_code}&b=k) ｜"
             f" [株探(財務)](https://kabutan.jp/stock/finance?code={stock_code}) ｜"
-            f" [TradingView](https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}) ｜"
+            f" TV([週](https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}&interval=1W)/"
+            f"[日](https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}&interval=1D)/"
+            f"[1h](https://jp.tradingview.com/chart/?symbol=TSE%3A{stock_code}&interval=60)) ｜"
             " [SBI証券](https://www.sbisec.co.jp/)"
         )
     elif not is_jp and stock_code:
+        us_sym = stock_code.upper()
         st.caption(
-            f"🔗 **外部調査**: [TradingView](https://jp.tradingview.com/chart/?symbol={stock_code.upper()}) ｜"
-            f" [Yahoo(US)](https://finance.yahoo.com/quote/{stock_code.upper()}) ｜"
-            f" [Finviz](https://finviz.com/quote.ashx?t={stock_code.upper()}) ｜"
+            f"🔗 **外部調査**: TV([週](https://jp.tradingview.com/chart/?symbol={us_sym}&interval=1W)/"
+            f"[日](https://jp.tradingview.com/chart/?symbol={us_sym}&interval=1D)/"
+            f"[1h](https://jp.tradingview.com/chart/?symbol={us_sym}&interval=60)) ｜"
+            f" [Yahoo(US)](https://finance.yahoo.com/quote/{us_sym}) ｜"
+            f" [Finviz](https://finviz.com/quote.ashx?t={us_sym}) ｜"
             " [SBI証券](https://www.sbisec.co.jp/)"
         )
 
@@ -1069,10 +1077,11 @@ if st.session_state.generated_data:
             "・重点検索②（向こう15営業日の日米重要イベント2段階切り分け＆国策織り込み検証）：発注日から15営業日以内の日米重要イベント日程"
             "（当該銘柄決算・日銀金融政策決定会合・FOMC・米雇用統計・米CPI・日米SQ日・主要選挙/政治日程）を必ずGoogle検索で特定し、"
             "『①直近5営業日以内の決算・FOMC・日銀会合＝原則見送り』、"
-            "『②6〜15営業日先の月次指標（雇用統計・CPI・SQ）＝平時VIX下では見送り要件とせず約定後の含み益1.5×ATR未満撤退ルール（前営業日後場撤退）で管理（同期間の決算・中銀会合はイベント前撤退前提で慎重判定）』の2段階で切り分けること。"
+            "『②6〜15営業日先の月次指標（雇用統計・CPI・SQ）＝平時VIX下（通常〜平穏圏・コンタンゴ・超短期VIX9D/VIX正常）では見送り要件とせず約定後の含み益1.5×ATR未満撤退ルール（前営業日後場撤退）で管理（同期間の決算・中銀会合はイベント前撤退前提で慎重判定）』の2段階で切り分けること。"
             "あわせて所属セクターに対する日本政府の国策・補助金・規制や米通商政策の影響を検索・評価しつつ、"
             "すでに株価へ織り込み済み（材料出尽くし高値圏）でないかをWTI原油(CL=F)・金(GC=F)・VIX・対指数RS・52週高値比の数値で裏付け検証すること。\n"
-            "・マクロ13指標表＆5段チャート（改定案A：11指標）＆対指数RS統合評価：Panel2(VVIX×SKEW)のオプション警戒感、Panel3(MOVE×HYG)のクレジット歪み、"
+            "・マクロ13指標表＆5段チャート（改定案A：11指標）＆対指数RS統合評価：Panel1のVIX期間構造（5段階強度・前日比/5D差/5D高値の変化方向・VIX絶対水準・超短期VIX9D/VIX逆転有無・短縮取引日等の流動性歪み）、"
+            "Panel2(VVIX×SKEW)のオプション警戒感、Panel3(MOVE×HYG)のクレジット歪み、"
             "WTI原油・金先物の実物インフレ/有事動向、およびPanel5(日経平均＆日経SMA25＆TOPIX相対軌道[1306.T]×ドル円)から『値がさハイテク主導か内需・東証全体への資金流入か』を判定し、本銘柄の対日経・対TOPIX相対強弱と照合すること。\n"
             "・LSEGレポートPDF追加添付時：Q1/Q2単体の表面的な業績スコアと通期EPS予想修正トレンドの乖離（計上時期偏重の有無）、"
             "コンセンサス目標株価レンジ（最高・平均・最低）、対日経225ベータ・相関、過去10年月次リターン季節性を統合評価すること。"
@@ -1091,9 +1100,10 @@ if st.session_state.generated_data:
             "・重点検索②（向こう15営業日の日米重要イベント2段階切り分け＆政策織り込み検証）：発注日から15営業日以内の重要マクロイベント日程"
             "（当該銘柄決算・FOMC・米雇用統計・米CPI・米SQ日・主要政治/通商日程）を必ずGoogle検索で特定し、"
             "『①直近5営業日以内の決算・FOMC＝原則見送り』、"
-            "『②6〜15営業日先の月次指標（雇用統計・CPI・SQ）＝平時VIX下では見送り要件とせず約定後の含み益1.5×ATR未満撤退ルールで管理（同期間の決算・FOMCはイベント前撤退前提で慎重判定）』の2段階で切り分けること。"
+            "『②6〜15営業日先の月次指標（雇用統計・CPI・SQ）＝平時VIX下（通常〜平穏圏・コンタンゴ・超短期VIX9D/VIX正常）では見送り要件とせず約定後の含み益1.5×ATR未満撤退ルールで管理（同期間の決算・FOMCはイベント前撤退前提で慎重判定）』の2段階で切り分けること。"
             "あわせて所属セクターに対する米通商政策（関税・対中輸出規制・補助金等）の影響を検索し、すでに株価へ織り込み済みでないかをWTI原油(CL=F)・金(GC=F)・VIX・対SOX指数RSの数値で裏付け検証すること。\n"
-            "・マクロ13指標表＆5段チャート（改定案A：11指標）統合評価：Panel1(VIX期間構造)、Panel2(VVIX×SKEW)、Panel3(MOVE×HYG)、Panel4(SOX×US10Y)、およびWTI原油・金先物の連動性と本銘柄の対指数相対強弱を照合すること。"
+            "・マクロ13指標表＆5段チャート（改定案A：11指標）統合評価：Panel1のVIX期間構造（5段階強度・変化方向・VIX絶対水準・超短期VIX9D/VIX逆転有無）、"
+            "Panel2(VVIX×SKEW)、Panel3(MOVE×HYG)、Panel4(SOX×US10Y)、およびWTI原油・金先物の連動性と本銘柄の対指数相対強弱を照合すること。"
         )
         position_size_rule = (
             "・資金管理基準（総資金500万円・米国株1株単位売買）：1トレードの許容損失は『理想1%＝5万円以内（上限2%＝10万円以内）』とする。"
@@ -1109,7 +1119,8 @@ if st.session_state.generated_data:
         "・戦略厳守（勝率・利確到達率・約定実現性の最優先）：評価の優先順位は『①勝率と利確到達確率 ＞ ②5営業日以内の約定実現性 ＞ ③リスクリワード比率』としてください。"
         "利確目標は現在値付近のエントリー（押し目指値・反発買い）では原則『最も手前にある確実な第1上値抵抗線（SMA25/75や直近高値）の手前（1.2〜3.0×ATR目安）』に設定し、計算上のRRを稼ぐために手前の抵抗線を無視して遠くに利確目標を置くことを厳禁とします。"
         "一方、水平抵抗線・上向きMAの上抜けをトリガーとする逆指値買いを検討する場合は、突破した抵抗線を新支持線・次の抵抗線（旧・第2抵抗線）手前を利確目標として現在値エントリーとは独立にRR検証してください"
-        "（ただし下降MAの突破・薄商い・VIXバックワーデーション時はザラ場一瞬の上抜けによるダマシ約定を防ぐため自動逆指値買いを避け、終値定着確認のアラート待機とすること）。"
+        "（ただし下降MAの突破・薄商い・VIX高ストレス警戒時［本格バックワーデーション1.05以上／拡大方向の軽度バックワーデーション／超短期VIX9D/VIX＞1.00の逆転継続時］はザラ場一瞬の上抜けによるダマシ約定を防ぐため自動逆指値買いを避け、終値定着確認のアラート待機とすること。"
+        "軽度バックワーデーション［1.00超〜1.05未満］でも明確な解消方向・収縮中かつ超短期VIX9D/VIX≦1.00かつ出来高を伴うブレイクが見込める場合のみギャップリスク明記の上で条件付き検討可とし、臨界フラット［0.98〜1.00］でもVIX20超や超短期逆転継続時は慎重判定すること）。"
         "さらに例外として、52週高値・上場来高値更新など頭上に明確な次の抵抗線が存在しないブレイクアウト・青天井局面（モメンタム初動・三角持ち合い上抜け等）に限り、"
         "『買値＋2.0〜3.0×日足ATR』またはボックス倍返し値幅を初期利確目標とし、OCOロールオーバーでトレンド追随することを認めます。"
         "損切り幅はノイズ狩り防止のため買値から『1.0〜1.6×日足ATR（0.8×ATR未満禁止）』とし、高勝率セットアップでは『RR 1 : 1.1以上（標準1 : 1.2以上、1 : 1.0未満は強制見送り）』を適用してください。"
