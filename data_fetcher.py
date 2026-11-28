@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.8 高密度スリム版)
+# AI株式分析データジェネレーター - data_fetcher.py (完全版 v2026.11 Rev.9.9 高密度スリム版)
 # 実装済仕様：東証年末年始の振替休日誤判定修正 / 日本株ファンダ5段階フォールバック /
 #            取得失敗・市場区分N/A時の非キャッシュ保護 / EDINET API稼働日フィルタ＆1日目Fail-Fast /
 #            EDINETキー種別自動判別(金融庁公式v2 ＆ 民間EDINET DB v1両対応・ROE自動補完) /
@@ -18,7 +18,11 @@
 #            [Rev.9.8] 重大バグ修正: 時価総額「兆/億/百万」統一パーサ導入(大型株の誤判定解消) /
 #                      深夜空振り対策: get_jp_latest_daily_ohlcvへ株探＆Yahoo時系列テーブル同一行抽出・
 #                      JSONブロック限定抽出を追加 / get_japanese_name末尾中黒トリム修正 /
-#                      _fetch_oneの市場タイムゾーン基準平日遅延判定化(土日・月曜朝の不要通信抑止)
+#                      _fetch_oneの市場タイムゾーン基準平日遅延判定化(土日・月曜朝の不要通信抑止) /
+#            [Rev.9.9] VIX期間構造レシオ改修(パターンB): 丸め前生数値による厳密判定＆小数第4位表記 /
+#                      5段階強度分離(本格1.05以上/軽度1.00超/臨界フラット0.98〜1.00/フラット化/コンタンゴ) /
+#                      前日比・5D差・5D高値からの方向性判定＆VIX絶対水準注記を同一行併記 /
+#                      ^VIX9D裏側取得(CBOE CSV補完付・_vix9d隔離格納)による超短期VIX9D/VIX補助併記
 # ==============================================================================
 import calendar
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -293,6 +297,7 @@ MACRO_HARD_CAPS = {"^VIX": 30.0, "^VIX3M": 28.0, "^VVIX": 130.0, "^SKEW": 162.0,
 CBOE_CSV_URLS = {
     "^VIX": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
     "^VIX3M": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv",
+    "^VIX9D": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv",
     "^VVIX": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv",
     "^SKEW": "https://cdn.cboe.com/api/global/us_indices/daily_prices/SKEW_History.csv",
 }
@@ -423,23 +428,26 @@ def get_macro_data_and_history():
   def _fetch_one(sym):
     target_tz = "Asia/Tokyo" if (sym in ["^N225", "USDJPY=X", "1306.T"] or sym.endswith(".T")) else "America/New_York"
     df, used_ticker = pd.DataFrame(), sym
-    for t_sym in ([sym, "^VXV"] if sym == "^VIX3M" else [sym]):
-      for period_try in ["1y", "6mo"]:
+    cand_syms = [sym, "^VXV"] if sym == "^VIX3M" else [sym]
+    periods = ["6mo", "3mo"] if sym == "^VIX9D" else ["1y", "6mo"]
+    min_rows = 10 if sym == "^VIX9D" else 30
+    for t_sym in cand_syms:
+      for period_try in periods:
         try:
           raw = yf.Ticker(t_sym).history(period=period_try, interval="1d", auto_adjust=False)
           df = _normalize_yf_df(raw, target_tz, True)
-          if not df.empty and len(df) >= 30:
+          if not df.empty and len(df) >= min_rows:
             used_ticker = t_sym
             break
         except Exception:
           pass
         time.sleep(0.25)
-      if not df.empty and len(df) >= 30:
+      if not df.empty and len(df) >= min_rows:
         break
 
     if sym in CBOE_CSV_URLS:
       wd_lag = _calc_market_weekday_lag(df.index[-1].date(), target_tz, dt_time(17, 0)) if not df.empty else 999
-      if df.empty or len(df) < 60 or wd_lag >= 1:
+      if df.empty or len(df) < (20 if sym == "^VIX9D" else 60) or wd_lag >= 1:
         cboe_df = _fetch_cboe_csv_fallback(sym)
         if not cboe_df.empty:
           merged = cboe_df if df.empty else pd.concat([df, cboe_df])
@@ -452,10 +460,11 @@ def get_macro_data_and_history():
     return sym, df
 
   histories = {}
+  fetch_syms = [s[0] for s in macro_specs] + ["^VIX9D"]
   with ThreadPoolExecutor(max_workers=6) as executor:
-    for f in as_completed([executor.submit(_fetch_one, s[0]) for s in macro_specs]):
+    for f in as_completed([executor.submit(_fetch_one, s) for s in fetch_syms]):
       sym, df = f.result()
-      histories[sym] = df
+      histories["_vix9d" if sym == "^VIX9D" else sym] = df
 
   try:
     fg_data = fear_greed.get()
@@ -569,25 +578,73 @@ def get_macro_data_and_history():
 
   histories["_thresholds"] = dynamic_thresholds
 
-  # [Rev.9.7 バグ修正②] VIX/VIX3M比を共通営業日(common_vix)基準へ統一（米国休場日等の片側更新ズレ防止）
+  # [Rev.9.9 パターンB] 生数値判定・5段階強度分離・モメンタム＆VIX絶対水準・超短期VIX9D/VIX補助併記
   vix_df, vix3m_df = histories.get("^VIX", pd.DataFrame()), histories.get("^VIX3M", pd.DataFrame())
+  vix9d_df = histories.get("_vix9d", pd.DataFrame())
   term_line = ""
   if not vix_df.empty and not vix3m_df.empty:
     vix_c = vix_df["Close"].dropna()
     vix3m_c = vix3m_df["Close"].dropna()
     common_vix = vix_c.index.intersection(vix3m_c.index).sort_values()
     if len(common_vix) > 0:
-      latest_common_dt = common_vix[-1]
-      c_vix = float(vix_c.loc[latest_common_dt])
-      c_vix3m = float(vix3m_c.loc[latest_common_dt])
-      if pd.notna(c_vix) and pd.notna(c_vix3m) and c_vix3m > 0:
-        ratio = round(c_vix / c_vix3m, 3)
-        if ratio >= 1.0:
-          term_state = "🔴バックワーデーション(1.00超：機関の直近プット買いパニック・急落警戒)"
-        elif ratio >= 0.92:
-          term_state = "🟠フラット化進行(0.92超：短期ヘッジ需要増加)"
+      denom_vix3m = vix3m_c.loc[common_vix].where(vix3m_c.loc[common_vix] > 0)
+      ratio_series = (vix_c.loc[common_vix] / denom_vix3m).replace([np.inf, -np.inf], np.nan).dropna()
+      if not ratio_series.empty:
+        latest_common_dt = ratio_series.index[-1]
+        raw_ratio = float(ratio_series.iloc[-1])
+        c_vix = float(vix_c.loc[latest_common_dt])
+        c_vix3m = float(vix3m_c.loc[latest_common_dt])
+
+        if raw_ratio >= 1.05:
+          term_state = "🔴本格バックワーデーション(1.05以上：機関の直近プット買いパニック・急落警戒)"
+        elif raw_ratio > 1.0:
+          term_state = "🟠軽度バックワーデーション(1.00超〜1.05未満：短期ストレス逆転・逆指値ダマシ警戒)"
+        elif raw_ratio >= 0.98:
+          term_state = "🟡臨界フラット(0.98〜1.00：逆転境界・方向感注視)"
+        elif raw_ratio >= 0.92:
+          term_state = "🟡フラット化進行(0.92以上：短期ヘッジ需要増加)"
         else:
           term_state = "🟢コンタンゴ(正常・平穏)"
+
+        d1_diff = raw_ratio - float(ratio_series.iloc[-2]) if len(ratio_series) >= 2 else None
+        d5_diff = raw_ratio - float(ratio_series.iloc[-6]) if len(ratio_series) >= 6 else None
+        max_5d_r = float(ratio_series.tail(5).max())
+        mom_parts = []
+        if d1_diff is not None:
+          mom_parts.append(f"前日比{d1_diff:+.4f}")
+        if d5_diff is not None:
+          mom_parts.append(f"5D差{d5_diff:+.4f}")
+        if d1_diff is not None:
+          if d1_diff <= -0.015 or (d1_diff < 0 and max_5d_r >= 1.02 and raw_ratio <= max_5d_r - 0.02):
+            dir_label = f"解消方向・収縮中(5D高値{max_5d_r:.4f})"
+          elif d1_diff >= 0.015 or (d1_diff > 0 and d5_diff is not None and d5_diff >= 0.02):
+            dir_label = "拡大方向・悪化中"
+          elif d1_diff < -0.003:
+            dir_label = f"小幅低下(5D高値{max_5d_r:.4f})"
+          elif d1_diff > 0.003:
+            dir_label = "小幅上昇"
+          else:
+            dir_label = "横ばい"
+          mom_str = f"{' / '.join(mom_parts)} → {dir_label}"
+        else:
+          mom_str = "変化方向N/A"
+
+        vix_abs_tag = "30超・極高ボラ" if c_vix >= 30.0 else ("20超・高ボラ残存" if c_vix >= 20.0 else "20未満・平穏圏")
+        vix_abs_str = f"VIX={c_vix:.2f}({vix_abs_tag})"
+
+        vix9d_str = ""
+        if isinstance(vix9d_df, pd.DataFrame) and not vix9d_df.empty and "Close" in vix9d_df.columns:
+          v9_c = vix9d_df["Close"].dropna()
+          common_9d = v9_c.index.intersection(vix_c.index).sort_values()
+          if len(common_9d) > 0:
+            dt_9d = common_9d[-1]
+            val_9d, val_30d = float(v9_c.loc[dt_9d]), float(vix_c.loc[dt_9d])
+            if pd.notna(val_9d) and pd.notna(val_30d) and val_30d > 0:
+              r_9d = val_9d / val_30d
+              st_9d = "🔴超短期逆転継続" if r_9d > 1.0 else ("🟡超短期フラット" if r_9d >= 0.96 else "🟢超短期正常")
+              dt9_note = f"({dt_9d.strftime('%m/%d')}基準)" if dt_9d != latest_common_dt else ""
+              vix9d_str = f" | 超短期VIX9D/VIX={r_9d:.4f}({val_9d:.2f}/{val_30d:.2f}・{st_9d}){dt9_note}"
+
         vix_last_dt, vix3m_last_dt = vix_c.index[-1], vix3m_c.index[-1]
         date_note = ""
         if vix_last_dt != vix3m_last_dt:
@@ -596,7 +653,10 @@ def get_macro_data_and_history():
               f"VIX={c_vix:.2f} / VIX3M={c_vix3m:.2f} | "
               f"表最新日 VIX={vix_last_dt.strftime('%m/%d')}・VIX3M={vix3m_last_dt.strftime('%m/%d')}]"
           )
-        term_line = f"\n・VIX期間構造レシオ (VIX/VIX3M): {ratio:.3f} → {term_state}{date_note}"
+        term_line = (
+            f"\n・VIX期間構造レシオ (VIX/VIX3M): {raw_ratio:.4f} → {term_state} "
+            f"[{mom_str} | {vix_abs_str}{vix9d_str}]{date_note}"
+        )
 
   n225_df, topix_df = histories.get("^N225", pd.DataFrame()), histories.get("1306.T", pd.DataFrame())
   jp_rel_line = ""
@@ -1175,7 +1235,7 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
         best_res = cand
     return best_res
 
-  # 1. 株探 時系列テーブル (kabutan.jp/stock/kabuka) — 深夜リセットの影響を受けにくい確定日足テーブル優先
+  # 1. 株探 時系列テーブル (kabutan.jp/stock/kabuka)
   try:
     kb_hist_html = _http_get_html(f"https://kabutan.jp/stock/kabuka?code={code4}", timeout=8)
     if kb_hist_html:
@@ -1200,7 +1260,7 @@ def get_jp_latest_daily_ohlcv(stock_code: str) -> dict:
   except Exception:
     pass
 
-  # 3. 株探 個別トップ (kabutan.jp/stock/?code=) — リアルタイム枠フォールバック
+  # 3. 株探 個別トップ (kabutan.jp/stock/?code=)
   try:
     kb_html = _http_get_html(f"https://kabutan.jp/stock/?code={code4}", timeout=8)
     if kb_html:
@@ -1484,7 +1544,7 @@ def evaluate_topix_passive_status(market_seg: str, market_cap_str: str, stock_co
           "JPX公式TOPIX構成銘柄だが浮動株時価総額100億円基準の境界圏・段階的ウエイト低減［683銘柄：1/4/7/10月末リバランス］該当有無は要検索確認）"
       )
 
-    # CSVに掲載がない場合 ＝ 確定でTOPIX非構成銘柄（グロース・非採用スタンダードの誤判定を完全防止）
+    # CSVに掲載がない場合 ＝ 確定でTOPIX非構成銘柄
     if mcap_oku is not None and mcap_oku >= 250.0:
       return (
           f"{prefix}🔵TOPIX非構成銘柄・次回新規採用候補圏（{mcap_txt} | JPX公式TOPIX一覧:非掲載："
